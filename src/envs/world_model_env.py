@@ -62,7 +62,7 @@ class WorldModelEnv:
         self.ep_len[dead] = 0
 
     @torch.no_grad()
-    def step(self, act: torch.LongTensor) -> StepOutput:
+    def step(self, act: torch.Tensor) -> StepOutput:
         self.act_buffer[:, -1] = act
 
         next_obs, denoising_trajectory = self.predict_next_obs()
@@ -94,13 +94,16 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def predict_rew_end(self, next_obs: Tensor) -> Tuple[Tensor, Tensor]:
-        logits_rew, logits_end, (self.hx_rew_end, self.cx_rew_end) = self.rew_end_model.predict_rew_end(
+        rew_out, logits_end, (self.hx_rew_end, self.cx_rew_end) = self.rew_end_model.predict_rew_end(
             self.obs_buffer[:, -1:],
             self.act_buffer[:, -1:],
             next_obs,
             (self.hx_rew_end, self.cx_rew_end),
         )
-        rew = Categorical(logits=logits_rew).sample().squeeze(1) - 1.0  # in {-1, 0, 1}
+        if self.rew_end_model.continuous_reward:
+            rew = rew_out.squeeze(1)  # (b, 1) -> (b,), predicted scalar reward used directly
+        else:
+            rew = Categorical(logits=rew_out).sample().squeeze(1) - 1.0  # in {-1, 0, 1}
         end = Categorical(logits=logits_end).sample().squeeze(1)
         return rew, end
 
