@@ -62,6 +62,7 @@ python src/play.py
 
 - [Try our playable diffusion world models](#try)
 - [Launch a training run](#launch)
+- [DM Control Suite support](#dm_control)
 - [Configuration](#configuration)
 - [Visualization](#visualization)
   - [Play mode (default)](#play_mode)
@@ -105,6 +106,58 @@ To resume a run that crashed, navigate to the fun folder and launch:
 ./scripts/resume.sh
 ```
 
+<a name="dm_control"></a>
+## [⬆️](#quick_links) DM Control Suite support
+
+This fork extends DIAMOND from Atari to the [DeepMind Control Suite](https://github.com/google-deepmind/dm_control), a collection of continuous-control tasks built on MuJoCo physics. **The original Atari path described above is fully preserved and unaffected** — it remains the default.
+
+- **Observations**: rendered RGB frames from `dm_control`'s MuJoCo renderer (not the default state observations such as `position`/`velocity`), flowing through the same observation pipeline as Atari.
+- **Actions**: continuous, task-dependent action spaces. Action dimension and bounds (`low`/`high`) are inferred automatically from each task's `action_spec()` at environment-construction time — never hard-coded to a specific dimension or task, so the same code path supports any DM Control Suite task without per-task code changes.
+- **Rewards**: raw continuous DM Control rewards are used directly end to end (world model, reward model, and actor-critic training) — no sign-clipping or classification, unlike the discrete-reward Atari path.
+
+### Selecting Atari vs. DM Control
+
+The environment is selected through Hydra's config group system, via the files in `config/env/`:
+
+- `config/env/atari.yaml` (default) — the original Atari path.
+- `config/env/dm_control.yaml` — the DM Control Suite path.
+
+To run the **original Atari path** (unchanged):
+```bash
+python src/main.py env.train.id=BreakoutNoFrameskip-v4 common.devices=0
+```
+
+To run **DM Control's `cheetah-run`**:
+```bash
+python src/main.py env=dm_control env.train.domain_name=cheetah env.train.task_name=run common.devices=0
+```
+
+To select **another DM Control domain/task**, override `domain_name`/`task_name` with any valid `dm_control.suite` pair (e.g. `walker`/`walk`, `hopper`/`hop`):
+```bash
+python src/main.py env=dm_control env.train.domain_name=walker env.train.task_name=walk common.devices=0
+```
+
+Resuming a crashed run works identically for either environment type — `./scripts/resume.sh` requires no environment-specific flags in either case (see [Run folder structure](#structure)).
+
+### DM Control configuration options
+
+Set in `config/env/dm_control.yaml`, or overridden on the command line (e.g. `env.train.action_repeat=2`):
+
+| Field | Meaning |
+|---|---|
+| `domain_name` / `task_name` | DM Control Suite task, e.g. `cheetah` / `run` |
+| `size` | rendered observation height/width (square) |
+| `camera_id` | which MuJoCo camera to render from |
+| `action_repeat` | number of physics substeps executed per agent action |
+| `time_limit` | episode duration in seconds (`null` = task default) |
+
+### Additional dependency
+
+DM Control support requires `dm_control` (which pulls in `mujoco`), on top of `requirements.txt`:
+```bash
+pip install dm_control
+```
+
 <a name="configuration"></a>
 ## [⬆️](#quick_links) Configuration
 
@@ -114,7 +167,8 @@ All configuration files are located in the `config` folder:
 
 - `config/trainer.yaml`: main configuration file.
 - `config/agent/default.yaml`: architecture hyperparameters.
-- `config/env/atari.yaml`: environment hyperparameters.
+- `config/env/atari.yaml`: Atari environment hyperparameters (default).
+- `config/env/dm_control.yaml`: DM Control Suite environment hyperparameters (see [DM Control Suite support](#dm_control)).
 
 You can turn on logging to [weights & biases](https://wandb.ai) in the `wandb` section of `config/trainer.yaml`.
 
