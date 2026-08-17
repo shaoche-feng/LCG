@@ -1,0 +1,17 @@
+train:
+  domain_name: cheetah
+  task_name: run
+  size: 64
+  camera_id: 0
+  action_repeat: 2
+  time_limit: null
+
+test:
+  domain_name: ${..train.domain_name}
+  task_name: ${..train.task_name}
+  size: ${..train.size}
+  camera_id: ${..train.camera_id}
+  action_repeat: ${..train.action_repeat}
+  time_limit: ${..train.time_limit}
+
+keymap: empty
