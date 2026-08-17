@@ -17,15 +17,33 @@ class InnerModelConfig:
     depths: List[int]
     channels: List[int]
     attn_depths: List[bool]
-    num_actions: Optional[int] = None
+    num_actions: Optional[int] = None  # discrete action count, e.g. Atari
+    continuous_action_dim: Optional[int] = None  # continuous action dimension, e.g. DM Control
+
+    # NOTE: no `__post_init__` validation here on purpose. `num_actions` is left unset (None) in
+    # config/agent/default.yaml and patched onto an already-constructed InnerModelConfig instance
+    # by AgentConfig.__post_init__ (agent.py), i.e. *after* hydra's bottom-up instantiate() has
+    # already built this dataclass. Validating "exactly one of the two is set" here would fire
+    # during that intermediate state and break the existing Atari path. The check instead lives in
+    # InnerModel.__init__, which only runs once the config is fully populated.
 
 
 class InnerModel(nn.Module):
     def __init__(self, cfg: InnerModelConfig) -> None:
         super().__init__()
+        assert (cfg.num_actions is None) != (cfg.continuous_action_dim is None), (
+            "InnerModelConfig requires exactly one of `num_actions` (discrete action space) "
+            "or `continuous_action_dim` (continuous action space) to be set."
+        )
         self.noise_emb = FourierFeatures(cfg.cond_channels)
+
+        act_emb_dim = cfg.cond_channels // cfg.num_steps_conditioning
+        if cfg.continuous_action_dim is None:
+            act_proj = nn.Embedding(cfg.num_actions, act_emb_dim)  # discrete: action index -> embedding
+        else:
+            act_proj = nn.Linear(cfg.continuous_action_dim, act_emb_dim)  # continuous: R^action_dim -> embedding
         self.act_emb = nn.Sequential(
-            nn.Embedding(cfg.num_actions, cfg.cond_channels // cfg.num_steps_conditioning),
+            act_proj,
             nn.Flatten(),  # b t e -> b (t e)
         )
         self.cond_proj = nn.Sequential(
