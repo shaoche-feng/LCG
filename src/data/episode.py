@@ -47,7 +47,7 @@ class Episode:
         path.parent.mkdir(parents=True, exist_ok=True)
         d = {k: v.add(1).div(2).mul(255).byte() if k == "obs" else v for k, v in self.__dict__.items()}
         torch.save(d, path.with_suffix(".tmp"))
-        path.with_suffix(".tmp").rename(path)
+        path.with_suffix(".tmp").replace(path)
 
 
 def merge_info(info_a, info_b):
