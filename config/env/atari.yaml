@@ -1,10 +1,12 @@
 train:
+  type: atari
   id: BreakoutNoFrameskip-v4
   done_on_life_loss: True
   size: 64
   max_episode_steps: null
-  
+
 test:
+  type: ${..train.type}
   id: ${..train.id}
   done_on_life_loss: False
   size: ${..train.size}

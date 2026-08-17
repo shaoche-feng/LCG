@@ -13,10 +13,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 import wandb
 
-from agent import Agent
+from agent import Agent, get_action_space_kwargs
 from coroutines.collector import make_collector, NumToCollect
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
-from envs import make_atari_env, WorldModelEnv
+from envs import make_atari_env, make_dm_control_env, WorldModelEnv
 from utils import (
     broadcast_if_needed,
     build_ddp_wrapper,
@@ -97,16 +97,20 @@ class Trainer(StateDictMixin):
         self.test_dataset.load_from_default_path()
 
         # Envs
+        make_env = {"atari": make_atari_env, "dm_control": make_dm_control_env}[cfg.env.train.type]
+        env_kwargs_train = {k: v for k, v in cfg.env.train.items() if k != "type"}
+        env_kwargs_test = {k: v for k, v in cfg.env.test.items() if k != "type"}
+
         if self._rank == 0:
-            train_env = make_atari_env(num_envs=cfg.collection.train.num_envs, device=self._device, **cfg.env.train)
-            test_env = make_atari_env(num_envs=cfg.collection.test.num_envs, device=self._device, **cfg.env.test)
-            num_actions = int(test_env.num_actions)
+            train_env = make_env(num_envs=cfg.collection.train.num_envs, device=self._device, **env_kwargs_train)
+            test_env = make_env(num_envs=cfg.collection.test.num_envs, device=self._device, **env_kwargs_test)
+            action_kwargs = get_action_space_kwargs(test_env)
         else:
-            num_actions = None
-        num_actions, = broadcast_if_needed(num_actions)
+            action_kwargs = None
+        action_kwargs, = broadcast_if_needed(action_kwargs)
 
         # Create models
-        self.agent = Agent(instantiate(cfg.agent, num_actions=num_actions)).to(self._device)
+        self.agent = Agent(instantiate(cfg.agent, **action_kwargs)).to(self._device)
         self._agent = build_ddp_wrapper(**self.agent._modules) if dist.is_initialized() else self.agent
 
         if cfg.initialization.path_to_ckpt is not None:
@@ -169,7 +173,7 @@ class Trainer(StateDictMixin):
         # RL env
 
         if self._is_model_free:
-            rl_env = make_atari_env(num_envs=cfg.actor_critic.training.batch_size, device=self._device, **cfg.env.train)
+            rl_env = make_env(num_envs=cfg.actor_critic.training.batch_size, device=self._device, **env_kwargs_train)
 
         else:
             c = cfg.actor_critic.training

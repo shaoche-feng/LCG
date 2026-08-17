@@ -1,4 +1,5 @@
 train:
+  type: dm_control
   domain_name: cheetah
   task_name: run
   size: 64
@@ -7,6 +8,7 @@ train:
   time_limit: null
 
 test:
+  type: ${..train.type}
   domain_name: ${..train.domain_name}
   task_name: ${..train.task_name}
   size: ${..train.size}

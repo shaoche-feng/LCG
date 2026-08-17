@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from .atari_preprocessing import AtariPreprocessing
+from .dm_control_env import DMControlEnv
 
 
 def make_atari_env(
@@ -50,6 +51,32 @@ def make_atari_env(
     return env
 
 
+def make_dm_control_env(
+    num_envs: int,
+    device: torch.device,
+    domain_name: str,
+    task_name: str,
+    size: int,
+    camera_id: int,
+    action_repeat: int,
+    time_limit: Optional[float],
+) -> TorchEnv:
+    def env_fn():
+        return DMControlEnv(
+            domain_name=domain_name,
+            task_name=task_name,
+            size=size,
+            camera_id=camera_id,
+            action_repeat=action_repeat,
+            time_limit=time_limit,
+        )
+
+    env = AsyncVectorEnv([env_fn for _ in range(num_envs)])
+    env = TorchEnv(env, device)
+
+    return env
+
+
 class DoneOnLifeLoss(gymnasium.Wrapper):
     def __init__(self, env: AsyncVectorEnv) -> None:
         super().__init__(env)
@@ -68,7 +95,21 @@ class TorchEnv(gymnasium.Wrapper):
         super().__init__(env)
         self.device = device
         self.num_envs = env.observation_space.shape[0]
-        self.num_actions = env.unwrapped.single_action_space.n
+
+        single_action_space = env.unwrapped.single_action_space
+        self.is_discrete = isinstance(single_action_space, gymnasium.spaces.Discrete)
+        if self.is_discrete:
+            self.num_actions = single_action_space.n
+            self.action_dim = None
+            self.action_low = None
+            self.action_high = None
+        else:
+            assert isinstance(single_action_space, gymnasium.spaces.Box)
+            self.num_actions = None
+            self.action_dim = int(single_action_space.shape[0])
+            self.action_low = torch.as_tensor(single_action_space.low, dtype=torch.float32, device=device)
+            self.action_high = torch.as_tensor(single_action_space.high, dtype=torch.float32, device=device)
+
         b, h, w, c = env.observation_space.shape
         self.observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(b, c, h, w))
 

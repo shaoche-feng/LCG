@@ -3,7 +3,6 @@ from typing import Generator, Tuple, Union
 
 import torch
 import torch.nn as nn
-from torch.distributions.categorical import Categorical
 
 from . import coroutine
 from envs import TorchEnv, WorldModelEnv
@@ -29,10 +28,16 @@ def make_env_loop(
 
         while n < num_steps:
             logits_act, val, (hx, cx) = model.predict_act_value(obs, (hx, cx))
-            act = Categorical(logits=logits_act).sample()
+            act = model.sample_action(logits_act)
 
             if random.random() < epsilon:
-                act = torch.randint(low=0, high=env.num_actions, size=(obs.size(0),), device=obs.device)
+                if env.is_discrete:
+                    act = torch.randint(low=0, high=env.num_actions, size=(obs.size(0),), device=obs.device)
+                else:
+                    # Uniform random action within the environment's configured bounds --
+                    # the continuous analogue of the discrete random-replacement above.
+                    act = torch.rand(obs.size(0), env.action_dim, device=obs.device)
+                    act = env.action_low + act * (env.action_high - env.action_low)
 
             next_obs, rew, end, trunc, info = env.step(act)
 
