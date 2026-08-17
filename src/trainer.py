@@ -423,7 +423,10 @@ class Trainer(StateDictMixin):
         return to_log
 
     def load_state_checkpoint(self) -> None:
-        self.load_state_dict(torch.load(self._path_state_ckpt, map_location=self._device))
+        # Trusted, locally generated DIAMOND state (includes Dataset state: numpy arrays, Counters,
+        # etc.), not just tensor weights -- weights_only=False is required for PyTorch >=2.6, whose
+        # default changed to weights_only=True.
+        self.load_state_dict(torch.load(self._path_state_ckpt, map_location=self._device, weights_only=False))
 
     def save_checkpoint(self) -> None:
         if self._rank == 0:

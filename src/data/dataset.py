@@ -140,4 +140,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
 
     def load_from_default_path(self) -> None:
         if self._default_path.is_file():
-            self.load_state_dict(torch.load(self._default_path))
+            # Trusted, locally generated DIAMOND dataset state (numpy arrays for start_idx/lengths,
+            # Counter objects for counter_rew/counter_end), not just tensor weights -- weights_only=False
+            # is required for PyTorch >=2.6, whose default changed to weights_only=True.
+            self.load_state_dict(torch.load(self._default_path, weights_only=False))
