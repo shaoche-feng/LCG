@@ -278,24 +278,37 @@ class Trainer(StateDictMixin):
         steps_per_epoch = c.steps_per_epoch
         max_steps = c.first_epoch.max
         threshold_rew = c.first_epoch.threshold_rew
+        continuous_reward = self.agent.rew_end_model.continuous_reward
         assert min_steps % steps_per_epoch == 0
 
         steps = min_steps
         while True:
             to_log += self._train_collector.send(NumToCollect(steps=steps))
             num_steps = self.train_dataset.num_steps
-            total_minority_rew = sum(sorted(self.train_dataset.counts_rew)[:-1])
-            if total_minority_rew >= threshold_rew:
-                break
-            if (max_steps is not None) and num_steps >= max_steps:
-                print("Reached the specified maximum for initial collect")
-                break
-            print(f"Minority reward: {total_minority_rew}/{threshold_rew} -> Keep collecting\n")
+
+            if continuous_reward:
+                # Dense/continuous rewards have no meaningful "minority reward class" to wait for
+                # (see Stage 7B report for the full trace/rationale): stop purely on the step
+                # budget already represented by first_epoch.min, without ever consulting
+                # reward-sign counts, thresholds, or .sign().
+                if num_steps >= min_steps:
+                    break
+                print(f"Continuous reward collection: {num_steps}/{min_steps} steps -> keep collecting\n")
+            else:
+                total_minority_rew = sum(sorted(self.train_dataset.counts_rew)[:-1])
+                if total_minority_rew >= threshold_rew:
+                    break
+                if (max_steps is not None) and num_steps >= max_steps:
+                    print("Reached the specified maximum for initial collect")
+                    break
+                print(f"Minority reward: {total_minority_rew}/{threshold_rew} -> Keep collecting\n")
+
             steps = steps_per_epoch
 
         print("\nSummary of initial collect:")
         print(f"Num steps: {num_steps} / {c.num_steps_total}")
-        print(f"Reward counts: {dict(self.train_dataset.counter_rew)}")
+        if not continuous_reward:
+            print(f"Reward counts: {dict(self.train_dataset.counter_rew)}")
 
         remaining_steps = c.num_steps_total - num_steps
         assert remaining_steps % c.steps_per_epoch == 0

@@ -37,9 +37,14 @@ collection:
     epsilon: 0.01
     num_steps_total: 100000
     first_epoch:
+      # min: for discrete/Atari agents (RewEndModel.continuous_reward=False), the collection
+      # floor before the reward-class-balance heuristic below is even consulted. For
+      # continuous-reward agents (e.g. DM Control), min is used directly and *only* as the
+      # initial-collection step budget: collection stops as soon as num_steps >= min, and
+      # max/threshold_rew below are not used at all (see Trainer.collect_initial_dataset).
       min: 5000
-      max: 10000  # null: no maximum
-      threshold_rew: 10
+      max: 10000  # null: no maximum. Atari-only.
+      threshold_rew: 10  # Atari-only.
     steps_per_epoch: 100
   test:
     num_envs: 1
