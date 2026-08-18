@@ -16,6 +16,20 @@ InitialCondition = Tuple[Tensor, Tensor, Tuple[Tensor, Tensor]]
 
 
 @dataclass
+class ImaginedCandidate:
+    """The exact conditioning window x* = (obs_buffer, act_buffer) the diffusion sampler
+    used, and the exact y* it sampled, for one WorldModelEnv.step() call. x_obs/x_act keep
+    their natural (num_envs, t, ...) shape (matching DiffusionSampler.sample's own input
+    convention); y_star is the unmodified tensor returned by the sampler, not reconstructed
+    or independently resampled. Populated only when WorldModelEnv is constructed with
+    `return_imagined_candidate=True` (default False, existing behavior unchanged)."""
+
+    x_obs: Tensor
+    x_act: Tensor
+    y_star: Tensor
+
+
+@dataclass
 class WorldModelEnvConfig:
     horizon: int
     num_batches_to_preload: int
@@ -30,11 +44,13 @@ class WorldModelEnv:
         data_loader: DataLoader,
         cfg: WorldModelEnvConfig,
         return_denoising_trajectory: bool = False,
+        return_imagined_candidate: bool = False,
     ) -> None:
         self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
         self.rew_end_model = rew_end_model
         self.horizon = cfg.horizon
         self.return_denoising_trajectory = return_denoising_trajectory
+        self.return_imagined_candidate = return_imagined_candidate
         self.num_envs = data_loader.batch_sampler.batch_size
         self.generator_init = self.make_generator_init(data_loader, cfg.num_batches_to_preload)
 
@@ -65,6 +81,10 @@ class WorldModelEnv:
     def step(self, act: torch.Tensor) -> StepOutput:
         self.act_buffer[:, -1] = act
 
+        if self.return_imagined_candidate:
+            candidate_x_obs = self.obs_buffer.clone()
+            candidate_x_act = self.act_buffer.clone()
+
         next_obs, denoising_trajectory = self.predict_next_obs()
         rew, end = self.predict_rew_end(next_obs.unsqueeze(1))
 
@@ -80,6 +100,9 @@ class WorldModelEnv:
         info = {}
         if self.return_denoising_trajectory:
             info["denoising_trajectory"] = torch.stack(denoising_trajectory, dim=1)
+
+        if self.return_imagined_candidate:
+            info["imagined_candidate"] = ImaginedCandidate(candidate_x_obs, candidate_x_act, next_obs.clone())
 
         if dead.any():
             self.reset_dead(dead)

@@ -91,6 +91,7 @@ class ActorCritic(nn.Module):
 
         self.env_loop = None
         self.loss_cfg = None
+        self.intrinsic_reward_fn = None
 
     @property
     def device(self) -> torch.device:
@@ -100,6 +101,15 @@ class ActorCritic(nn.Module):
         assert self.env_loop is None and self.loss_cfg is None
         self.env_loop = make_env_loop(rl_env, self)
         self.loss_cfg = loss_cfg
+
+    def set_intrinsic_reward_fn(self, fn) -> None:
+        """Optional hook: fn(infos, env_rew) -> Tensor, same shape as env_rew, used in place
+        of the environment/world-model reward when set. `infos` is the per-step list
+        env_loop already yields (previously discarded); `env_rew` is the reward env_loop
+        collected from `rl_env.step()` for that rollout. None (the default) reproduces
+        forward()'s exact prior behavior -- this method exists only so that behavior can be
+        opted into, never as a side effect of another call."""
+        self.intrinsic_reward_fn = fn
 
     def predict_act_value(self, obs: Tensor, hx_cx: Tuple[Tensor, Tensor]) -> ActorCriticOutput:
         assert obs.ndim == 4
@@ -214,7 +224,10 @@ class ActorCritic(nn.Module):
 
     def forward(self) -> LossAndLogs:
         c = self.loss_cfg
-        _, act, rew, end, trunc, logits_act, val, val_bootstrap, _ = self.env_loop.send(c.backup_every)
+        _, act, rew, end, trunc, logits_act, val, val_bootstrap, infos = self.env_loop.send(c.backup_every)
+
+        if self.intrinsic_reward_fn is not None:
+            rew = self.intrinsic_reward_fn(infos, rew)
 
         log_prob, entropy_per_sample = self.log_prob_and_entropy(logits_act, act)
         entropy = entropy_per_sample.mean()
