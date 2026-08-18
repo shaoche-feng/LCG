@@ -97,6 +97,7 @@ def check_vjp_matches_gauss_newton(denoiser, params, device, num_mc=6000, seed=0
     print(f"[GN check] num_mc={num_mc}, d_S={d_s}, d_y={J.shape[0]}")
     print(f"[GN check] ||G_mc - G_exact||_F / ||G_exact||_F = {rel_err_full.item():.4f}")
     print(f"[GN check] ||diag_mc - diag_exact|| / ||diag_exact|| = {rel_err_diag.item():.4f}")
+    print(f"[GN check] ||diag_mc - G_exact||_F / ||G_exact||_F = {(G_mc.diagonal() - G_exact).norm() / G_exact.norm():.4f}")
     assert rel_err_full < 0.15, "Monte Carlo GN estimate deviates too much from explicit J^T J"
     assert rel_err_diag < 0.15, "Monte Carlo GN diagonal deviates too much from explicit diag(J^T J)"
 
@@ -129,6 +130,7 @@ def check_sigma_strata(device, num_strata=3, n_per_stratum=100_000):
 
 
 def main():
+    print("from validate_lcg_stage1.py: running Stage 1 validation checks...")
     device = torch.device("cpu")
     denoiser = build_toy_denoiser(device)
     params, _ = check_theta_s(denoiser)
