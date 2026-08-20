@@ -8,6 +8,7 @@ from .candidate_score import candidate_score, candidate_score_per_stratum
 from .crn import CRNBank, DEFAULT_NUM_CRN_BANKS, make_crn_bank, make_crn_bank_set
 from .gauss_newton import compute_vjp, differentiable_denoise, edm_weight
 from .intrinsic_reward import make_lcg_intrinsic_reward_fn
+from .lifecycle import LCGConfig, LCGLifecycle
 from .precision import historical_precision, load_transition, sample_valid_transitions
 from .reward_normalization import RunningRMS, RunningRMSConfig, wrap_with_running_rms
 from .sigma_strata import sample_sigma_strata, sample_sigma_stratum
@@ -27,6 +28,8 @@ __all__ = [
     "imagined_candidates_from_batch",
     "load_transition",
     "make_lcg_intrinsic_reward_fn",
+    "LCGConfig",
+    "LCGLifecycle",
     "make_crn_bank",
     "make_crn_bank_set",
     "RunningRMS",
