@@ -17,6 +17,7 @@ from agent import Agent, get_action_space_kwargs
 from coroutines.collector import make_collector, NumToCollect
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
 from envs import make_atari_env, make_dm_control_env, WorldModelEnv
+from lcg import LCGConfig, LCGLifecycle
 from utils import (
     broadcast_if_needed,
     build_ddp_wrapper,
@@ -172,6 +173,8 @@ class Trainer(StateDictMixin):
 
         # RL env
 
+        lcg_enabled = bool(getattr(cfg, "lcg", None) is not None and cfg.lcg.enabled)
+
         if self._is_model_free:
             rl_env = make_env(num_envs=cfg.actor_critic.training.batch_size, device=self._device, **env_kwargs_train)
 
@@ -181,7 +184,10 @@ class Trainer(StateDictMixin):
             bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
             dl_actor_critic = make_data_loader(batch_sampler=bs)
             wm_env_cfg = instantiate(cfg.world_model_env)
-            rl_env = WorldModelEnv(self.agent.denoiser, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg)
+            rl_env = WorldModelEnv(
+                self.agent.denoiser, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg,
+                return_imagined_candidate=lcg_enabled,
+            )
 
             if cfg.training.compile_wm:
                 rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
@@ -191,6 +197,33 @@ class Trainer(StateDictMixin):
         sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
         actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
         self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
+
+        # LCG intrinsic-reward lifecycle (Stage 5C) -- disabled unless cfg.lcg.enabled is
+        # True (default False, see config/trainer.yaml); only meaningful for the
+        # world-model (non-model-free) path. When disabled, self._lcg_lifecycle stays None
+        # and train_agent()/train_component() take their exact original code paths.
+        if lcg_enabled and not self._is_model_free:
+            lcg_cfg = LCGConfig(
+                enabled=True,
+                h_d_batch_size=cfg.lcg.h_d_batch_size,
+                damping=cfg.lcg.damping,
+                beta=cfg.lcg.beta,
+                num_strata=cfg.lcg.num_strata,
+                num_crn_banks=cfg.lcg.num_crn_banks,
+                chunk_size=cfg.lcg.chunk_size,
+                rms_enabled=cfg.lcg.rms_enabled,
+                rms_alpha=cfg.lcg.rms_alpha,
+                rms_ema_decay=cfg.lcg.rms_ema_decay,
+                rms_eps=cfg.lcg.rms_eps,
+            )
+            self._lcg_lifecycle = LCGLifecycle(
+                lcg_cfg, sigma_distribution_cfg,
+                img_channels=cfg.agent.denoiser.inner_model.img_channels,
+                img_size=cfg.env.train.size,
+                device=self._device,
+            )
+        else:
+            self._lcg_lifecycle = None
 
         # Training state (things to be saved/restored)
         self.epoch = 0
@@ -348,8 +381,26 @@ class Trainer(StateDictMixin):
         for name in model_names:
             cfg = getattr(self._cfg, name).training
             if self.epoch > cfg.start_after_epochs:
+                if name == "actor_critic" and self._lcg_lifecycle is not None:
+                    # World-model update for this round is complete (denoiser/rew_end_model
+                    # already trained above) -- refresh h_D/CRN banks/RunningRMS once per
+                    # round, then rewire the frozen hook before this round's ActorCritic
+                    # updates begin. See lcg.lifecycle.LCGLifecycle.
+                    self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset)
+                    self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
                 steps = cfg.steps_first_epoch if self.epoch == 1 else cfg.steps_per_epoch
-                to_log += self.train_component(name, steps)
+                if self._lcg_lifecycle is not None:
+                    t0 = time.time()
+                    to_log += self.train_component(name, steps)
+                    # NOTE: self._lcg_lifecycle.round_id is only authoritative for `name ==
+                    # "actor_critic"` (refresh() has just run this epoch); for
+                    # denoiser/rew_end_model it would still show the *previous* round's id,
+                    # so this line is labeled by epoch instead to avoid mislabeling.
+                    round_label = self._lcg_lifecycle.round_id if name == "actor_critic" else f"pending(epoch={self.epoch})"
+                    print(f"[LCG-TIMING] round={round_label} component={name} "
+                          f"time={time.time() - t0:.2f}s", flush=True)
+                else:
+                    to_log += self.train_component(name, steps)
         return to_log
 
     @torch.no_grad()
@@ -377,9 +428,21 @@ class Trainer(StateDictMixin):
 
         num_steps = cfg.grad_acc_steps * steps
 
+        # Gated purely-additive timing split (Stage 5C): only active for actor_critic when
+        # LCG is enabled, so it costs nothing and changes nothing when LCG is disabled or
+        # for the other components.
+        lcg_timing = self._lcg_lifecycle is not None and name == "actor_critic"
+        t_forward_total = 0.0
+        t_backward_total = 0.0
+
         for i in trange(num_steps, desc=f"Training {name}", disable=self._rank > 0):
             batch = next(data_iterator).to(self._device) if data_iterator is not None else None
+            if lcg_timing:
+                t0 = time.time()
             loss, metrics = model(batch) if batch is not None else model()
+            if lcg_timing:
+                t_forward_total += time.time() - t0
+                t0 = time.time()
             loss.backward()
 
             num_batch = self.num_batch_train.get(name)
@@ -397,8 +460,14 @@ class Trainer(StateDictMixin):
                 if lr_sched is not None:
                     metrics["lr"] = lr_sched.get_last_lr()[0]
                     lr_sched.step()
+            if lcg_timing:
+                t_backward_total += time.time() - t0
 
             to_log.append(metrics)
+
+        if lcg_timing:
+            print(f"[LCG-TIMING] round={self._lcg_lifecycle.round_id} component=actor_critic "
+                  f"forward(imagination+scoring)={t_forward_total:.2f}s backward+opt={t_backward_total:.2f}s", flush=True)
 
         process_confusion_matrices_if_any_and_compute_classification_metrics(to_log)
         to_log = [{f"{name}/train/{k}": v for k, v in d.items()} for d in to_log]

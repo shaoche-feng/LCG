@@ -148,3 +148,19 @@ actor_critic:
     lr: 1e-4
     weight_decay: 0
     eps: 1e-8
+
+# LCG intrinsic-reward lifecycle (Stage 5C). Disabled by default: when `enabled: False`,
+# Trainer.train_agent()/train_component() take their exact original code paths, byte for
+# byte. All values below other than `enabled` are only read when `enabled: True`.
+lcg:
+  enabled: False
+  h_d_batch_size: 40
+  damping: 1e-4
+  beta: 1.0
+  num_strata: 3
+  num_crn_banks: 2
+  chunk_size: 4
+  rms_enabled: True
+  rms_alpha: 1.0
+  rms_ema_decay: 0.99
+  rms_eps: 1e-8
