@@ -24,8 +24,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+def _find_repo_root(start: Path) -> Path:
+    p = start.resolve()
+    while not ((p / "src").is_dir() and (p / "scripts").is_dir()):
+        if p.parent == p:
+            raise RuntimeError("could not locate LCG repo root (no ancestor has both src/ and scripts/)")
+        p = p.parent
+    return p
+
+
+_REPO_ROOT = _find_repo_root(Path(__file__).parent)
+sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# scripts/ was reorganized into topic subfolders after this file was first written; this
+# extra entry lets this module find diagnose_lcg_backward_variance_setup regardless of
+# exactly where this file itself ends up nested.
+sys.path.insert(0, str(_REPO_ROOT / "scripts" / "backward_VJP" / "3-stratum"))
 
 import torch
 import torch.func as func

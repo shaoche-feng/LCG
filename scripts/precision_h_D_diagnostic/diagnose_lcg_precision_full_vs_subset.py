@@ -48,7 +48,16 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+def _find_repo_root(start: Path) -> Path:
+    p = start.resolve()
+    while not ((p / "src").is_dir() and (p / "scripts").is_dir()):
+        if p.parent == p:
+            raise RuntimeError("could not locate LCG repo root (no ancestor has both src/ and scripts/)")
+        p = p.parent
+    return p
+
+
+sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
 
 import hashlib
 import numpy as np

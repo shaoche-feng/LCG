@@ -20,8 +20,19 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+def _find_repo_root(start: Path) -> Path:
+    p = start.resolve()
+    while not ((p / "src").is_dir() and (p / "scripts").is_dir()):
+        if p.parent == p:
+            raise RuntimeError("could not locate LCG repo root (no ancestor has both src/ and scripts/)")
+        p = p.parent
+    return p
+
+
+_REPO_ROOT = _find_repo_root(Path(__file__).parent)
+sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(_REPO_ROOT / "scripts" / "backward_VJP" / "3-stratum"))
 
 import torch
 
