@@ -157,10 +157,21 @@ lcg:
   h_d_batch_size: 40
   damping: 1e-4
   beta: 1.0
-  num_strata: 3
-  num_crn_banks: 2
-  chunk_size: 4
+  num_strata: 3       # only used by the legacy candidate_estimator=vjp_stratified path (and always by historical_precision)
+  num_crn_banks: 2     # only used by the legacy candidate_estimator=vjp_stratified path
+  chunk_size: 4         # only used by the legacy candidate_estimator=vjp_stratified path
   rms_enabled: True
   rms_alpha: 1.0
   rms_ema_decay: 0.99
   rms_eps: 1e-8
+  # Candidate-side scoring backend (Stage 6). historical_precision is unaffected by this
+  # setting -- it always uses the backward/VJP estimator (lcg.gauss_newton.compute_vjp).
+  candidate_estimator: forward_jvp  # "forward_jvp" (production) or "vjp_stratified" (legacy/diagnostic)
+  candidate_sampling: simple_mc  # only "simple_mc" is implemented for candidate_estimator=forward_jvp
+  candidate_num_mc: 12 #16, 24
+  candidate_crn: full  # only "full" is implemented
+  # Candidate-chunk size for the forward_jvp scorer (Stage 7 batching optimization).
+  # 16 was benchmarked as the fastest AND lowest-memory choice among C in
+  # {4,8,16,32,64,96,128,240} at M=12 (22.9s/480 candidates, 958MB peak reserved on an
+  # 8GB laptop GPU); C=240 hit a genuine GPU-memory cliff and was slower than C=4.
+  candidate_chunk_size: 16

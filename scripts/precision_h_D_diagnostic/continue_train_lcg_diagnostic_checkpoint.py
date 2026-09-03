@@ -27,7 +27,17 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+def _find_repo_root(start: Path) -> Path:
+    p = start.resolve()
+    while not ((p / "src").is_dir() and (p / "scripts").is_dir()):
+        if p.parent == p:
+            raise RuntimeError("could not locate LCG repo root")
+        p = p.parent
+    return p
+
+
+sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
 
 import numpy as np
 import torch
@@ -42,7 +52,7 @@ from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
 from models.diffusion.inner_model import InnerModelConfig
 from utils import configure_opt
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = _find_repo_root(Path(__file__).parent)
 SCRATCH_BASE = Path(
     r"C:\Users\jerry\AppData\Local\Temp\claude\c--Users-jerry-Project-LCG"
     r"\974bd621-91fa-4766-822e-267b547a92c5\scratchpad"

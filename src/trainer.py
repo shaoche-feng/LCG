@@ -215,6 +215,11 @@ class Trainer(StateDictMixin):
                 rms_alpha=cfg.lcg.rms_alpha,
                 rms_ema_decay=cfg.lcg.rms_ema_decay,
                 rms_eps=cfg.lcg.rms_eps,
+                candidate_estimator=cfg.lcg.candidate_estimator,
+                candidate_sampling=cfg.lcg.candidate_sampling,
+                candidate_num_mc=cfg.lcg.candidate_num_mc,
+                candidate_crn=cfg.lcg.candidate_crn,
+                candidate_chunk_size=cfg.lcg.candidate_chunk_size,
             )
             self._lcg_lifecycle = LCGLifecycle(
                 lcg_cfg, sigma_distribution_cfg,
