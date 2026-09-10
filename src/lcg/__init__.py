@@ -21,7 +21,7 @@ from .forward_jvp import (
 from .gauss_newton import compute_vjp, differentiable_denoise, edm_weight
 from .intrinsic_reward import make_lcg_forward_jvp_intrinsic_reward_fn, make_lcg_intrinsic_reward_fn
 from .lifecycle import CANDIDATE_ESTIMATORS, LCGConfig, LCGLifecycle
-from .precision import historical_precision, load_transition, sample_valid_transitions
+from .precision import historical_precision, load_transition, sample_uniform_historical_transitions
 from .reward_normalization import RunningRMS, RunningRMSConfig, wrap_with_running_rms
 from .sigma_strata import sample_sigma_strata, sample_sigma_stratum
 from .theta_s import selected_dim, selected_parameters, selected_submodules
@@ -59,7 +59,7 @@ __all__ = [
     "selected_named_parameters",
     "unflatten_to_dict",
     "wrap_with_running_rms",
-    "sample_valid_transitions",
+    "sample_uniform_historical_transitions",
     "sample_sigma_strata",
     "sample_sigma_stratum",
     "score_candidate_with_banks",

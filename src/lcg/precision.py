@@ -5,49 +5,87 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 
-from data import BatchSampler, Dataset, SegmentId
+from data import Dataset, SegmentId
 from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig, apply_noise_from_samples
 
 from .gauss_newton import compute_vjp
 from .sigma_strata import sample_sigma_stratum
 
 
-def sample_valid_transitions(
+def sample_uniform_historical_transitions(
     dataset: Dataset,
     batch_size: int,
     num_steps_conditioning: int,
     seed: Optional[int] = None,
     rank: int = 0,
     world_size: int = 1,
+    replace: bool = False,
 ) -> List[SegmentId]:
-    """B candidate LCG transitions (x_i, y_i), drawn through DIAMOND's existing replay
-    sampling machinery (BatchSampler + Dataset) rather than a new pipeline.
+    """B historical LCG transitions (x_i, y_i), sampled uniformly over every valid
+    transition in the (rank's partition of the) dataset -- P((episode, t)) = 1/N for
+    every valid (episode_id, t), N = dataset.num_steps (summed over the rank's eligible
+    episodes).
 
-    One valid transition is a segment of `num_steps_conditioning + 1` frames whose *last*
-    frame (the target y_i) is a real, unpadded environment step; the preceding
-    `num_steps_conditioning` frames (x_i's conditioning window) may be left-padded with
-    zeros near an episode's start -- exactly what Denoiser.forward already tolerates via
-    mask_padding (it masks the loss on the target position, never on the conditioning
-    window). With `can_sample_beyond_end=False`, BatchSampler only ever produces segments
-    whose stop position is a real, in-episode step, so every draw satisfies this by
-    construction; `load_transition` still checks it defensively.
+    LCG-specific: does NOT use DIAMOND's generic BatchSampler. BatchSampler.sample()'s
+    can_sample_beyond_end=False branch draws a uniform timestep t and THEN shifts it by an
+    independent random offset in [0, seq_length) before clipping to the episode boundary
+    (stop = min(L_e, t+1+offset)) -- appropriate for training-time window diversity (which
+    of the seq_length frames in a window is the "last" one should vary), but wrong for
+    LCG's "one uniformly-sampled historical transition = one curvature sample" semantics:
+    the transition that ends up as the actual VJP target is stop-1, not t, so the
+    resulting distribution over targets is NOT uniform -- it under-samples the first
+    seq_length-1 transitions of every episode and produces a probability spike at each
+    episode's final transition (all overflowing (t, offset) combinations collapse onto
+    it via the min-clip). See docs/lcg_diagnostic/historical_sampling_fix/ for the
+    quantified bias and an old-vs-new comparison diagnostic.
 
-    Uses natural (unweighted, i.e. `sample_weights=None`) episode-length-proportional
-    sampling -- not the training-time recency-biased `sample_weights` curriculum -- since
-    h_D is meant to summarize the whole historical dataset D, not a training curriculum.
+    Every frame s_t (t in [0, L_e)) of every episode e is a valid target here (the
+    num_steps_conditioning frames before it may be left-padded near an episode's start,
+    exactly as DIAMOND's own Denoiser.forward tolerates via mask_padding) -- so N =
+    dataset.num_steps = sum_e L_e is exactly the number of valid (episode, t) pairs, and
+    a uniform draw of a global frame index in [0, N) followed by mapping it back to
+    (episode_id, t) via dataset.start_idx gives P((episode, t)) = 1/N directly, with no
+    further randomization: the SegmentId's stop is built as t+1 (not a randomized
+    offset), so the sampled t IS the transition whose curvature gets measured.
+
+    batch_size transitions are drawn WITHOUT replacement by default (replace=False),
+    matching the N/B unbiased-subset-sum estimator's "B distinct historical transitions"
+    interpretation; raises if batch_size exceeds the number of available transitions
+    unless replace=True is passed explicitly. Uses a local np.random.Generator (not
+    global np.random state) -- this reduces, not adds to, the codebase's existing global-
+    RNG-contamination surface (a separate, not-yet-fixed issue tracked elsewhere).
     """
-    if seed is not None:
-        np.random.seed(seed)
-    sampler = BatchSampler(
-        dataset,
-        rank,
-        world_size,
-        batch_size,
-        num_steps_conditioning + 1,
-        sample_weights=None,
-        can_sample_beyond_end=False,
-    )
-    return sampler.sample()
+    if world_size > 1:
+        eligible_episodes = np.arange(rank, dataset.num_episodes, world_size)
+    else:
+        eligible_episodes = np.arange(dataset.num_episodes)
+    eligible_lengths = dataset.lengths[eligible_episodes]
+    n_available = int(eligible_lengths.sum())
+
+    if not replace:
+        assert batch_size <= n_available, (
+            f"requested batch_size={batch_size} historical transitions without replacement, "
+            f"but only {n_available} distinct transitions are available "
+            f"(rank={rank}, world_size={world_size}); pass replace=True to explicitly allow "
+            f"duplicate transitions, or reduce batch_size."
+        )
+
+    rng = np.random.default_rng(seed)
+    global_indices = rng.choice(n_available, size=batch_size, replace=replace)
+
+    # cumulative frame offsets WITHIN the eligible-episode subset, for global index -> (episode, t)
+    eligible_start_idx = np.concatenate(([0], np.cumsum(eligible_lengths)[:-1]))
+    seq_length = num_steps_conditioning + 1
+
+    segment_ids = []
+    for g in global_indices:
+        local_ep_idx = int(np.searchsorted(eligible_start_idx, g, side="right") - 1)
+        episode_id = int(eligible_episodes[local_ep_idx])
+        t = int(g - eligible_start_idx[local_ep_idx])
+        stop = t + 1
+        start = stop - seq_length
+        segment_ids.append(SegmentId(episode_id, start, stop))
+    return segment_ids
 
 
 def load_transition(
@@ -87,11 +125,16 @@ def historical_precision(
         h_D_hat = damping * 1_{d_S} + beta * (N / B) * sum_{i in B} g_i
         g_i = (1 / num_strata) * sum_{m=1}^{num_strata} v_i^(m) (.) v_i^(m)
 
-    B is a random subset of size |B| drawn (with replacement, matching DIAMOND's own
-    minibatch sampling convention) from the full dataset D of size N (defaults to
-    `dataset.num_steps`: see `sample_valid_transitions`/`load_transition` for what counts
-    as one valid transition in DIAMOND's replay representation, and why `dataset.num_steps`
-    is exactly that count under this pipeline's left-padding convention). The N/B factor
+    B is a subset of size |B| drawn WITHOUT replacement, uniformly over every valid
+    historical transition (P((episode,t))=1/N for every valid (episode,t) pair -- see
+    sample_uniform_historical_transitions, which replaced the previous BatchSampler-based
+    sampler after discovering it did not actually sample the transition it claimed to:
+    BatchSampler's endpoint-shifting logic made the ACTUAL VJP target a randomized
+    function of the originally-drawn timestep, non-uniform over historical transitions),
+    from the full dataset D of size N (defaults to `dataset.num_steps`: see
+    `sample_uniform_historical_transitions`/`load_transition` for what counts as one
+    valid transition in DIAMOND's replay representation, and why `dataset.num_steps` is
+    exactly that count under this pipeline's left-padding convention). The N/B factor
     makes h_D_hat an unbiased estimate of the full-dataset sum for any B, so its scale
     should not depend systematically on the precision-estimation batch size.
 
@@ -117,7 +160,7 @@ def historical_precision(
     d_S = sum(p.numel() for p in theta_s_params)
     h = damping * torch.ones(d_S, device=device)
 
-    segment_ids = sample_valid_transitions(dataset, B, num_steps_conditioning, seed, rank, world_size)
+    segment_ids = sample_uniform_historical_transitions(dataset, B, num_steps_conditioning, seed, rank, world_size)
     scale = beta * (N / B)
 
     for segment_id in segment_ids:
