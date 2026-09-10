@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch import Tensor
@@ -14,6 +14,7 @@ def sample_sigma_stratum(
     num_strata: int,
     n: int,
     device: torch.device,
+    generator: Optional[torch.Generator] = None,
 ) -> Tensor:
     """Draw n sigmas from one equal-probability stratum of p_train(sigma) in log-sigma
     space. p_train is the same log-normal used by Denoiser.sample_sigma_training
@@ -21,11 +22,17 @@ def sample_sigma_stratum(
     restricts z to the quantile range [stratum_idx/num_strata, (stratum_idx+1)/num_strata]
     of the standard normal via inverse-CDF sampling. num_strata=1 reproduces the
     unstratified distribution exactly (the single-sample ablation case).
+
+    generator=None (default) preserves the exact original behavior (draws from the
+    global torch RNG, matching Denoiser.sample_sigma_training's own unseeded convention).
+    Passing an explicit torch.Generator (device-matched to `device`) makes this draw not
+    consume/mutate global RNG state -- used by LCG's production callers for RNG
+    isolation from DIAMOND; DIAMOND itself never passes one.
     """
     assert 0 <= stratum_idx < num_strata
     lo_q = max(stratum_idx / num_strata, _QUANTILE_EPS)
     hi_q = min((stratum_idx + 1) / num_strata, 1 - _QUANTILE_EPS)
-    u = torch.empty(n, device=device).uniform_(lo_q, hi_q)
+    u = torch.empty(n, device=device).uniform_(lo_q, hi_q, generator=generator)
     standard_normal = torch.distributions.Normal(
         torch.zeros((), device=device), torch.ones((), device=device)
     )
@@ -39,6 +46,7 @@ def sample_sigma_strata(
     num_strata: int,
     n: int,
     device: torch.device,
+    generator: Optional[torch.Generator] = None,
 ) -> List[Tensor]:
     """One draw of n sigmas per stratum, for m = 0 .. num_strata-1."""
-    return [sample_sigma_stratum(cfg, m, num_strata, n, device) for m in range(num_strata)]
+    return [sample_sigma_stratum(cfg, m, num_strata, n, device, generator=generator) for m in range(num_strata)]

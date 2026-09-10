@@ -150,16 +150,22 @@ def make_jvp_bank(
 ) -> JVPBank:
     """Legacy/diagnostic 3-stratum Full-CRN forward-JVP bank: one probe per equal-
     probability sigma stratum. Kept for the stratified forward-JVP diagnostic path; the
-    production candidate scorer uses `make_forward_jvp_simple_mc_bank` instead."""
+    production candidate scorer uses `make_forward_jvp_simple_mc_bank` instead.
+
+    RNG isolation: uses a local, device-matched torch.Generator (seeded from `seed` when
+    given, else auto-seeded from entropy) rather than global torch.manual_seed, so
+    building a bank never mutates the global torch RNG stream DIAMOND's own code
+    observes. Same seed -> same bank; different seeds -> different banks (unchanged)."""
+    gen = torch.Generator(device=device)
     if seed is not None:
-        torch.manual_seed(seed)
+        gen.manual_seed(seed)
     c = y_shape[1]
     sigmas, epsilons, epsilons_offset, etas = [], [], [], []
     for m in range(num_strata):
-        sigmas.append(sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device).detach())
-        epsilons.append(torch.randn(y_shape, device=device).detach())
-        epsilons_offset.append(torch.randn(1, c, 1, 1, device=device).detach())
-        etas.append(torch.randn(d_S, device=device).detach())
+        sigmas.append(sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device, generator=gen).detach())
+        epsilons.append(torch.randn(y_shape, device=device, generator=gen).detach())
+        epsilons_offset.append(torch.randn(1, c, 1, 1, device=device, generator=gen).detach())
+        etas.append(torch.randn(d_S, device=device, generator=gen).detach())
     return JVPBank(tuple(sigmas), tuple(epsilons), tuple(epsilons_offset), tuple(etas))
 
 
@@ -181,18 +187,22 @@ def make_forward_jvp_simple_mc_bank(
     including across computational chunks -- the bank is built once and passed unchanged
     into every chunk's score_one_jvp_bank call.
 
-    A single torch.manual_seed(seed) call up front (not one reseed per sample) is
-    sufficient for determinism: the whole num_samples-long draw sequence is then a
-    deterministic function of seed."""
+    A single generator seeded once up front (not one reseed per sample) is sufficient for
+    determinism: the whole num_samples-long draw sequence is then a deterministic
+    function of seed. RNG isolation: uses a local, device-matched torch.Generator rather
+    than global torch.manual_seed, so building a bank never mutates the global torch RNG
+    stream DIAMOND's own code observes. Same seed -> same bank; different seeds ->
+    different banks (unchanged)."""
+    gen = torch.Generator(device=device)
     if seed is not None:
-        torch.manual_seed(seed)
+        gen.manual_seed(seed)
     c = y_shape[1]
     sigmas, epsilons, epsilons_offset, etas = [], [], [], []
     for _ in range(num_samples):
-        sigmas.append(sample_sigma_stratum(sigma_cfg, 0, 1, 1, device).detach())
-        epsilons.append(torch.randn(y_shape, device=device).detach())
-        epsilons_offset.append(torch.randn(1, c, 1, 1, device=device).detach())
-        etas.append(torch.randn(d_S, device=device).detach())
+        sigmas.append(sample_sigma_stratum(sigma_cfg, 0, 1, 1, device, generator=gen).detach())
+        epsilons.append(torch.randn(y_shape, device=device, generator=gen).detach())
+        epsilons_offset.append(torch.randn(1, c, 1, 1, device=device, generator=gen).detach())
+        etas.append(torch.randn(d_S, device=device, generator=gen).detach())
     return JVPBank(tuple(sigmas), tuple(epsilons), tuple(epsilons_offset), tuple(etas))
 
 

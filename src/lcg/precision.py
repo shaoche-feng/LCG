@@ -160,6 +160,14 @@ def historical_precision(
     d_S = sum(p.numel() for p in theta_s_params)
     h = damping * torch.ones(d_S, device=device)
 
+    # Local, device-matched torch.Generator -- RNG isolation from DIAMOND: seeded (not
+    # torch.manual_seed'd globally) when `seed` is given, else auto-seeded from entropy;
+    # either way, every torch.randn* draw below uses THIS generator explicitly, so this
+    # call never mutates the global torch RNG stream DIAMOND's own code observes.
+    torch_gen = torch.Generator(device=device)
+    if seed is not None:
+        torch_gen.manual_seed(seed)
+
     segment_ids = sample_uniform_historical_transitions(dataset, B, num_steps_conditioning, seed, rank, world_size)
     scale = beta * (N / B)
 
@@ -167,11 +175,11 @@ def historical_precision(
         obs, act, y = load_transition(dataset, segment_id, num_steps_conditioning, device)
         g_i = torch.zeros(d_S, device=device)
         for m in range(num_strata):
-            sigma = sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device)
-            eps = torch.randn_like(y)
-            eps_offset = torch.randn(y.shape[0], y.shape[1], 1, 1, device=device)
+            sigma = sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device, generator=torch_gen)
+            eps = torch.randn(y.shape, dtype=y.dtype, device=y.device, generator=torch_gen)
+            eps_offset = torch.randn(y.shape[0], y.shape[1], 1, 1, device=device, generator=torch_gen)
             y_sigma = apply_noise_from_samples(y, sigma, eps, eps_offset, denoiser.cfg.sigma_offset_noise).detach()
-            v, _ = compute_vjp(denoiser, theta_s_params, y_sigma, sigma, obs, act)
+            v, _ = compute_vjp(denoiser, theta_s_params, y_sigma, sigma, obs, act, generator=torch_gen)
             g_i = g_i + (v * v) / num_strata
         h = h + scale * g_i
 

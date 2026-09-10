@@ -37,13 +37,18 @@ def make_crn_bank(
     num_strata: int = 3,
     seed: Optional[int] = None,
 ) -> CRNBank:
+    """RNG isolation: uses a local, device-matched torch.Generator (seeded from `seed`
+    when given, else auto-seeded from entropy) rather than global torch.manual_seed, so
+    building a bank never mutates the global torch RNG stream DIAMOND's own code
+    observes. Same seed -> same bank; different seeds -> different banks (unchanged)."""
+    gen = torch.Generator(device=device)
     if seed is not None:
-        torch.manual_seed(seed)
+        gen.manual_seed(seed)
     sigmas, epsilons, xis = [], [], []
     for m in range(num_strata):
-        sigmas.append(sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device).detach())
-        epsilons.append(torch.randn(y_shape, device=device).detach())
-        xis.append(torch.randn(y_shape, device=device).detach())
+        sigmas.append(sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device, generator=gen).detach())
+        epsilons.append(torch.randn(y_shape, device=device, generator=gen).detach())
+        xis.append(torch.randn(y_shape, device=device, generator=gen).detach())
     return CRNBank(tuple(sigmas), tuple(epsilons), tuple(xis))
 
 

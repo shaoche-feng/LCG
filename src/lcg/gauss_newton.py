@@ -35,6 +35,7 @@ def compute_vjp(
     obs: Tensor,
     act: Tensor,
     xi: Optional[Tensor] = None,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[Tensor, Tensor]:
     """v(theta_S; sigma, eps, xi) = grad_{theta_S}[ sqrt(2 w(sigma)) xi^T D_theta(y_sigma,sigma,x) ],
     for one transition (x, y) and one already-sampled (sigma, eps, xi) -- i.e. y_sigma is
@@ -42,7 +43,11 @@ def compute_vjp(
     without ever materializing the Jacobian J = d D_theta / d theta_S.
 
     xi defaults to a fresh N(0, I) draw shaped like the denoiser output (denoiser-output
-    space, per the LCG spec), inferred automatically via torch.randn_like.
+    space, per the LCG spec). `generator=None` (default) draws it via the global torch RNG
+    (byte-identical to the original torch.randn_like(d_theta) behavior); passing an
+    explicit torch.Generator (device-matched to d_theta) makes this draw not consume/
+    mutate global RNG state -- used by LCG's production callers for RNG isolation from
+    DIAMOND. Ignored if `xi` is supplied explicitly.
 
     Handles exactly one transition at a time (y_sigma.size(0) == 1): batching multiple
     dataset examples into a single backward pass would sum their per-example VJPs together
@@ -51,7 +56,7 @@ def compute_vjp(
     assert y_sigma.size(0) == 1, "compute_vjp handles one transition (batch size 1) at a time"
     d_theta, w = differentiable_denoise(denoiser, y_sigma, sigma, obs, act)
     if xi is None:
-        xi = torch.randn_like(d_theta)
+        xi = torch.randn(d_theta.shape, dtype=d_theta.dtype, device=d_theta.device, generator=generator)
     scalar = (torch.sqrt(2 * w) * xi * d_theta).sum()
     grads = torch.autograd.grad(scalar, params, retain_graph=False, create_graph=False)
     v = torch.cat([g.reshape(-1) for g in grads])
