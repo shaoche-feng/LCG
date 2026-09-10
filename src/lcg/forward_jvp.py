@@ -5,7 +5,7 @@ import torch
 import torch.func as func
 from torch import Tensor
 
-from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig
+from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig, apply_noise_from_samples
 
 from .sigma_strata import sample_sigma_stratum
 from .theta_s import selected_parameters
@@ -112,9 +112,13 @@ def jvp_through_F(
 
 @dataclass(frozen=True)
 class JVPBank:
-    """A set of shared forward-JVP probes: one (sigma, eps, eta) triple per entry, reused
-    across every candidate (Full CRN). sigmas/epsilons: same broadcastable shapes as
-    lcg.crn.CRNBank. etas: one flat (d_S,) tensor per entry (parameter-space probe).
+    """A set of shared forward-JVP probes: one (sigma, eps, eps_offset, eta) quadruple per
+    entry, reused across every candidate (Full CRN). sigmas/epsilons: same broadcastable
+    shapes as lcg.crn.CRNBank. epsilons_offset: one (1, C, 1, 1) tensor per entry -- the
+    DIAMOND offset-noise draw (models.diffusion.denoiser.apply_noise_from_samples),
+    broadcast across the whole candidate batch (batch dim 1, matching epsilons'
+    broadcasting convention), NOT one independent draw per candidate. etas: one flat
+    (d_S,) tensor per entry (parameter-space probe).
 
     Used both for the legacy 3-stratum forward estimator (one entry per sigma-stratum,
     via `make_jvp_bank`) and the production simple-MC estimator (M IID entries drawn from
@@ -125,10 +129,11 @@ class JVPBank:
 
     sigmas: Tuple[Tensor, ...]
     epsilons: Tuple[Tensor, ...]
+    epsilons_offset: Tuple[Tensor, ...]
     etas: Tuple[Tensor, ...]
 
     def __post_init__(self) -> None:
-        assert len(self.sigmas) == len(self.epsilons) == len(self.etas)
+        assert len(self.sigmas) == len(self.epsilons) == len(self.epsilons_offset) == len(self.etas)
 
     @property
     def num_strata(self) -> int:
@@ -148,12 +153,14 @@ def make_jvp_bank(
     production candidate scorer uses `make_forward_jvp_simple_mc_bank` instead."""
     if seed is not None:
         torch.manual_seed(seed)
-    sigmas, epsilons, etas = [], [], []
+    c = y_shape[1]
+    sigmas, epsilons, epsilons_offset, etas = [], [], [], []
     for m in range(num_strata):
         sigmas.append(sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device).detach())
         epsilons.append(torch.randn(y_shape, device=device).detach())
+        epsilons_offset.append(torch.randn(1, c, 1, 1, device=device).detach())
         etas.append(torch.randn(d_S, device=device).detach())
-    return JVPBank(tuple(sigmas), tuple(epsilons), tuple(etas))
+    return JVPBank(tuple(sigmas), tuple(epsilons), tuple(epsilons_offset), tuple(etas))
 
 
 def make_forward_jvp_simple_mc_bank(
@@ -164,25 +171,29 @@ def make_forward_jvp_simple_mc_bank(
     num_samples: int = 24,
     seed: Optional[int] = None,
 ) -> JVPBank:
-    """Production Full-CRN probe bank: num_samples IID (sigma, eps, eta) triples, each
-    sigma drawn from the *complete* training distribution p_train(sigma) (via
-    sample_sigma_stratum(cfg, stratum_idx=0, num_strata=1, ...), which collapses to the
-    full unstratified distribution -- validated in the forward simple-MC diagnostic). All
-    candidates scored against one bank instance share the identical num_samples triples
-    (Full CRN), including across computational chunks -- the bank is built once and passed
-    unchanged into every chunk's score_one_jvp_bank call.
+    """Production Full-CRN probe bank: num_samples IID (sigma, eps, eps_offset, eta)
+    quadruples, each sigma drawn from the *complete* training distribution p_train(sigma)
+    (via sample_sigma_stratum(cfg, stratum_idx=0, num_strata=1, ...), which collapses to
+    the full unstratified distribution -- validated in the forward simple-MC diagnostic).
+    eps_offset has shape (1, C, 1, 1) -- one draw per MC sample, shared across every
+    candidate via broadcasting (Full CRN), NOT independent per candidate. All candidates
+    scored against one bank instance share the identical num_samples quadruples,
+    including across computational chunks -- the bank is built once and passed unchanged
+    into every chunk's score_one_jvp_bank call.
 
     A single torch.manual_seed(seed) call up front (not one reseed per sample) is
     sufficient for determinism: the whole num_samples-long draw sequence is then a
     deterministic function of seed."""
     if seed is not None:
         torch.manual_seed(seed)
-    sigmas, epsilons, etas = [], [], []
+    c = y_shape[1]
+    sigmas, epsilons, epsilons_offset, etas = [], [], [], []
     for _ in range(num_samples):
         sigmas.append(sample_sigma_stratum(sigma_cfg, 0, 1, 1, device).detach())
         epsilons.append(torch.randn(y_shape, device=device).detach())
+        epsilons_offset.append(torch.randn(1, c, 1, 1, device=device).detach())
         etas.append(torch.randn(d_S, device=device).detach())
-    return JVPBank(tuple(sigmas), tuple(epsilons), tuple(etas))
+    return JVPBank(tuple(sigmas), tuple(epsilons), tuple(epsilons_offset), tuple(etas))
 
 
 def score_one_jvp_bank(
@@ -196,11 +207,14 @@ def score_one_jvp_bank(
     candidates: List[Candidate],
     chunk_size: int,
 ) -> Tensor:
-    """r_hat(x_j) = (1/len(bank)) * sum_s 2*||JVP_F(x_j; sigma_s, eps_s; z_s)||^2, for
-    every candidate. z_s = h_D_inv_sqrt * eta_s (elementwise, H_D diagonal, no_grad).
-    Processes candidates in chunks of chunk_size; one probe (bank entry) at a time across
-    all chunks, so at most one (chunk_size, d_S)-shaped JVP output is alive per step
-    regardless of bank size.
+    """r_hat(x_j) = (1/len(bank)) * sum_s 2*||JVP_F(x_j; y_sigma_s; z_s)||^2, for every
+    candidate, where y_sigma_s = apply_noise_from_samples(x_j, sigma_s, eps_s,
+    eps_offset_s, denoiser.cfg.sigma_offset_noise) is the exact DIAMOND training
+    corruption law (fixed: previously used y + sigma*eps only, omitting the offset-noise
+    term DIAMOND training actually applies). z_s = h_D_inv_sqrt * eta_s (elementwise,
+    H_D diagonal, no_grad). Processes candidates in chunks of chunk_size; one probe (bank
+    entry) at a time across all chunks, so at most one (chunk_size, d_S)-shaped JVP
+    output is alive per step regardless of bank size.
 
     Loop order (probe outer, candidate-chunk inner) and candidate-chunk pre-batching
     (obs/act/y concatenated once per chunk and reused across every probe) were chosen
@@ -230,13 +244,13 @@ def score_one_jvp_bank(
         chunks.append((start, obs_batch, act_batch, y_batch, len(chunk)))
 
     for m in range(num_entries):
-        sigma, eps, eta = bank.sigmas[m], bank.epsilons[m], bank.etas[m]
+        sigma, eps, eps_offset, eta = bank.sigmas[m], bank.epsilons[m], bank.epsilons_offset[m], bank.etas[m]
         with torch.no_grad():
             z_flat = h_D_inv_sqrt * eta
         tangent_named = unflatten_to_dict(z_flat, template)  # hoisted: once per probe, not once per (chunk, probe)
 
         for start, obs_batch, act_batch, y_batch, B in chunks:
-            y_sigma_batch = (y_batch + sigma.view(-1, 1, 1, 1) * eps).detach()
+            y_sigma_batch = apply_noise_from_samples(y_batch, sigma, eps, eps_offset, denoiser.cfg.sigma_offset_noise).detach()
             _, jvp_out = jvp_through_F(
                 denoiser, theta_s_named, frozen_named, tangent_named, y_sigma_batch, sigma, obs_batch, act_batch
             )

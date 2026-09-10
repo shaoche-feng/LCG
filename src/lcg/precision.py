@@ -6,7 +6,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from data import BatchSampler, Dataset, SegmentId
-from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig
+from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig, apply_noise_from_samples
 
 from .gauss_newton import compute_vjp
 from .sigma_strata import sample_sigma_stratum
@@ -95,8 +95,15 @@ def historical_precision(
     makes h_D_hat an unbiased estimate of the full-dataset sum for any B, so its scale
     should not depend systematically on the precision-estimation batch size.
 
-    Uses the same y_sigma = y + sigma*eps corruption convention validated in Stage 1
-    (`lcg.gauss_newton.compute_vjp`) -- no different corruption process is introduced here.
+    Uses the exact DIAMOND training corruption law, y_sigma = y + sigma*eps +
+    sigma_offset_noise*eps_offset (models.diffusion.denoiser.apply_noise_from_samples,
+    the same helper Denoiser.apply_noise calls) -- previously this used y + sigma*eps
+    only, omitting the offset-noise term DIAMOND training actually applies; fixed so
+    historical precision evaluates D_theta/F_theta at the same corrupted-input
+    distribution the denoiser was trained/queried on. compute_vjp/differentiable_denoise
+    are unmodified: compute_conditioners already derives the correct effective sigma
+    (sqrt(sigma^2+sigma_offset_noise^2)) from the bare sigma passed alongside y_sigma, so
+    only the corruption construction here needed fixing, not the preconditioning math.
     Caller is responsible for `denoiser.eval()`/frozen weights; this function never calls
     `.backward()`, never touches `.grad`, and never modifies denoiser parameters (only
     `torch.autograd.grad(..., retain_graph=False, create_graph=False)` inside `compute_vjp`
@@ -119,7 +126,8 @@ def historical_precision(
         for m in range(num_strata):
             sigma = sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device)
             eps = torch.randn_like(y)
-            y_sigma = (y + sigma.view(-1, 1, 1, 1) * eps).detach()
+            eps_offset = torch.randn(y.shape[0], y.shape[1], 1, 1, device=device)
+            y_sigma = apply_noise_from_samples(y, sigma, eps, eps_offset, denoiser.cfg.sigma_offset_noise).detach()
             v, _ = compute_vjp(denoiser, theta_s_params, y_sigma, sigma, obs, act)
             g_i = g_i + (v * v) / num_strata
         h = h + scale * g_i

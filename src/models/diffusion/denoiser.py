@@ -15,6 +15,26 @@ def add_dims(input: Tensor, n: int) -> Tensor:
     return input.reshape(input.shape + (1,) * (n - input.ndim))
 
 
+def apply_noise_from_samples(x: Tensor, sigma: Tensor, eps: Tensor, eps_offset: Tensor, sigma_offset_noise: float) -> Tensor:
+    """The single authoritative DIAMOND corruption formula:
+
+        y_sigma = x + sigma * eps + sigma_offset_noise * eps_offset
+
+    eps/eps_offset are supplied by the caller rather than drawn internally, so callers
+    outside training (e.g. LCG's historical-precision/forward-JVP estimators) can control
+    them explicitly -- under Full CRN, LCG shares one (sigma, eps, eps_offset) triple
+    across every candidate in a scoring batch. `Denoiser.apply_noise` draws its own fresh
+    eps/eps_offset and calls this; the two paths must never diverge into separate
+    hand-written formulas.
+
+    sigma broadcasts via add_dims against x's shape (e.g. (B,) -> (B,1,1,1)). eps must
+    already match x's shape. eps_offset must be broadcastable against x -- DIAMOND
+    training uses (B,C,1,1) (one independent draw per training example, spatially
+    constant within each channel); LCG's Full CRN uses (1,C,1,1) (one draw shared across
+    the whole candidate batch via ordinary broadcasting)."""
+    return x + add_dims(sigma, x.ndim) * eps + sigma_offset_noise * eps_offset
+
+
 @dataclass
 class Conditioners:
     c_in: Tensor
@@ -59,9 +79,12 @@ class Denoiser(nn.Module):
         self.sample_sigma_training = sample_sigma
     
     def apply_noise(self, x: Tensor, sigma: Tensor, sigma_offset_noise: float) -> Tensor:
-        b, c, _, _ = x.shape 
-        offset_noise = sigma_offset_noise * torch.randn(b, c, 1, 1, device=self.device)
-        return x + offset_noise + torch.randn_like(x) * add_dims(sigma, x.ndim)
+        b, c, _, _ = x.shape
+        # Draw order preserved exactly (offset noise first, then pixel noise) so this
+        # remains bit-identical to the pre-refactor inline formula under a fixed seed.
+        eps_offset = torch.randn(b, c, 1, 1, device=self.device)
+        eps = torch.randn_like(x)
+        return apply_noise_from_samples(x, sigma, eps, eps_offset, sigma_offset_noise)
 
     def compute_conditioners(self, sigma: Tensor) -> Conditioners:
         sigma = (sigma**2 + self.cfg.sigma_offset_noise**2).sqrt()
