@@ -7,9 +7,8 @@ the original 480-candidate/B=32,H=15 workload to a handful of tiny synthetic can
 from dataclasses import dataclass
 
 import torch
-from lcg.batched_scoring import imagined_candidates_from_batch
-from lcg.forward_jvp import frozen_named_parameters, make_forward_jvp_simple_mc_bank, selected_named_parameters
-from lcg.intrinsic_reward import make_lcg_forward_jvp_intrinsic_reward_fn
+from lcg.forward_jvp import frozen_named_parameters, make_jvp_bank, selected_named_parameters
+from lcg.intrinsic_reward import imagined_candidates_from_batch, make_lcg_intrinsic_reward_fn
 from models.diffusion import SigmaDistributionConfig
 
 TINY_IMG_CHANNELS = 3
@@ -25,8 +24,8 @@ class _FakeImaginedCandidate:
 
 
 def test_reshape_is_step_major(tiny_denoiser):
-    """The exact reshape used by make_lcg_forward_jvp_intrinsic_reward_fn/
-    make_lcg_intrinsic_reward_fn: flat index t*num_envs+b must land at reshaped[b, t]."""
+    """The exact reshape used by make_lcg_intrinsic_reward_fn: flat index t*num_envs+b
+    must land at reshaped[b, t]."""
     num_envs, num_steps = 3, 2
     flat = torch.arange(num_envs * num_steps).float()
     reshaped = flat.view(num_steps, num_envs).transpose(0, 1).contiguous()
@@ -61,12 +60,12 @@ def test_full_pipeline_no_candidate_lost_or_duplicated(tiny_denoiser):
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     d_S = sum(p.numel() for p in theta_s_named.values())
     h_D = torch.rand(d_S) + 0.5
-    bank = make_forward_jvp_simple_mc_bank(
+    bank = make_jvp_bank(
         TINY_SIGMA_CFG, torch.Size([1, TINY_IMG_CHANNELS, TINY_IMG_SIZE, TINY_IMG_SIZE]), d_S,
         device=torch.device("cpu"), num_samples=2, seed=0,
     )
 
-    hook = make_lcg_forward_jvp_intrinsic_reward_fn(denoiser, theta_s_named, frozen_named, h_D, bank, chunk_size=2)
+    hook = make_lcg_intrinsic_reward_fn(denoiser, theta_s_named, frozen_named, h_D, bank, chunk_size=2)
     out = hook(infos, env_rew)
 
     assert out.shape == env_rew.shape

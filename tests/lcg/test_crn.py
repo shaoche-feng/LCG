@@ -7,7 +7,7 @@ independent of how candidates happen to be chunked.
 import torch
 from lcg.forward_jvp import (
     frozen_named_parameters,
-    make_forward_jvp_simple_mc_bank,
+    make_jvp_bank,
     score_one_jvp_bank,
     selected_named_parameters,
 )
@@ -32,7 +32,7 @@ def _make_candidates(denoiser, n):
 def test_eps_offset_shared_not_per_candidate(tiny_denoiser):
     theta_s_named = selected_named_parameters(tiny_denoiser)
     d_S = sum(p.numel() for p in theta_s_named.values())
-    bank = make_forward_jvp_simple_mc_bank(
+    bank = make_jvp_bank(
         TINY_SIGMA_CFG, torch.Size([1, TINY_IMG_CHANNELS, TINY_IMG_SIZE, TINY_IMG_SIZE]), d_S,
         device=torch.device("cpu"), num_samples=4, seed=0,
     )
@@ -51,7 +51,7 @@ def test_duplicate_candidate_scores_identically_across_chunks(tiny_denoiser):
     h_D = torch.rand(d_S) + 0.5
     h_D_inv_sqrt = h_D.rsqrt()
 
-    bank = make_forward_jvp_simple_mc_bank(
+    bank = make_jvp_bank(
         TINY_SIGMA_CFG, torch.Size([1, TINY_IMG_CHANNELS, TINY_IMG_SIZE, TINY_IMG_SIZE]), d_S,
         device=torch.device("cpu"), num_samples=3, seed=1,
     )
@@ -74,7 +74,7 @@ def test_chunk_size_does_not_change_scores(tiny_denoiser):
     h_D = torch.rand(d_S) + 0.5
     h_D_inv_sqrt = h_D.rsqrt()
 
-    bank = make_forward_jvp_simple_mc_bank(
+    bank = make_jvp_bank(
         TINY_SIGMA_CFG, torch.Size([1, TINY_IMG_CHANNELS, TINY_IMG_SIZE, TINY_IMG_SIZE]), d_S,
         device=torch.device("cpu"), num_samples=3, seed=2,
     )

@@ -51,6 +51,19 @@ class SigmaDistributionConfig:
     sigma_max: float
 
 
+def sample_sigma_training_distribution(
+    cfg: SigmaDistributionConfig, n: int, device: torch.device, generator: Optional[torch.Generator] = None
+) -> Tensor:
+    """The single authoritative p_train(sigma) implementation: z ~ N(loc, scale^2),
+    sigma = clip(exp(z), sigma_min, sigma_max). `Denoiser.setup_training` delegates to
+    this (generator=None, preserving DIAMOND's original unseeded behavior exactly);
+    LCG's historical-precision and forward-JVP candidate paths call it with an explicit
+    local torch.Generator for RNG isolation from DIAMOND. No stratification here -- plain
+    IID sampling from the complete distribution."""
+    z = torch.randn(n, device=device, generator=generator) * cfg.scale + cfg.loc
+    return z.exp().clip(cfg.sigma_min, cfg.sigma_max)
+
+
 @dataclass
 class DenoiserConfig:
     inner_model: InnerModelConfig
@@ -73,8 +86,7 @@ class Denoiser(nn.Module):
         assert self.sample_sigma_training is None
 
         def sample_sigma(n: int, device: torch.device):
-            s = torch.randn(n, device=device) * cfg.scale + cfg.loc
-            return s.exp().clip(cfg.sigma_min, cfg.sigma_max)
+            return sample_sigma_training_distribution(cfg, n, device)
 
         self.sample_sigma_training = sample_sigma
     

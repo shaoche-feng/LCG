@@ -5,9 +5,13 @@ import torch
 import torch.func as func
 from torch import Tensor
 
-from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig, apply_noise_from_samples
+from models.diffusion.denoiser import (
+    Denoiser,
+    SigmaDistributionConfig,
+    apply_noise_from_samples,
+    sample_sigma_training_distribution,
+)
 
-from .sigma_strata import sample_sigma_stratum
 from .theta_s import selected_parameters
 
 Candidate = Tuple[Tensor, Tensor, Tensor]  # (x_obs_flat, x_act, y_star), each batch size 1
@@ -113,19 +117,15 @@ def jvp_through_F(
 @dataclass(frozen=True)
 class JVPBank:
     """A set of shared forward-JVP probes: one (sigma, eps, eps_offset, eta) quadruple per
-    entry, reused across every candidate (Full CRN). sigmas/epsilons: same broadcastable
-    shapes as lcg.crn.CRNBank. epsilons_offset: one (1, C, 1, 1) tensor per entry -- the
-    DIAMOND offset-noise draw (models.diffusion.denoiser.apply_noise_from_samples),
-    broadcast across the whole candidate batch (batch dim 1, matching epsilons'
-    broadcasting convention), NOT one independent draw per candidate. etas: one flat
+    entry, reused across every candidate (Full CRN). epsilons_offset: one (1, C, 1, 1)
+    tensor per entry -- the DIAMOND offset-noise draw
+    (models.diffusion.denoiser.apply_noise_from_samples), broadcast across the whole
+    candidate batch (batch dim 1), NOT one independent draw per candidate. etas: one flat
     (d_S,) tensor per entry (parameter-space probe).
 
-    Used both for the legacy 3-stratum forward estimator (one entry per sigma-stratum,
-    via `make_jvp_bank`) and the production simple-MC estimator (M IID entries drawn from
-    the full training sigma distribution, via `make_forward_jvp_simple_mc_bank`) -- the
-    `num_strata` property just reports len(sigmas)/len(etas), and score_one_jvp_bank
-    treats it as a plain average over however many entries the bank holds, regardless of
-    whether they came from stratified or simple-MC sampling."""
+    Entries are ordinary IID Monte Carlo samples (sigma_m ~ p_train(sigma), see
+    make_jvp_bank) -- score_one_jvp_bank treats the bank as a plain average over however
+    many entries it holds."""
 
     sigmas: Tuple[Tensor, ...]
     epsilons: Tuple[Tensor, ...]
@@ -136,7 +136,7 @@ class JVPBank:
         assert len(self.sigmas) == len(self.epsilons) == len(self.epsilons_offset) == len(self.etas)
 
     @property
-    def num_strata(self) -> int:
+    def num_samples(self) -> int:
         return len(self.sigmas)
 
 
@@ -145,47 +145,17 @@ def make_jvp_bank(
     y_shape: torch.Size,
     d_S: int,
     device: torch.device,
-    num_strata: int = 3,
-    seed: Optional[int] = None,
-) -> JVPBank:
-    """Legacy/diagnostic 3-stratum Full-CRN forward-JVP bank: one probe per equal-
-    probability sigma stratum. Kept for the stratified forward-JVP diagnostic path; the
-    production candidate scorer uses `make_forward_jvp_simple_mc_bank` instead.
-
-    RNG isolation: uses a local, device-matched torch.Generator (seeded from `seed` when
-    given, else auto-seeded from entropy) rather than global torch.manual_seed, so
-    building a bank never mutates the global torch RNG stream DIAMOND's own code
-    observes. Same seed -> same bank; different seeds -> different banks (unchanged)."""
-    gen = torch.Generator(device=device)
-    if seed is not None:
-        gen.manual_seed(seed)
-    c = y_shape[1]
-    sigmas, epsilons, epsilons_offset, etas = [], [], [], []
-    for m in range(num_strata):
-        sigmas.append(sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device, generator=gen).detach())
-        epsilons.append(torch.randn(y_shape, device=device, generator=gen).detach())
-        epsilons_offset.append(torch.randn(1, c, 1, 1, device=device, generator=gen).detach())
-        etas.append(torch.randn(d_S, device=device, generator=gen).detach())
-    return JVPBank(tuple(sigmas), tuple(epsilons), tuple(epsilons_offset), tuple(etas))
-
-
-def make_forward_jvp_simple_mc_bank(
-    sigma_cfg: SigmaDistributionConfig,
-    y_shape: torch.Size,
-    d_S: int,
-    device: torch.device,
     num_samples: int = 24,
     seed: Optional[int] = None,
 ) -> JVPBank:
     """Production Full-CRN probe bank: num_samples IID (sigma, eps, eps_offset, eta)
-    quadruples, each sigma drawn from the *complete* training distribution p_train(sigma)
-    (via sample_sigma_stratum(cfg, stratum_idx=0, num_strata=1, ...), which collapses to
-    the full unstratified distribution -- validated in the forward simple-MC diagnostic).
-    eps_offset has shape (1, C, 1, 1) -- one draw per MC sample, shared across every
-    candidate via broadcasting (Full CRN), NOT independent per candidate. All candidates
-    scored against one bank instance share the identical num_samples quadruples,
-    including across computational chunks -- the bank is built once and passed unchanged
-    into every chunk's score_one_jvp_bank call.
+    quadruples, each sigma drawn from the complete training distribution p_train(sigma)
+    (sample_sigma_training_distribution, the same authoritative distribution DIAMOND
+    training itself samples from). eps_offset has shape (1, C, 1, 1) -- one draw per MC
+    sample, shared across every candidate via broadcasting (Full CRN), NOT independent
+    per candidate. All candidates scored against one bank instance share the identical
+    num_samples quadruples, including across computational chunks -- the bank is built
+    once and passed unchanged into every chunk's score_one_jvp_bank call.
 
     A single generator seeded once up front (not one reseed per sample) is sufficient for
     determinism: the whole num_samples-long draw sequence is then a deterministic
@@ -199,7 +169,7 @@ def make_forward_jvp_simple_mc_bank(
     c = y_shape[1]
     sigmas, epsilons, epsilons_offset, etas = [], [], [], []
     for _ in range(num_samples):
-        sigmas.append(sample_sigma_stratum(sigma_cfg, 0, 1, 1, device, generator=gen).detach())
+        sigmas.append(sample_sigma_training_distribution(sigma_cfg, 1, device, generator=gen).detach())
         epsilons.append(torch.randn(y_shape, device=device, generator=gen).detach())
         epsilons_offset.append(torch.randn(1, c, 1, 1, device=device, generator=gen).detach())
         etas.append(torch.randn(d_S, device=device, generator=gen).detach())
@@ -241,7 +211,7 @@ def score_one_jvp_bank(
     problem size, and it uses substantially more memory for no net speedup) -- kept
     sequential, per Stage 7's explicit "measure, don't assume" guidance."""
     device = h_D.device
-    num_entries = bank.num_strata
+    num_entries = bank.num_samples
     num_candidates = len(candidates)
     total_scores = torch.zeros(num_candidates, device=device)
 

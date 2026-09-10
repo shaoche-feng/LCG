@@ -10,7 +10,7 @@ from lcg.forward_jvp import (
     JVPBank,
     frozen_named_parameters,
     jvp_through_F,
-    make_forward_jvp_simple_mc_bank,
+    make_jvp_bank,
     score_one_jvp_bank,
     selected_named_parameters,
     unflatten_to_dict,
@@ -113,7 +113,7 @@ def test_score_finite_nonneg_correct_shape(tiny_denoiser, tiny_transition):
     denoiser, obs, act, y, theta_s_named, frozen_named, params, d_S, *_ = _tiny_setup(tiny_denoiser, tiny_transition)
     h_D = torch.rand(d_S) + 0.5
     h_D_inv_sqrt = h_D.rsqrt()
-    bank = make_forward_jvp_simple_mc_bank(
+    bank = make_jvp_bank(
         TINY_SIGMA_CFG, torch.Size([1, TINY_IMG_CHANNELS, TINY_IMG_SIZE, TINY_IMG_SIZE]), d_S,
         device=torch.device("cpu"), num_samples=3, seed=0,
     )

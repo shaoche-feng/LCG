@@ -6,10 +6,14 @@ from torch import Tensor
 import torch.nn as nn
 
 from data import Dataset, SegmentId
-from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig, apply_noise_from_samples
+from models.diffusion.denoiser import (
+    Denoiser,
+    SigmaDistributionConfig,
+    apply_noise_from_samples,
+    sample_sigma_training_distribution,
+)
 
 from .gauss_newton import compute_vjp
-from .sigma_strata import sample_sigma_stratum
 
 
 def sample_uniform_historical_transitions(
@@ -113,17 +117,26 @@ def historical_precision(
     sigma_cfg: SigmaDistributionConfig,
     B: int,
     N: Optional[int] = None,
-    num_strata: int = 3,
+    num_mc: int = 3,
     beta: float = 1.0,
     damping: float = 1e-4,
     seed: Optional[int] = None,
     rank: int = 0,
     world_size: int = 1,
 ) -> Tensor:
-    """Offline diagonal Laplace/Gauss-Newton precision estimate, Algorithm 2:
+    """Offline diagonal Laplace/Gauss-Newton precision estimate:
 
         h_D_hat = damping * 1_{d_S} + beta * (N / B) * sum_{i in B} g_i
-        g_i = (1 / num_strata) * sum_{m=1}^{num_strata} v_i^(m) (.) v_i^(m)
+        g_i = (1 / num_mc) * sum_{m=1}^{num_mc} v_i^(m) (.) v_i^(m)
+
+    sigma_m ~ p_train(sigma) IID for m=1..num_mc (sample_sigma_training_distribution,
+    the same authoritative distribution DIAMOND training itself samples from) -- plain
+    Monte Carlo, not stratified; validated against 3-stratum sampling in
+    docs/lcg_diagnostic/historical_precision_sampling/ (equal-VJP-budget comparison,
+    8 seeds): statistically indistinguishable h_D quality and downstream candidate-score
+    behavior at every tested budget, so the simpler IID estimator is now the only one.
+    num_mc=3 is the production default (matches the previous 3-stratum estimator's VJP
+    cost exactly).
 
     B is a subset of size |B| drawn WITHOUT replacement, uniformly over every valid
     historical transition (P((episode,t))=1/N for every valid (episode,t) pair -- see
@@ -152,7 +165,7 @@ def historical_precision(
     `torch.autograd.grad(..., retain_graph=False, create_graph=False)` inside `compute_vjp`
     is used, and each transition's graph is built and discarded independently).
     """
-    assert B > 0 and num_strata > 0
+    assert B > 0 and num_mc > 0
     device = denoiser.device
     N = dataset.num_steps if N is None else N
     num_steps_conditioning = denoiser.cfg.inner_model.num_steps_conditioning
@@ -174,13 +187,13 @@ def historical_precision(
     for segment_id in segment_ids:
         obs, act, y = load_transition(dataset, segment_id, num_steps_conditioning, device)
         g_i = torch.zeros(d_S, device=device)
-        for m in range(num_strata):
-            sigma = sample_sigma_stratum(sigma_cfg, m, num_strata, 1, device, generator=torch_gen)
+        for _ in range(num_mc):
+            sigma = sample_sigma_training_distribution(sigma_cfg, 1, device, generator=torch_gen)
             eps = torch.randn(y.shape, dtype=y.dtype, device=y.device, generator=torch_gen)
             eps_offset = torch.randn(y.shape[0], y.shape[1], 1, 1, device=device, generator=torch_gen)
             y_sigma = apply_noise_from_samples(y, sigma, eps, eps_offset, denoiser.cfg.sigma_offset_noise).detach()
             v, _ = compute_vjp(denoiser, theta_s_params, y_sigma, sigma, obs, act, generator=torch_gen)
-            g_i = g_i + (v * v) / num_strata
+            g_i = g_i + (v * v) / num_mc
         h = h + scale * g_i
 
     return h

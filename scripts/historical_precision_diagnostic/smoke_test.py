@@ -52,7 +52,7 @@ def main():
 
     from lcg.forward_jvp import (
         frozen_named_parameters,
-        make_forward_jvp_simple_mc_bank,
+        make_jvp_bank,
         score_one_jvp_bank,
         selected_named_parameters,
     )
@@ -89,7 +89,7 @@ def main():
     h_D_inv_sqrt = h_D.rsqrt()
 
     sigma_cfg = SigmaDistributionConfig(loc=-0.4, scale=1.2, sigma_min=0.002, sigma_max=20.0)
-    bank = make_forward_jvp_simple_mc_bank(
+    bank = make_jvp_bank(
         sigma_cfg, torch.Size([1, 3, 64, 64]), h_D.numel(), device, num_samples=M, seed=0
     )
 

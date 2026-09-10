@@ -208,7 +208,7 @@ def test_historical_precision_end_to_end_with_fixed_sampler(tiny_denoiser, small
     sigma_cfg = SigmaDistributionConfig(loc=-0.4, scale=1.2, sigma_min=0.002, sigma_max=20.0)
 
     h_D = historical_precision(
-        denoiser, params, dataset, sigma_cfg, B=B, N=N, num_strata=3, beta=1.0, damping=1e-4, seed=42,
+        denoiser, params, dataset, sigma_cfg, B=B, N=N, num_mc=3, beta=1.0, damping=1e-4, seed=42,
     )
 
     assert h_D.shape == (d_S,)
