@@ -17,7 +17,7 @@ from agent import Agent, get_action_space_kwargs
 from coroutines.collector import make_collector, NumToCollect
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
 from envs import make_atari_env, make_dm_control_env, WorldModelEnv
-from lcg import LCGConfig, LCGLifecycle
+from lcg import LCGLifecycle
 from utils import (
     broadcast_if_needed,
     build_ddp_wrapper,
@@ -173,7 +173,7 @@ class Trainer(StateDictMixin):
 
         # RL env
 
-        lcg_enabled = bool(getattr(cfg, "lcg", None) is not None and cfg.lcg.enabled)
+        lcg_enabled = bool(getattr(cfg, "intrinsic_reward", None) is not None and cfg.intrinsic_reward.enabled)
 
         if self._is_model_free:
             rl_env = make_env(num_envs=cfg.actor_critic.training.batch_size, device=self._device, **env_kwargs_train)
@@ -198,29 +198,16 @@ class Trainer(StateDictMixin):
         actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
         self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
 
-        # LCG intrinsic-reward lifecycle (Stage 5C) -- disabled unless cfg.lcg.enabled is
-        # True (default False, see config/trainer.yaml); only meaningful for the
-        # world-model (non-model-free) path. When disabled, self._lcg_lifecycle stays None
-        # and train_agent()/train_component() take their exact original code paths.
+        # LCG intrinsic-reward lifecycle (Stage 5C) -- disabled unless
+        # cfg.intrinsic_reward.enabled is True (default False, see
+        # config/intrinsic_reward/lcg.yaml); only meaningful for the world-model
+        # (non-model-free) path. When disabled, self._lcg_lifecycle stays None and
+        # train_agent()/train_component() take their exact original code paths.
         if lcg_enabled and not self._is_model_free:
-            lcg_cfg = LCGConfig(
-                enabled=True,
-                h_d_batch_size=cfg.lcg.h_d_batch_size,
-                damping=cfg.lcg.damping,
-                beta=cfg.lcg.beta,
-                num_strata=cfg.lcg.num_strata,
-                num_crn_banks=cfg.lcg.num_crn_banks,
-                chunk_size=cfg.lcg.chunk_size,
-                rms_enabled=cfg.lcg.rms_enabled,
-                rms_alpha=cfg.lcg.rms_alpha,
-                rms_ema_decay=cfg.lcg.rms_ema_decay,
-                rms_eps=cfg.lcg.rms_eps,
-                candidate_estimator=cfg.lcg.candidate_estimator,
-                candidate_sampling=cfg.lcg.candidate_sampling,
-                candidate_num_mc=cfg.lcg.candidate_num_mc,
-                candidate_crn=cfg.lcg.candidate_crn,
-                candidate_chunk_size=cfg.lcg.candidate_chunk_size,
-            )
+            # enabled=True is guaranteed here: lcg_enabled already required
+            # cfg.intrinsic_reward.enabled to be True, and instantiate() reads it from
+            # that same value.
+            lcg_cfg = instantiate(cfg.intrinsic_reward)
             self._lcg_lifecycle = LCGLifecycle(
                 lcg_cfg, sigma_distribution_cfg,
                 img_channels=cfg.agent.denoiser.inner_model.img_channels,
