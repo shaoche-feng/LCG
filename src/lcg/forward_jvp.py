@@ -68,9 +68,12 @@ def unflatten_to_dict(flat: Tensor, template: Dict[str, Tensor]) -> Dict[str, Te
 
 # --------------------------------------------------------------------------------------
 # Genuine forward-mode JVP through F_theta (EDM-cancelled, no c_out/c_skip), validated in
-# Stage F1-F6: w(sigma)*c_out(sigma)^2 = 1 identically (edm_weight is defined as
-# c_out^-2, see lcg.gauss_newton), so 2*w*||J_D z||^2 = 2*||J_F z||^2 exactly, and the JVP
-# can be taken through the raw (un-preconditioned) inner-model output directly.
+# Stage F1-F6: w(sigma) = c_out(sigma)^-2 exactly under this EDM setup, so
+# w(sigma)*c_out(sigma)^2 = 1 identically, and 2*w*||J_D z||^2 = 2*||J_F z||^2 exactly --
+# the JVP can be taken through the raw (un-preconditioned) inner-model output directly.
+# lcg.precision._backward_vjp_probe relies on the same identity for the historical
+# (backward-VJP) side; see tests/lcg/test_forward_jvp.py and tests/lcg/test_precision.py
+# for the permanent numerical proofs on each side.
 # --------------------------------------------------------------------------------------
 
 

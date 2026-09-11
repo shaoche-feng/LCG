@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -13,7 +14,7 @@ from models.diffusion.denoiser import (
     sample_sigma_training_distribution,
 )
 
-from .gauss_newton import compute_vjp
+_SQRT_2 = math.sqrt(2.0)
 
 
 def sample_uniform_historical_transitions(
@@ -110,6 +111,52 @@ def load_transition(
     return obs, act, y
 
 
+def _backward_vjp_probe(
+    denoiser: Denoiser,
+    params: List[nn.Parameter],
+    y_sigma: Tensor,
+    sigma: Tensor,
+    obs: Tensor,
+    act: Tensor,
+    xi: Optional[Tensor] = None,
+    generator: Optional[torch.Generator] = None,
+) -> Tensor:
+    """v = sqrt(2) * J_F^T xi -- the historical curvature probe, computed by
+    differentiating the RAW inner-model output F_theta directly (one
+    torch.autograd.grad call through Denoiser.compute_model_output; no Jacobian is ever
+    materialized).
+
+    This is an EXACT simplification of the estimator's original D_theta-based form,
+    v = sqrt(2*w(sigma)) * J_D^T xi with D_theta = c_skip*y_sigma + c_out*F_theta -- not
+    an approximation. y_sigma does not depend on theta_S, so J_D = c_out * J_F exactly;
+    and this codebase's EDM setup has w(sigma) = c_out(sigma)^-2 exactly (Denoiser.
+    compute_conditioners defines c_out = sigma*sqrt(c_skip), and Denoiser.forward's
+    F-space training loss is built on precisely this weighting), so
+    sqrt(2*w)*J_D^T = sqrt(2)/c_out * c_out*J_F^T = sqrt(2)*J_F^T (c_out > 0 always, so no
+    sign ambiguity). See tests/lcg/test_precision.py for the permanent numerical proof
+    (reconstructs D_theta locally, off the production path, purely to document the
+    equivalence) and tests/lcg/test_forward_jvp.py's analogous D-vs-F check on the
+    candidate (forward-JVP) side.
+
+    Uses the same raw-F_theta primitive (Denoiser.compute_model_output) that
+    forward_jvp.jvp_through_F's inner functional_call reimplements for torch.func.jvp --
+    both sides of LCG (historical backward-VJP here, candidate forward-JVP there) now
+    differentiate the identical F_theta, never reconstructing D_theta.
+
+    Handles exactly one transition at a time (y_sigma.size(0) == 1): batching multiple
+    dataset examples into a single backward pass would sum their per-example VJPs
+    together rather than keep them separate, which the N/B accumulation needs.
+    """
+    assert y_sigma.size(0) == 1, "_backward_vjp_probe handles one transition (batch size 1) at a time"
+    cs = denoiser.compute_conditioners(sigma)
+    model_output = denoiser.compute_model_output(y_sigma, obs, act, cs)  # raw F_theta
+    if xi is None:
+        xi = torch.randn(model_output.shape, dtype=model_output.dtype, device=model_output.device, generator=generator)
+    scalar = _SQRT_2 * (xi * model_output).sum()
+    grads = torch.autograd.grad(scalar, params, retain_graph=False, create_graph=False)
+    return torch.cat([g.reshape(-1) for g in grads])
+
+
 def historical_precision(
     denoiser: Denoiser,
     theta_s_params: List[nn.Parameter],
@@ -155,15 +202,26 @@ def historical_precision(
     sigma_offset_noise*eps_offset (models.diffusion.denoiser.apply_noise_from_samples,
     the same helper Denoiser.apply_noise calls) -- previously this used y + sigma*eps
     only, omitting the offset-noise term DIAMOND training actually applies; fixed so
-    historical precision evaluates D_theta/F_theta at the same corrupted-input
-    distribution the denoiser was trained/queried on. compute_vjp/differentiable_denoise
-    are unmodified: compute_conditioners already derives the correct effective sigma
-    (sqrt(sigma^2+sigma_offset_noise^2)) from the bare sigma passed alongside y_sigma, so
-    only the corruption construction here needed fixing, not the preconditioning math.
+    historical precision evaluates F_theta at the same corrupted-input distribution the
+    denoiser was trained/queried on. compute_conditioners already derives the correct
+    effective sigma (sqrt(sigma^2+sigma_offset_noise^2)) from the bare sigma passed
+    alongside y_sigma, so only the corruption construction ever needed fixing, not the
+    preconditioning math.
+
+    Each v_i^(m) = sqrt(2)*J_F^T xi is computed by _backward_vjp_probe, which
+    differentiates the raw inner-model output F_theta directly -- an exact simplification
+    of the estimator's original D_theta-based form (v = sqrt(2*w)*J_D^T xi,
+    D_theta = c_skip*y_sigma + c_out*F_theta), not a different estimator: y_sigma doesn't
+    depend on theta_S, so J_D = c_out*J_F exactly, and this EDM setup has
+    w(sigma) = c_out(sigma)^-2 exactly, so sqrt(2*w)*J_D^T = sqrt(2)*J_F^T identically.
+    See tests/lcg/test_precision.py for the permanent numerical proof against the real
+    Denoiser.
+
     Caller is responsible for `denoiser.eval()`/frozen weights; this function never calls
     `.backward()`, never touches `.grad`, and never modifies denoiser parameters (only
-    `torch.autograd.grad(..., retain_graph=False, create_graph=False)` inside `compute_vjp`
-    is used, and each transition's graph is built and discarded independently).
+    `torch.autograd.grad(..., retain_graph=False, create_graph=False)` inside
+    `_backward_vjp_probe` is used, and each transition's graph is built and discarded
+    independently).
     """
     assert B > 0 and num_mc > 0
     device = denoiser.device
@@ -192,7 +250,7 @@ def historical_precision(
             eps = torch.randn(y.shape, dtype=y.dtype, device=y.device, generator=torch_gen)
             eps_offset = torch.randn(y.shape[0], y.shape[1], 1, 1, device=device, generator=torch_gen)
             y_sigma = apply_noise_from_samples(y, sigma, eps, eps_offset, denoiser.cfg.sigma_offset_noise).detach()
-            v, _ = compute_vjp(denoiser, theta_s_params, y_sigma, sigma, obs, act, generator=torch_gen)
+            v = _backward_vjp_probe(denoiser, theta_s_params, y_sigma, sigma, obs, act, generator=torch_gen)
             g_i = g_i + (v * v) / num_mc
         h = h + scale * g_i
 

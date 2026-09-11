@@ -9,7 +9,6 @@ from .forward_jvp import (
     selected_named_parameters,
     unflatten_to_dict,
 )
-from .gauss_newton import compute_vjp, differentiable_denoise, edm_weight
 from .intrinsic_reward import imagined_candidates_from_batch, make_lcg_intrinsic_reward_fn
 from .lifecycle import LCGConfig, LCGLifecycle
 from .precision import historical_precision, load_transition, sample_uniform_historical_transitions
@@ -19,9 +18,6 @@ from .theta_s import selected_dim, selected_parameters
 __all__ = [
     "JVPBank",
     "assert_setup_valid",
-    "compute_vjp",
-    "differentiable_denoise",
-    "edm_weight",
     "flatten_dict",
     "frozen_named_parameters",
     "historical_precision",

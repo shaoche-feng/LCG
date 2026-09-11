@@ -15,7 +15,6 @@ from lcg.forward_jvp import (
     selected_named_parameters,
     unflatten_to_dict,
 )
-from lcg.gauss_newton import edm_weight
 from lcg.theta_s import selected_parameters
 from models.diffusion import SigmaDistributionConfig
 from models.diffusion.denoiser import apply_noise_from_samples
@@ -151,7 +150,7 @@ def test_d_vs_f_equivalence_at_corrected_corruption(tiny_denoiser, tiny_transiti
     tangent_named = unflatten_to_dict(torch.randn(d_S), theta_s_named)
     _, jvp_F = jvp_through_F(denoiser, theta_s_named, frozen_named, tangent_named, y_sigma, sigma, obs, act)
     jvp_D, cs = jvp_through_D(tangent_named)
-    w = edm_weight(cs.c_out)
+    w = cs.c_out.pow(-2)  # edm_weight(c_out), reconstructed locally -- production no longer needs it
 
     score_F = 2.0 * jvp_F.square().sum().item()
     score_D = 2.0 * (w * jvp_D.square()).sum().item()
