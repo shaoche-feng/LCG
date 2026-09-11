@@ -26,40 +26,6 @@ def sample_uniform_historical_transitions(
     world_size: int = 1,
     replace: bool = False,
 ) -> List[SegmentId]:
-    """B historical LCG transitions (x_i, y_i), sampled uniformly over every valid
-    transition in the (rank's partition of the) dataset -- P((episode, t)) = 1/N for
-    every valid (episode_id, t), N = dataset.num_steps (summed over the rank's eligible
-    episodes).
-
-    LCG-specific: does NOT use DIAMOND's generic BatchSampler. BatchSampler.sample()'s
-    can_sample_beyond_end=False branch draws a uniform timestep t and THEN shifts it by an
-    independent random offset in [0, seq_length) before clipping to the episode boundary
-    (stop = min(L_e, t+1+offset)) -- appropriate for training-time window diversity (which
-    of the seq_length frames in a window is the "last" one should vary), but wrong for
-    LCG's "one uniformly-sampled historical transition = one curvature sample" semantics:
-    the transition that ends up as the actual VJP target is stop-1, not t, so the
-    resulting distribution over targets is NOT uniform -- it under-samples the first
-    seq_length-1 transitions of every episode and produces a probability spike at each
-    episode's final transition (all overflowing (t, offset) combinations collapse onto
-    it via the min-clip). See docs/lcg_diagnostic/historical_sampling_fix/ for the
-    quantified bias and an old-vs-new comparison diagnostic.
-
-    Every frame s_t (t in [0, L_e)) of every episode e is a valid target here (the
-    num_steps_conditioning frames before it may be left-padded near an episode's start,
-    exactly as DIAMOND's own Denoiser.forward tolerates via mask_padding) -- so N =
-    dataset.num_steps = sum_e L_e is exactly the number of valid (episode, t) pairs, and
-    a uniform draw of a global frame index in [0, N) followed by mapping it back to
-    (episode_id, t) via dataset.start_idx gives P((episode, t)) = 1/N directly, with no
-    further randomization: the SegmentId's stop is built as t+1 (not a randomized
-    offset), so the sampled t IS the transition whose curvature gets measured.
-
-    batch_size transitions are drawn WITHOUT replacement by default (replace=False),
-    matching the N/B unbiased-subset-sum estimator's "B distinct historical transitions"
-    interpretation; raises if batch_size exceeds the number of available transitions
-    unless replace=True is passed explicitly. Uses a local np.random.Generator (not
-    global np.random state) -- this reduces, not adds to, the codebase's existing global-
-    RNG-contamination surface (a separate, not-yet-fixed issue tracked elsewhere).
-    """
     if world_size > 1:
         eligible_episodes = np.arange(rank, dataset.num_episodes, world_size)
     else:
@@ -121,32 +87,6 @@ def _backward_vjp_probe(
     xi: Optional[Tensor] = None,
     generator: Optional[torch.Generator] = None,
 ) -> Tensor:
-    """v = sqrt(2) * J_F^T xi -- the historical curvature probe, computed by
-    differentiating the RAW inner-model output F_theta directly (one
-    torch.autograd.grad call through Denoiser.compute_model_output; no Jacobian is ever
-    materialized).
-
-    This is an EXACT simplification of the estimator's original D_theta-based form,
-    v = sqrt(2*w(sigma)) * J_D^T xi with D_theta = c_skip*y_sigma + c_out*F_theta -- not
-    an approximation. y_sigma does not depend on theta_S, so J_D = c_out * J_F exactly;
-    and this codebase's EDM setup has w(sigma) = c_out(sigma)^-2 exactly (Denoiser.
-    compute_conditioners defines c_out = sigma*sqrt(c_skip), and Denoiser.forward's
-    F-space training loss is built on precisely this weighting), so
-    sqrt(2*w)*J_D^T = sqrt(2)/c_out * c_out*J_F^T = sqrt(2)*J_F^T (c_out > 0 always, so no
-    sign ambiguity). See tests/lcg/test_precision.py for the permanent numerical proof
-    (reconstructs D_theta locally, off the production path, purely to document the
-    equivalence) and tests/lcg/test_forward_jvp.py's analogous D-vs-F check on the
-    candidate (forward-JVP) side.
-
-    Uses the same raw-F_theta primitive (Denoiser.compute_model_output) that
-    forward_jvp.jvp_through_F's inner functional_call reimplements for torch.func.jvp --
-    both sides of LCG (historical backward-VJP here, candidate forward-JVP there) now
-    differentiate the identical F_theta, never reconstructing D_theta.
-
-    Handles exactly one transition at a time (y_sigma.size(0) == 1): batching multiple
-    dataset examples into a single backward pass would sum their per-example VJPs
-    together rather than keep them separate, which the N/B accumulation needs.
-    """
     assert y_sigma.size(0) == 1, "_backward_vjp_probe handles one transition (batch size 1) at a time"
     cs = denoiser.compute_conditioners(sigma)
     model_output = denoiser.compute_model_output(y_sigma, obs, act, cs)  # raw F_theta
@@ -171,58 +111,6 @@ def historical_precision(
     rank: int = 0,
     world_size: int = 1,
 ) -> Tensor:
-    """Offline diagonal Laplace/Gauss-Newton precision estimate:
-
-        h_D_hat = damping * 1_{d_S} + beta * (N / B) * sum_{i in B} g_i
-        g_i = (1 / num_mc) * sum_{m=1}^{num_mc} v_i^(m) (.) v_i^(m)
-
-    sigma_m ~ p_train(sigma) IID for m=1..num_mc (sample_sigma_training_distribution,
-    the same authoritative distribution DIAMOND training itself samples from) -- plain
-    Monte Carlo, not stratified; validated against 3-stratum sampling in
-    docs/lcg_diagnostic/historical_precision_sampling/ (equal-VJP-budget comparison,
-    8 seeds): statistically indistinguishable h_D quality and downstream candidate-score
-    behavior at every tested budget, so the simpler IID estimator is now the only one.
-    num_mc=3 is the production default (matches the previous 3-stratum estimator's VJP
-    cost exactly).
-
-    B is a subset of size |B| drawn WITHOUT replacement, uniformly over every valid
-    historical transition (P((episode,t))=1/N for every valid (episode,t) pair -- see
-    sample_uniform_historical_transitions, which replaced the previous BatchSampler-based
-    sampler after discovering it did not actually sample the transition it claimed to:
-    BatchSampler's endpoint-shifting logic made the ACTUAL VJP target a randomized
-    function of the originally-drawn timestep, non-uniform over historical transitions),
-    from the full dataset D of size N (defaults to `dataset.num_steps`: see
-    `sample_uniform_historical_transitions`/`load_transition` for what counts as one
-    valid transition in DIAMOND's replay representation, and why `dataset.num_steps` is
-    exactly that count under this pipeline's left-padding convention). The N/B factor
-    makes h_D_hat an unbiased estimate of the full-dataset sum for any B, so its scale
-    should not depend systematically on the precision-estimation batch size.
-
-    Uses the exact DIAMOND training corruption law, y_sigma = y + sigma*eps +
-    sigma_offset_noise*eps_offset (models.diffusion.denoiser.apply_noise_from_samples,
-    the same helper Denoiser.apply_noise calls) -- previously this used y + sigma*eps
-    only, omitting the offset-noise term DIAMOND training actually applies; fixed so
-    historical precision evaluates F_theta at the same corrupted-input distribution the
-    denoiser was trained/queried on. compute_conditioners already derives the correct
-    effective sigma (sqrt(sigma^2+sigma_offset_noise^2)) from the bare sigma passed
-    alongside y_sigma, so only the corruption construction ever needed fixing, not the
-    preconditioning math.
-
-    Each v_i^(m) = sqrt(2)*J_F^T xi is computed by _backward_vjp_probe, which
-    differentiates the raw inner-model output F_theta directly -- an exact simplification
-    of the estimator's original D_theta-based form (v = sqrt(2*w)*J_D^T xi,
-    D_theta = c_skip*y_sigma + c_out*F_theta), not a different estimator: y_sigma doesn't
-    depend on theta_S, so J_D = c_out*J_F exactly, and this EDM setup has
-    w(sigma) = c_out(sigma)^-2 exactly, so sqrt(2*w)*J_D^T = sqrt(2)*J_F^T identically.
-    See tests/lcg/test_precision.py for the permanent numerical proof against the real
-    Denoiser.
-
-    Caller is responsible for `denoiser.eval()`/frozen weights; this function never calls
-    `.backward()`, never touches `.grad`, and never modifies denoiser parameters (only
-    `torch.autograd.grad(..., retain_graph=False, create_graph=False)` inside
-    `_backward_vjp_probe` is used, and each transition's graph is built and discarded
-    independently).
-    """
     assert B > 0 and num_mc > 0
     device = denoiser.device
     N = dataset.num_steps if N is None else N
