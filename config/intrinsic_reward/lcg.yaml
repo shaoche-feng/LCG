@@ -32,7 +32,7 @@ theta_s:
     - "conv_out.*"
   exclude: []
 
-precision_reference_size: 40
+precision_reference_size: 320
 precision_num_mc: 3
 damping: 1e-4
 beta: 1.0

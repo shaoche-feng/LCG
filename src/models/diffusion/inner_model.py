@@ -38,6 +38,7 @@ class InnerModel(nn.Module):
         self.noise_emb = FourierFeatures(cfg.cond_channels)
 
         act_emb_dim = cfg.cond_channels // cfg.num_steps_conditioning
+
         if cfg.continuous_action_dim is None:
             act_proj = nn.Embedding(cfg.num_actions, act_emb_dim)  # discrete: action index -> embedding
         else:
@@ -46,11 +47,13 @@ class InnerModel(nn.Module):
             act_proj,
             nn.Flatten(),  # b t e -> b (t e)
         )
+
         self.cond_proj = nn.Sequential(
             nn.Linear(cfg.cond_channels, cfg.cond_channels),
             nn.SiLU(),
             nn.Linear(cfg.cond_channels, cfg.cond_channels),
         )
+        
         self.conv_in = Conv3x3((cfg.num_steps_conditioning + 1) * cfg.img_channels, cfg.channels[0])
 
         self.unet = UNet(cfg.cond_channels, cfg.depths, cfg.channels, cfg.attn_depths)

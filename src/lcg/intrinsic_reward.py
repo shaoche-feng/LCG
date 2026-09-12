@@ -33,7 +33,7 @@ def make_lcg_intrinsic_reward_fn(
     frozen_named: Dict[str, Tensor],
     h_D: Tensor,
     bank: JVPBank,
-    chunk_size: int = 4,
+    chunk_size: int = 16,
 ) -> Callable[[List[Dict], Tensor], Tensor]:
     """Builds an ActorCritic.intrinsic_reward_fn(infos, env_rew) -> Tensor hook (see
     ActorCritic.set_intrinsic_reward_fn) using the production forward-mode JVP estimator
@@ -41,20 +41,7 @@ def make_lcg_intrinsic_reward_fn(
     distribution, Full CRN, M=bank.num_samples): scores every rollout step's
     info["imagined_candidate"] (populated by WorldModelEnv when constructed with
     return_imagined_candidate=True) against the frozen (denoiser, h_D, bank).
-
-    All H rollout steps' candidates (H x num_envs total, all sharing the same frozen
-    denoiser/h_D/bank) are flattened into a single list and scored with ONE
-    score_one_jvp_bank call (chunk_size candidates per chunk). The flat result is reshaped
-    back to env_rew's (num_envs, num_steps) layout, preserving temporal/env order: flat
-    index t*num_envs + b holds step t / env b (matching how `infos` is ordered), so
-    `.view(num_steps, num_envs).transpose(0, 1)` recovers env_rew[b, t].
-
-    theta_s_named/frozen_named/h_D/bank are captured by reference and only ever read,
-    never modified or resampled here -- refresh cadence (when a new bank/h_D is built) is
-    owned entirely by LCGLifecycle.refresh(). Every (env, step) imagined transition is
-    scored exactly once -- no resampling or redundant recomputation.
     """
-
     def intrinsic_reward_fn(infos: List[Dict], env_rew: Tensor) -> Tensor:
         num_envs, num_steps = env_rew.shape
         all_candidates = []
