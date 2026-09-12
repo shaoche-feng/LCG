@@ -255,8 +255,9 @@ def test_forward_jvp_is_parameter_subset_agnostic(tiny_denoiser, include):
     candidates = [(obs, act, y), (obs, act, y)]  # duplicate, to also check Full-CRN identity across chunks
 
     bank = make_jvp_bank(SIGMA_CFG, torch.Size([1, 3, 8, 8]), d_S, device=torch.device("cpu"), num_samples=3, seed=0)
-    scores_chunk1 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D.rsqrt(), bank, candidates, chunk_size=1)
-    scores_chunk2 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D.rsqrt(), bank, candidates, chunk_size=2)
+    h_D_inv_sqrt = h_D.rsqrt()
+    scores_chunk1 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=1)
+    scores_chunk2 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=2)
 
     assert scores_chunk1.shape == (2,)
     assert torch.isfinite(scores_chunk1).all()

@@ -375,7 +375,15 @@ class Trainer(StateDictMixin):
                     # already trained above) -- refresh h_D/CRN banks/RunningRMS once per
                     # round, then rewire the frozen hook before this round's ActorCritic
                     # updates begin. See lcg.lifecycle.LCGLifecycle.
-                    self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset)
+                    #
+                    # round_identifier=self.epoch (not an internal counter): self.epoch is
+                    # already persisted/restored by Trainer's own checkpoint (StateDictMixin
+                    # picks up every non-underscore-prefixed attribute, and self._lcg_lifecycle
+                    # itself is NOT checkpointed), so deriving the LCG round seed from it means
+                    # a resumed run continues the seed sequence rather than restarting it from 0
+                    # and reusing seeds (and therefore historical subsets/candidate banks) an
+                    # earlier, pre-resume round already used.
+                    self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
                     self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
                 steps = cfg.steps_first_epoch if self.epoch == 1 else cfg.steps_per_epoch
                 if self._lcg_lifecycle is not None:
@@ -417,9 +425,9 @@ class Trainer(StateDictMixin):
 
         num_steps = cfg.grad_acc_steps * steps
 
-        # Gated purely-additive timing split (Stage 5C): only active for actor_critic when
-        # LCG is enabled, so it costs nothing and changes nothing when LCG is disabled or
-        # for the other components.
+        # Gated purely-additive timing split: only active for actor_critic when LCG is
+        # enabled, so it costs nothing and changes nothing when LCG is disabled or for
+        # the other components.
         lcg_timing = self._lcg_lifecycle is not None and name == "actor_critic"
         t_forward_total = 0.0
         t_backward_total = 0.0

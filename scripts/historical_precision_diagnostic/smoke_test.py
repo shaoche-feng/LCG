@@ -96,7 +96,7 @@ def main():
     )
 
     scores = score_one_jvp_bank(
-        denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, CHUNK_SIZE
+        denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, CHUNK_SIZE
     )
 
     finite_ok = torch.isfinite(scores).all().item()

@@ -99,7 +99,7 @@ def test_score_formula_matches_explicit_jacobian(tiny_denoiser, tiny_transition)
 
     bank = JVPBank((sigma,), (eps,), (eps_offset,), (eta,))
     r_actual = score_one_jvp_bank(
-        denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, [(obs, act, y)], chunk_size=1
+        denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, [(obs, act, y)], chunk_size=1
     ).item()
     assert abs(r_actual - r_expected) < 1e-3 * max(abs(r_expected), 1.0)
 
@@ -124,10 +124,40 @@ def test_score_finite_nonneg_correct_shape(tiny_denoiser, tiny_transition):
         device=torch.device("cpu"), num_samples=3, seed=0,
     )
     candidates = [(obs, act, y), (obs, act, y)]
-    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, chunk_size=2)
+    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=2)
     assert scores.shape == (2,)
     assert torch.isfinite(scores).all()
     assert (scores >= 0).all()
+
+
+def test_score_stays_on_input_device_no_cpu_roundtrip(tiny_denoiser, tiny_transition):
+    """score_one_jvp_bank must return its result on h_D_inv_sqrt's device, with no
+    implicit .cpu() transfer -- regression guard for the removed GPU->CPU->GPU round
+    trip (the caller, make_lcg_intrinsic_reward_fn, now moves the result to env_rew's
+    device itself, a no-op when it already matches)."""
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("CUDA not available")
+
+    import copy
+
+    _, obs, act, y, *_ = _tiny_setup(tiny_denoiser, tiny_transition)
+    device = torch.device("cuda")
+    # tiny_denoiser is a session-scoped fixture shared by every test in this file --
+    # nn.Module.to() mutates in place, so move a deep copy, never the shared instance.
+    denoiser = copy.deepcopy(tiny_denoiser).to(device)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
+    frozen_named = frozen_named_parameters(denoiser, theta_s_named)
+    d_S = sum(p.numel() for p in theta_s_named.values())
+    obs, act, y = obs.to(device), act.to(device), y.to(device)
+
+    h_D_inv_sqrt = (torch.rand(d_S) + 0.5).rsqrt().to(device)
+    bank = make_jvp_bank(
+        TINY_SIGMA_CFG, torch.Size([1, TINY_IMG_CHANNELS, TINY_IMG_SIZE, TINY_IMG_SIZE]), d_S,
+        device=device, num_samples=2, seed=0,
+    )
+    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, [(obs, act, y)], chunk_size=1)
+    assert scores.device.type == "cuda"
 
 
 def test_d_vs_f_equivalence_at_corrected_corruption(tiny_denoiser, tiny_transition):

@@ -31,7 +31,7 @@ def make_lcg_intrinsic_reward_fn(
     denoiser: Denoiser,
     theta_s_named: Dict[str, Tensor],
     frozen_named: Dict[str, Tensor],
-    h_D: Tensor,
+    h_D_inv_sqrt: Tensor,
     bank: JVPBank,
     chunk_size: int = 16,
 ) -> Callable[[List[Dict], Tensor], Tensor]:
@@ -40,7 +40,12 @@ def make_lcg_intrinsic_reward_fn(
     (genuine torch.func.jvp, simple IID Monte Carlo over the full training sigma
     distribution, Full CRN, M=bank.num_samples): scores every rollout step's
     info["imagined_candidate"] (populated by WorldModelEnv when constructed with
-    return_imagined_candidate=True) against the frozen (denoiser, h_D, bank).
+    return_imagined_candidate=True) against the frozen (denoiser, h_D_inv_sqrt, bank).
+
+    h_D_inv_sqrt is precomputed ONCE by the caller (LCGLifecycle.refresh(), once per outer
+    round) and passed in already-transformed -- h_D is fixed for the whole round, so
+    recomputing its rsqrt() on every one of this closure's calls (once per ActorCritic
+    scoring step, i.e. many times per round) would be pure waste.
     """
     def intrinsic_reward_fn(infos: List[Dict], env_rew: Tensor) -> Tensor:
         num_envs, num_steps = env_rew.shape
@@ -52,11 +57,8 @@ def make_lcg_intrinsic_reward_fn(
             batch = infos[t]["imagined_candidate"]
             all_candidates.extend(imagined_candidates_from_batch(batch.x_obs, batch.x_act, batch.y_star))
 
-        h_D_inv_sqrt = h_D.rsqrt()
-        scores_flat = score_one_jvp_bank(
-            denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, all_candidates, chunk_size
-        )
-        scores_flat = scores_flat.to(device=env_rew.device, dtype=env_rew.dtype)
+        scores_flat = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, all_candidates, chunk_size)
+        scores_flat = scores_flat.to(device=env_rew.device, dtype=env_rew.dtype)  # no-op when already matching (the common case)
         return scores_flat.view(num_steps, num_envs).transpose(0, 1).contiguous()
 
     return intrinsic_reward_fn

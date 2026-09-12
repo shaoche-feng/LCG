@@ -50,8 +50,8 @@ def wrap_with_running_rms(
     hook_fn: Callable[[List[Dict], Tensor], Tensor], rms: RunningRMS
 ) -> Callable[[List[Dict], Tensor], Tensor]:
     """Composes an existing intrinsic_reward_fn (e.g. from make_lcg_intrinsic_reward_fn)
-    with RunningRMS normalization as a separate, optional layer. Raw-LCG (Stage 5A/5B Part
-    A) behavior is reproduced exactly by simply not wrapping, or by wrapping with
+    with RunningRMS normalization as a separate, optional layer. Raw (unnormalized) LCG
+    reward is reproduced exactly by simply not wrapping, or by wrapping with
     RunningRMSConfig(enabled=False).
     """
 

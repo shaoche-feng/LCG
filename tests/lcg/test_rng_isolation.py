@@ -76,7 +76,7 @@ def test_numpy_global_rng_preserved_by_transition_sampling(small_dataset):
     expected = np.random.random(50)
 
     np.random.seed(123)
-    sample_uniform_historical_transitions(small_dataset, batch_size=5, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=999)
+    sample_uniform_historical_transitions(small_dataset, reference_size=5, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=999)
     actual = np.random.random(50)
 
     np.testing.assert_array_equal(actual, expected)
@@ -158,8 +158,8 @@ def test_different_seed_bank_is_different(tiny_denoiser):
 
 
 def test_historical_transition_sampling_reproducible(small_dataset):
-    ids1 = sample_uniform_historical_transitions(small_dataset, batch_size=6, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=42)
-    ids2 = sample_uniform_historical_transitions(small_dataset, batch_size=6, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=42)
+    ids1 = sample_uniform_historical_transitions(small_dataset, reference_size=6, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=42)
+    ids2 = sample_uniform_historical_transitions(small_dataset, reference_size=6, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=42)
     assert [(s.episode_id, s.start, s.stop) for s in ids1] == [(s.episode_id, s.start, s.stop) for s in ids2]
 
 
@@ -197,8 +197,8 @@ def test_candidate_score_reproducible(tiny_denoiser):
         TINY_SIGMA_CFG, torch.Size([1, IMG_CHANNELS, IMG_SIZE, IMG_SIZE]), d_S, device=torch.device("cpu"),
         num_samples=3, seed=13,
     )
-    scores1 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, chunk_size=1)
-    scores2 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, chunk_size=1)
+    scores1 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=1)
+    scores2 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=1)
     assert torch.equal(scores1, scores2)
 
 
@@ -265,7 +265,7 @@ def test_diamond_torch_sequence_independent_of_candidate_bank_and_scoring(tiny_d
         TINY_SIGMA_CFG, torch.Size([1, IMG_CHANNELS, IMG_SIZE, IMG_SIZE]), d_S, device=torch.device("cpu"),
         num_samples=3, seed=21,
     )
-    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, chunk_size=1)
+    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=1)
     sequence_after_lcg = torch.rand(30)
 
     assert torch.equal(sequence_after_lcg, baseline_sequence)
@@ -304,7 +304,7 @@ def test_integration_smoke_rng_preserved_and_outputs_valid(tiny_denoiser, small_
         TINY_SIGMA_CFG, torch.Size([1, IMG_CHANNELS, IMG_SIZE, IMG_SIZE]), d_S, device=torch.device("cpu"),
         num_samples=2, seed=6,
     )
-    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt=h_D.rsqrt(),
+    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt=h_D.rsqrt(),
                                  bank=bank, candidates=[(obs, act, y)], chunk_size=1)
     assert scores.shape == (1,)
     assert torch.isfinite(scores).all() and (scores >= 0).all()

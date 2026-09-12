@@ -19,13 +19,17 @@ _SQRT_2 = math.sqrt(2.0)
 
 def sample_uniform_historical_transitions(
     dataset: Dataset,
-    batch_size: int,
+    reference_size: int,
     num_steps_conditioning: int,
     seed: Optional[int] = None,
     rank: int = 0,
     world_size: int = 1,
     replace: bool = False,
 ) -> List[SegmentId]:
+    """Draws reference_size historical transitions uniformly without replacement from the
+    replay (P((episode,t))=1/N for every valid (episode,t) pair). reference_size = |S_B|,
+    i.e. B in the h_D formula -- NOT a neural-network minibatch size; it names the size of
+    the historical reference subset used to estimate h_D."""
     if world_size > 1:
         eligible_episodes = np.arange(rank, dataset.num_episodes, world_size)
     else:
@@ -34,15 +38,15 @@ def sample_uniform_historical_transitions(
     n_available = int(eligible_lengths.sum())
 
     if not replace:
-        assert batch_size <= n_available, (
-            f"requested batch_size={batch_size} historical transitions without replacement, "
-            f"but only {n_available} distinct transitions are available "
+        assert reference_size <= n_available, (
+            f"requested reference_size={reference_size} historical transitions without "
+            f"replacement, but only {n_available} distinct transitions are available "
             f"(rank={rank}, world_size={world_size}); pass replace=True to explicitly allow "
-            f"duplicate transitions, or reduce batch_size."
+            f"duplicate transitions, or reduce reference_size."
         )
 
     rng = np.random.default_rng(seed)
-    global_indices = rng.choice(n_available, size=batch_size, replace=replace)
+    global_indices = rng.choice(n_available, size=reference_size, replace=replace)
 
     # cumulative frame offsets WITHIN the eligible-episode subset, for global index -> (episode, t)
     eligible_start_idx = np.concatenate(([0], np.cumsum(eligible_lengths)[:-1]))

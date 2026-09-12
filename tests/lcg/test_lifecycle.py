@@ -101,15 +101,15 @@ def test_lifecycle_selects_theta_s_exactly_once_across_rounds(tmp_path):
 
     with mock.patch.object(lcg_lifecycle, "selected_named_parameters", wraps=selected_named_parameters) as spy_select, \
          mock.patch.object(lcg_lifecycle, "frozen_named_parameters", wraps=frozen_named_parameters) as spy_frozen:
-        lifecycle.refresh(denoiser, dataset)
+        lifecycle.refresh(denoiser, dataset, round_identifier=0)
         h_D_round0 = lifecycle.h_D.clone()
         bank_round0 = lifecycle.bank
 
-        lifecycle.refresh(denoiser, dataset)
+        lifecycle.refresh(denoiser, dataset, round_identifier=1)
         h_D_round1 = lifecycle.h_D.clone()
         bank_round1 = lifecycle.bank
 
-        lifecycle.refresh(denoiser, dataset)
+        lifecycle.refresh(denoiser, dataset, round_identifier=2)
         h_D_round2 = lifecycle.h_D.clone()
         bank_round2 = lifecycle.bank
 
@@ -123,16 +123,52 @@ def test_lifecycle_selects_theta_s_exactly_once_across_rounds(tmp_path):
     assert bank_round1 is not bank_round2
 
 
-def test_lifecycle_round_id_and_seeds_advance_each_round(tmp_path):
+def test_lifecycle_round_id_tracks_caller_supplied_identifier(tmp_path):
+    """round_id is now a direct copy of the caller-supplied round_identifier (e.g.
+    Trainer.epoch), not an internally auto-incremented counter -- this is what makes the
+    seed sequence survive checkpoint/resume (see test_lifecycle_resume_reproduces_seeds)."""
     denoiser = _build_denoiser()
     dataset = _build_dataset(tmp_path)
     lifecycle = _build_lifecycle()
 
     assert lifecycle.round_id == -1
-    lifecycle.refresh(denoiser, dataset)
+    lifecycle.refresh(denoiser, dataset, round_identifier=0)
     assert lifecycle.round_id == 0
-    lifecycle.refresh(denoiser, dataset)
+    lifecycle.refresh(denoiser, dataset, round_identifier=1)
     assert lifecycle.round_id == 1
+    # a caller may pass any identifier sequence -- e.g. resuming straight to round 7
+    lifecycle.refresh(denoiser, dataset, round_identifier=7)
+    assert lifecycle.round_id == 7
+
+
+def test_lifecycle_resume_reproduces_seeds(tmp_path):
+    """Simulates checkpoint/resume: LCGLifecycle itself is never checkpointed (it is a
+    underscore-prefixed Trainer attribute, see StateDictMixin), so a resumed run
+    reconstructs a brand-new LCGLifecycle and calls refresh() directly at the round
+    identifier it resumed from. Since historical_precision/make_jvp_bank are pure
+    functions of (denoiser weights, dataset, seed) with no persistent state carried by
+    LCGLifecycle across rounds, jumping straight to round_identifier=2 on a fresh
+    lifecycle must reproduce bit-identical h_D/bank to having reached round 2 by calling
+    refresh() at 0, 1, 2 in sequence on a long-lived lifecycle."""
+    denoiser = _build_denoiser()
+    dataset = _build_dataset(tmp_path)
+
+    uninterrupted = _build_lifecycle()
+    for r in (0, 1, 2):
+        uninterrupted.refresh(denoiser, dataset, round_identifier=r)
+    h_D_uninterrupted = uninterrupted.h_D.clone()
+    bank_uninterrupted = uninterrupted.bank
+
+    resumed = _build_lifecycle()  # fresh instance, as after a process restart
+    resumed.refresh(denoiser, dataset, round_identifier=2)
+    h_D_resumed = resumed.h_D.clone()
+    bank_resumed = resumed.bank
+
+    assert torch.equal(h_D_uninterrupted, h_D_resumed)
+    assert bank_uninterrupted.sigmas == bank_resumed.sigmas
+    assert all(torch.equal(a, b) for a, b in zip(bank_uninterrupted.epsilons, bank_resumed.epsilons))
+    assert all(torch.equal(a, b) for a, b in zip(bank_uninterrupted.epsilons_offset, bank_resumed.epsilons_offset))
+    assert all(torch.equal(a, b) for a, b in zip(bank_uninterrupted.etas, bank_resumed.etas))
 
 
 # --------------------------------------------------------------------------------------
@@ -145,8 +181,8 @@ def test_cached_theta_s_reflects_parameter_mutations_across_rounds(tmp_path):
     dataset = _build_dataset(tmp_path)
     lifecycle = _build_lifecycle()
 
-    lifecycle.refresh(denoiser, dataset)  # round 0: cache created
-    name = lifecycle._theta_s_names[0]
+    lifecycle.refresh(denoiser, dataset, round_identifier=0)  # round 0: cache created
+    name = next(iter(lifecycle._theta_s_named.keys()))
     live_param = dict(denoiser.inner_model.named_parameters())[name]
     old_value = live_param.detach().clone()
 
@@ -157,7 +193,7 @@ def test_cached_theta_s_reflects_parameter_mutations_across_rounds(tmp_path):
     assert cached_param is live_param  # cache did not snapshot
     assert not torch.equal(cached_param, old_value)  # cache observes the new value
 
-    lifecycle.refresh(denoiser, dataset)  # round 1: must reuse cache, not reselect
+    lifecycle.refresh(denoiser, dataset, round_identifier=1)  # round 1: must reuse cache, not reselect
     assert torch.isfinite(lifecycle.h_D).all()
     assert (lifecycle.h_D > 0).all()
 
@@ -173,9 +209,9 @@ def test_lifecycle_raises_on_denoiser_replacement(tmp_path):
     dataset = _build_dataset(tmp_path)
     lifecycle = _build_lifecycle()
 
-    lifecycle.refresh(denoiser_a, dataset)
+    lifecycle.refresh(denoiser_a, dataset, round_identifier=0)
     with pytest.raises(RuntimeError, match="different denoiser instance"):
-        lifecycle.refresh(denoiser_b, dataset)
+        lifecycle.refresh(denoiser_b, dataset, round_identifier=1)
 
 
 # --------------------------------------------------------------------------------------
@@ -188,6 +224,75 @@ def test_lifecycle_caches_dimension_matching_h_D(tmp_path):
     dataset = _build_dataset(tmp_path)
     lifecycle = _build_lifecycle()
 
-    lifecycle.refresh(denoiser, dataset)
+    lifecycle.refresh(denoiser, dataset, round_identifier=0)
     assert lifecycle._theta_s_dim == sum(p.numel() for p in lifecycle._theta_s_named.values())
     assert lifecycle.h_D.numel() == lifecycle._theta_s_dim
+
+
+# --------------------------------------------------------------------------------------
+# Item 8: LCGConfig.__post_init__ validation -- reject nonsensical configs loudly instead
+# of letting them silently degrade (in particular candidate_num_mc=0, which would
+# otherwise silently produce an empty JVP bank and a zero intrinsic reward everywhere).
+# --------------------------------------------------------------------------------------
+
+
+def _valid_kwargs(**overrides):
+    kwargs = dict(
+        enabled=True, precision_reference_size=10, precision_num_mc=2, candidate_num_mc=2,
+        candidate_chunk_size=2, theta_s=THETA_S_CFG,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"precision_reference_size": 0},
+        {"precision_reference_size": -1},
+        {"precision_num_mc": 0},
+        {"precision_num_mc": -1},
+        {"candidate_chunk_size": 0},
+        {"candidate_chunk_size": -1},
+        {"damping": 0.0},
+        {"damping": -1e-4},
+    ],
+)
+def test_lcg_config_rejects_non_positive_fields(override):
+    with pytest.raises(AssertionError):
+        LCGConfig(**_valid_kwargs(**override))
+
+
+def test_lcg_config_rejects_non_positive_candidate_num_mc():
+    """candidate_num_mc=0 must not silently produce a zero-sample JVP bank and thus zero
+    intrinsic reward everywhere -- it must fail loudly at config time instead."""
+    with pytest.raises(AssertionError, match="candidate_num_mc"):
+        LCGConfig(**_valid_kwargs(candidate_num_mc=0))
+    with pytest.raises(AssertionError):
+        LCGConfig(**_valid_kwargs(candidate_num_mc=-3))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"rms_alpha": 0.0},
+        {"rms_alpha": -1.0},
+        {"rms_ema_decay": -0.1},
+        {"rms_ema_decay": 1.0},
+        {"rms_ema_decay": 1.5},
+        {"rms_eps": 0.0},
+        {"rms_eps": -1e-8},
+    ],
+)
+def test_lcg_config_rejects_invalid_rms_params_when_enabled(override):
+    with pytest.raises(AssertionError):
+        LCGConfig(**_valid_kwargs(rms_enabled=True, **override))
+
+
+def test_lcg_config_allows_invalid_rms_params_when_rms_disabled():
+    # rms_* fields are irrelevant when rms_enabled=False -- must not be validated then
+    LCGConfig(**_valid_kwargs(rms_enabled=False, rms_alpha=-1.0, rms_ema_decay=5.0, rms_eps=-1.0))
+
+
+def test_lcg_config_accepts_valid_defaults():
+    LCGConfig(**_valid_kwargs())

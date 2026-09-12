@@ -67,7 +67,7 @@ def test_duplicate_candidate_scores_identically_across_chunks(tiny_denoiser):
     # under chunk_size=2 (chunks are [0,1], [2,3], [4,5])
     candidates[4] = tuple(t.clone() for t in candidates[0])
 
-    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, chunk_size=2)
+    scores = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=2)
     assert torch.equal(scores[0], scores[4])
 
 
@@ -87,9 +87,9 @@ def test_chunk_size_does_not_change_scores(tiny_denoiser):
     )
     candidates = _make_candidates(denoiser, 6)
 
-    scores_c1 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, chunk_size=1)
-    scores_c3 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, chunk_size=3)
-    scores_c6 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, theta_s_named, h_D, h_D_inv_sqrt, bank, candidates, chunk_size=6)
+    scores_c1 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=1)
+    scores_c3 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=3)
+    scores_c6 = score_one_jvp_bank(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, candidates, chunk_size=6)
 
     assert torch.allclose(scores_c1, scores_c3, atol=1e-5)
     assert torch.allclose(scores_c1, scores_c6, atol=1e-5)

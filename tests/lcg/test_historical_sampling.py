@@ -84,7 +84,7 @@ def test_every_transition_is_representable(small_dataset):
     dataset, lengths = small_dataset
     N = sum(lengths)
     segment_ids = sample_uniform_historical_transitions(
-        dataset, batch_size=N, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=0, replace=False
+        dataset, reference_size=N, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=0, replace=False
     )
     sampled_pairs = {(sid.episode_id, sid.stop - 1) for sid in segment_ids}
     assert sampled_pairs == _all_valid_transitions(lengths)
@@ -95,7 +95,7 @@ def test_exact_endpoint_preservation(small_dataset):
     segment's target frame must be exactly episode.obs[t], not obs[t+k] for any k!=0."""
     dataset, lengths = small_dataset
     segment_ids = sample_uniform_historical_transitions(
-        dataset, batch_size=sum(lengths), num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=1, replace=False
+        dataset, reference_size=sum(lengths), num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=1, replace=False
     )
     for sid in segment_ids:
         t = sid.stop - 1
@@ -113,7 +113,7 @@ def test_no_duplicate_transitions_without_replacement(small_dataset):
     N = sum(lengths)
     B = N - 2
     segment_ids = sample_uniform_historical_transitions(
-        dataset, batch_size=B, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=2, replace=False
+        dataset, reference_size=B, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=2, replace=False
     )
     pairs = [(sid.episode_id, sid.stop - 1) for sid in segment_ids]
     assert len(pairs) == len(set(pairs))
@@ -123,21 +123,21 @@ def test_correct_sample_count(small_dataset):
     dataset, lengths = small_dataset
     for B in [1, 4, sum(lengths)]:
         segment_ids = sample_uniform_historical_transitions(
-            dataset, batch_size=B, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=3, replace=False
+            dataset, reference_size=B, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=3, replace=False
         )
         assert len(segment_ids) == B
 
 
-def test_batch_size_exceeding_available_raises_without_replace(small_dataset):
+def test_reference_size_exceeding_available_raises_without_replace(small_dataset):
     dataset, lengths = small_dataset
     N = sum(lengths)
     with pytest.raises(AssertionError):
         sample_uniform_historical_transitions(
-            dataset, batch_size=N + 1, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=4, replace=False
+            dataset, reference_size=N + 1, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=4, replace=False
         )
     # explicit replace=True must not raise
     segment_ids = sample_uniform_historical_transitions(
-        dataset, batch_size=N + 5, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=4, replace=True
+        dataset, reference_size=N + 5, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=4, replace=True
     )
     assert len(segment_ids) == N + 5
 
@@ -161,7 +161,7 @@ def test_final_transition_no_extra_probability_from_clipping(small_dataset):
     LAST transition from boundary clipping. Verify the new sampler's empirical frequency
     at each episode's final transition is NOT inflated relative to other transitions.
 
-    Uses independent batch_size=1 draws (NOT batch_size=N without replacement, which
+    Uses independent reference_size=1 draws (NOT reference_size=N without replacement, which
     would trivially force a full permutation -- i.e. every transition exactly once --
     regardless of whether the underlying sampling is biased or not)."""
     dataset, lengths = small_dataset
@@ -169,7 +169,7 @@ def test_final_transition_no_extra_probability_from_clipping(small_dataset):
     num_draws = 20000
     for seed in range(num_draws):
         segment_ids = sample_uniform_historical_transitions(
-            dataset, batch_size=1, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=1000 + seed, replace=False
+            dataset, reference_size=1, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=1000 + seed, replace=False
         )
         sid = segment_ids[0]
         counts[(sid.episode_id, sid.stop - 1)] += 1
@@ -192,7 +192,7 @@ def test_empirical_frequencies_approximately_uniform(small_dataset):
     counts = {k: 0 for k in _all_valid_transitions(lengths)}
     for seed in rng_seeds:
         segment_ids = sample_uniform_historical_transitions(
-            dataset, batch_size=1, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=seed, replace=False
+            dataset, reference_size=1, num_steps_conditioning=NUM_STEPS_CONDITIONING, seed=seed, replace=False
         )
         sid = segment_ids[0]
         counts[(sid.episode_id, sid.stop - 1)] += 1

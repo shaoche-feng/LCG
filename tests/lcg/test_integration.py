@@ -68,13 +68,13 @@ def test_full_pipeline_no_candidate_lost_or_duplicated(tiny_denoiser):
     theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     d_S = sum(p.numel() for p in theta_s_named.values())
-    h_D = torch.rand(d_S) + 0.5
+    h_D_inv_sqrt = (torch.rand(d_S) + 0.5).rsqrt()
     bank = make_jvp_bank(
         TINY_SIGMA_CFG, torch.Size([1, TINY_IMG_CHANNELS, TINY_IMG_SIZE, TINY_IMG_SIZE]), d_S,
         device=torch.device("cpu"), num_samples=2, seed=0,
     )
 
-    hook = make_lcg_intrinsic_reward_fn(denoiser, theta_s_named, frozen_named, h_D, bank, chunk_size=2)
+    hook = make_lcg_intrinsic_reward_fn(denoiser, theta_s_named, frozen_named, h_D_inv_sqrt, bank, chunk_size=2)
     out = hook(infos, env_rew)
 
     assert out.shape == env_rew.shape
