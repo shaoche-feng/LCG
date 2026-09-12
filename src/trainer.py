@@ -17,7 +17,7 @@ from agent import Agent, get_action_space_kwargs
 from coroutines.collector import make_collector, NumToCollect
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
 from envs import make_atari_env, make_dm_control_env, WorldModelEnv
-from lcg import LCGLifecycle
+from lcg import LCGConfig, LCGLifecycle
 from utils import (
     broadcast_if_needed,
     build_ddp_wrapper,
@@ -198,15 +198,12 @@ class Trainer(StateDictMixin):
         actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
         self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
 
-        # LCG intrinsic-reward lifecycle (Stage 5C) -- disabled unless
+        # LCG intrinsic-reward lifecycle -- disabled unless
         # cfg.intrinsic_reward.enabled is True (default False, see
         # config/intrinsic_reward/lcg.yaml); only meaningful for the world-model
         # (non-model-free) path. When disabled, self._lcg_lifecycle stays None and
         # train_agent()/train_component() take their exact original code paths.
         if lcg_enabled and not self._is_model_free:
-            # enabled=True is guaranteed here: lcg_enabled already required
-            # cfg.intrinsic_reward.enabled to be True, and instantiate() reads it from
-            # that same value.
             lcg_cfg = instantiate(cfg.intrinsic_reward)
             self._lcg_lifecycle = LCGLifecycle(
                 lcg_cfg, sigma_distribution_cfg,
