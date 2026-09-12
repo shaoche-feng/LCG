@@ -33,8 +33,17 @@ sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
 from data import Dataset, Episode  # noqa: E402
 from data.utils import make_segment  # noqa: E402
 from lcg.precision import historical_precision, load_transition, sample_uniform_historical_transitions  # noqa: E402
-from lcg.theta_s import selected_parameters  # noqa: E402
+from lcg.theta_s import ThetaSConfig, selected_parameters  # noqa: E402
 from models.diffusion import SigmaDistributionConfig  # noqa: E402
+
+
+def _default_theta_s_config(denoiser) -> ThetaSConfig:
+    """Current-production-equivalent ThetaSConfig for whichever denoiser is passed --
+    duplicated per test file, matching this suite's existing convention (see conftest.py's
+    default_theta_s_config, the same helper)."""
+    last_idx = len(denoiser.inner_model.unet.u_blocks) - 1
+    return ThetaSConfig(include=(f"unet.u_blocks.{last_idx}.*", "norm_out.*", "conv_out.*"), exclude=())
+
 
 IMG_CHANNELS = 3
 IMG_SIZE = 8
@@ -203,7 +212,7 @@ def test_historical_precision_end_to_end_with_fixed_sampler(tiny_denoiser, small
     denoiser = tiny_denoiser
     N = sum(lengths)
     B = N  # exercise the "B == N, without replacement" boundary explicitly
-    params = selected_parameters(denoiser)
+    params = selected_parameters(denoiser, _default_theta_s_config(denoiser))
     d_S = sum(p.numel() for p in params)
     sigma_cfg = SigmaDistributionConfig(loc=-0.4, scale=1.2, sigma_min=0.002, sigma_max=20.0)
 

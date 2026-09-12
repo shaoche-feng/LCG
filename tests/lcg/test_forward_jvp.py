@@ -8,14 +8,12 @@ import torch
 import torch.func as func
 from lcg.forward_jvp import (
     JVPBank,
-    frozen_named_parameters,
     jvp_through_F,
     make_jvp_bank,
     score_one_jvp_bank,
-    selected_named_parameters,
     unflatten_to_dict,
 )
-from lcg.theta_s import selected_parameters
+from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters, selected_parameters
 from models.diffusion import SigmaDistributionConfig
 from models.diffusion.denoiser import apply_noise_from_samples
 
@@ -24,6 +22,14 @@ from models.diffusion.denoiser import apply_noise_from_samples
 TINY_IMG_CHANNELS = 3
 TINY_IMG_SIZE = 8
 TINY_SIGMA_CFG = SigmaDistributionConfig(loc=-0.4, scale=1.2, sigma_min=0.002, sigma_max=20.0)
+
+
+def _default_theta_s_config(denoiser) -> ThetaSConfig:
+    """Current-production-equivalent ThetaSConfig for whichever denoiser is passed --
+    duplicated per test file, matching this suite's existing convention (see conftest.py's
+    default_theta_s_config, the same helper)."""
+    last_idx = len(denoiser.inner_model.unet.u_blocks) - 1
+    return ThetaSConfig(include=(f"unet.u_blocks.{last_idx}.*", "norm_out.*", "conv_out.*"), exclude=())
 
 
 def _explicit_jacobian_of_F(denoiser, params, y_sigma, sigma, obs, act):
@@ -40,7 +46,7 @@ def _explicit_jacobian_of_F(denoiser, params, y_sigma, sigma, obs, act):
 def _tiny_setup(tiny_denoiser, tiny_transition):
     denoiser = tiny_denoiser
     obs, act, y = tiny_transition
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     params = list(theta_s_named.values())
     d_S = sum(p.numel() for p in params)
@@ -69,8 +75,9 @@ def test_jvp_matches_explicit_jacobian(tiny_denoiser, tiny_transition):
 
 
 def test_parameter_ordering_matches_theta_s(tiny_denoiser):
-    theta_s_named = selected_named_parameters(tiny_denoiser)
-    ref = selected_parameters(tiny_denoiser)
+    cfg = _default_theta_s_config(tiny_denoiser)
+    theta_s_named = selected_named_parameters(tiny_denoiser, cfg)
+    ref = selected_parameters(tiny_denoiser, cfg)
     assert len(theta_s_named) == len(ref)
     assert all(a is b for a, b in zip(theta_s_named.values(), ref))
 

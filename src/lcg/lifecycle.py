@@ -1,6 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -8,16 +8,17 @@ from torch import Tensor
 from data import Dataset
 from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig
 
-from .forward_jvp import assert_setup_valid, frozen_named_parameters, make_jvp_bank, selected_named_parameters
+from .forward_jvp import make_jvp_bank
 from .intrinsic_reward import make_lcg_intrinsic_reward_fn
-from .precision import historical_precision
+from .precision import assert_setup_valid, historical_precision
 from .reward_normalization import RunningRMS, RunningRMSConfig
+from .theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
 
 
 @dataclass
 class LCGConfig:
     enabled: bool = False
-    h_d_batch_size: int = 40
+    precision_reference_size: int = 40
     precision_num_mc: int = 3  # historical precision: IID sigma draws per historical transition (backward VJP)
     damping: float = 1e-4
     beta: float = 1.0
@@ -27,36 +28,10 @@ class LCGConfig:
     rms_alpha: float = 1.0
     rms_ema_decay: float = 0.99
     rms_eps: float = 1e-8
+    theta_s: ThetaSConfig = field(kw_only=True)  # which parameters belong to theta_S -- see config/intrinsic_reward/lcg.yaml
 
 
 class LCGLifecycle:
-    """Owns the outer-round LCG state and refreshes it once per completed world-model
-    update round:
-
-        world-model update -> h_D refresh (backward VJP, simple MC) -> candidate JVP-bank
-        refresh (forward JVP, simple MC, Full CRN) -> RunningRMS reset
-        -> LCG ActorCritic inner training (fixed theta_S/h_D/bank; RMS evolves normally
-           across the round's ActorCritic optimizer steps)
-        -> next world-model round -> refresh everything
-
-    h_D is estimated via lcg.precision.historical_precision, which samples historical
-    transitions uniformly without replacement (lcg.precision.
-    sample_uniform_historical_transitions) and applies the N/B correction using
-    N=dataset.num_steps by default -- both passed explicitly here for clarity. theta_S
-    and the RunningRMS formula are fixed by the method, not configurable here.
-
-    Candidate scoring is always forward-mode JVP + simple Monte Carlo + Full CRN -- there
-    is no alternative estimator to select.
-
-    Instrumented for lifecycle verification: `round_id` identifies the current outer round
-    (0-indexed, set at the start of refresh() and held constant until the next refresh());
-    h_d_compute_count / crn_construct_count / rms_reset_count each increment exactly once
-    per refresh() call. `refresh()` and the returned intrinsic_reward_fn print `[LCG]`-
-    prefixed diagnostic lines (round id, content fingerprints of h_D/bank, RMS state,
-    timing) so an external harness can verify exactly-once-per-round refresh and
-    within-round persistence from process stdout alone.
-    """
-
     def __init__(self, cfg: LCGConfig, sigma_cfg: SigmaDistributionConfig, img_channels: int, img_size: int, device: torch.device):
         self.cfg = cfg
         self.sigma_cfg = sigma_cfg
@@ -65,9 +40,12 @@ class LCGLifecycle:
         self.device = device
 
         self.round_id = -1
-        self.h_d_compute_count = 0
-        self.crn_construct_count = 0
-        self.rms_reset_count = 0
+
+        self._theta_s_named: Optional[Dict[str, torch.nn.Parameter]] = None
+        self._theta_s_names: Optional[Tuple[str, ...]] = None
+        self._theta_s_dim: Optional[int] = None
+        self._frozen_named: Optional[Dict[str, torch.Tensor]] = None
+        self._denoiser_ref: Optional[Denoiser] = None
 
         self.h_D: Optional[Tensor] = None
         self.bank = None
@@ -76,47 +54,64 @@ class LCGLifecycle:
 
     def refresh(self, denoiser: Denoiser, dataset: Dataset) -> None:
         assert self.cfg.enabled
+
         self.round_id += 1
-        theta_s_named = selected_named_parameters(denoiser)
-        params = list(theta_s_named.values())
         seed = self.round_id
 
+        # theta_S selection and frozen parameter caching is done once per lifecycle instance
+        # The denoiser instance must be the same across refreshes.
+        if self._theta_s_named is None:
+            theta_s_named = selected_named_parameters(denoiser, self.cfg.theta_s)
+            self._theta_s_named = theta_s_named
+            self._theta_s_names = tuple(theta_s_named.keys())
+            self._theta_s_dim = sum(p.numel() for p in theta_s_named.values())
+            self._frozen_named = frozen_named_parameters(denoiser, theta_s_named)
+            self._denoiser_ref = denoiser
+            print(
+                f"[LCG] theta_S: parameter tensors={len(theta_s_named)} "
+                f"scalar parameters={self._theta_s_dim} "
+                f"include={list(self.cfg.theta_s.include)} exclude={list(self.cfg.theta_s.exclude)}",
+                flush=True,
+            )
+        elif denoiser is not self._denoiser_ref:
+            raise RuntimeError("LCGLifecycle.refresh() was called with a different denoiser instance ")
+
+        theta_s_named = self._theta_s_named
+        frozen_named = self._frozen_named
+        params = list(theta_s_named.values())
+
+        # Compute historical precision h_D (backward VJP)
         t0 = time.time()
         self.h_D = historical_precision(
             denoiser, params, dataset, self.sigma_cfg,
-            B=self.cfg.h_d_batch_size, N=dataset.num_steps, num_mc=self.cfg.precision_num_mc,
+            B=self.cfg.precision_reference_size, N=dataset.num_steps, num_mc=self.cfg.precision_num_mc,
             beta=self.cfg.beta, damping=self.cfg.damping, seed=seed,
         )
         t_h_d = time.time() - t0
-        self.h_d_compute_count += 1
+        assert_setup_valid(theta_s_named, self.h_D, d_S=self._theta_s_dim)
 
         y_shape = torch.Size([1, self.img_channels, self.img_size, self.img_size])
         t0 = time.time()
-        frozen_named = frozen_named_parameters(denoiser, theta_s_named)
-        assert_setup_valid(theta_s_named, self.h_D, d_S=self.h_D.numel())
         self.bank = make_jvp_bank(
-            self.sigma_cfg, y_shape, self.h_D.numel(), self.device,
+            self.sigma_cfg, y_shape, self._theta_s_dim, self.device,
             num_samples=self.cfg.candidate_num_mc, seed=seed + 1_000_000,
         )
         base_hook = make_lcg_intrinsic_reward_fn(
             denoiser, theta_s_named, frozen_named, self.h_D, self.bank, chunk_size=self.cfg.candidate_chunk_size,
         )
         t_crn = time.time() - t0
-        self.crn_construct_count += 1
 
         self.rms = RunningRMS(RunningRMSConfig(
             enabled=self.cfg.rms_enabled, alpha=self.cfg.rms_alpha,
             ema_decay=self.cfg.rms_ema_decay, eps=self.cfg.rms_eps,
         ))
-        self.rms_reset_count += 1
 
         h_d_fingerprint = self.h_D.sum().item()
         banks_fingerprint = sum(s.item() for s in self.bank.sigmas)
         print(
             f"[LCG] round={self.round_id} refresh: N={dataset.num_steps} "
-            f"h_d_compute_count={self.h_d_compute_count} h_D_fingerprint={h_d_fingerprint:.6f} (t={t_h_d:.2f}s)  "
-            f"crn_construct_count={self.crn_construct_count} banks_fingerprint={banks_fingerprint:.6f} (t={t_crn:.2f}s)  "
-            f"rms_reset_count={self.rms_reset_count}",
+            f"h_D_fingerprint={h_d_fingerprint:.6f} (t={t_h_d:.2f}s)  "
+            f"banks_fingerprint={banks_fingerprint:.6f} (t={t_crn:.2f}s)",
             flush=True,
         )
 

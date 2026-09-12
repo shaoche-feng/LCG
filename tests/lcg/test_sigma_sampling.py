@@ -71,7 +71,7 @@ def test_historical_precision_uses_iid_full_distribution_not_stratified(tiny_den
 
     sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
     from data import Dataset, Episode
-    from lcg.theta_s import selected_parameters
+    from lcg.theta_s import ThetaSConfig, selected_parameters
     from models.diffusion import SigmaDistributionConfig
 
     denoiser = tiny_denoiser
@@ -89,7 +89,9 @@ def test_historical_precision_uses_iid_full_distribution_not_stratified(tiny_den
         for L in [4, 6]:
             dataset.add_episode(_make_episode(L))
         N = dataset.num_steps
-        params = selected_parameters(denoiser)
+        last_idx = len(denoiser.inner_model.unet.u_blocks) - 1
+        theta_s_cfg = ThetaSConfig(include=(f"unet.u_blocks.{last_idx}.*", "norm_out.*", "conv_out.*"), exclude=())
+        params = selected_parameters(denoiser, theta_s_cfg)
 
         calls = []
         real_fn = lcg_precision.sample_sigma_training_distribution

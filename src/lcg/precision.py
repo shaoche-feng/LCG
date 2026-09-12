@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 import torch
@@ -143,3 +143,13 @@ def historical_precision(
         h = h + scale * g_i
 
     return h
+
+
+def assert_setup_valid(theta_s_named: Dict[str, Tensor], h_D: Tensor, d_S: int) -> None:
+    flat = torch.cat([t.reshape(-1) for t in theta_s_named.values()])
+    assert flat.numel() == d_S, f"theta_S flat dim {flat.numel()} != d_S {d_S}"
+    assert h_D.numel() == d_S, f"h_D dim {h_D.numel()} != d_S {d_S}"
+    assert torch.isfinite(h_D).all(), "h_D contains non-finite values"
+    assert (h_D > 0).all(), "h_D is not strictly positive"
+    assert not h_D.requires_grad, "h_D must not require grad"
+    print(f"assert_setup_valid: dim(theta_S)=dim(h_D)={d_S}, h_D finite and >0, h_D.requires_grad=False -- OK")

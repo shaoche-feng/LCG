@@ -14,8 +14,16 @@ locally, purely to document/verify the identity -- production itself never does 
 """
 import torch
 from lcg.precision import _backward_vjp_probe
-from lcg.theta_s import selected_parameters
+from lcg.theta_s import ThetaSConfig, selected_parameters
 from models.diffusion.denoiser import apply_noise_from_samples
+
+
+def _default_theta_s_config(denoiser) -> ThetaSConfig:
+    """Current-production-equivalent ThetaSConfig for whichever denoiser is passed --
+    duplicated per test file, matching this suite's existing convention (see conftest.py's
+    default_theta_s_config, the same helper)."""
+    last_idx = len(denoiser.inner_model.unet.u_blocks) - 1
+    return ThetaSConfig(include=(f"unet.u_blocks.{last_idx}.*", "norm_out.*", "conv_out.*"), exclude=())
 
 
 def _explicit_jacobian(out_flat, params):
@@ -38,7 +46,7 @@ def test_backward_vjp_matches_explicit_jacobian_of_F(tiny_denoiser, tiny_transit
     independently-built explicit Jacobian of the raw inner-model output F_theta."""
     denoiser = tiny_denoiser
     obs, act, y = tiny_transition
-    params = selected_parameters(denoiser)
+    params = selected_parameters(denoiser, _default_theta_s_config(denoiser))
 
     sigma = torch.tensor([1.0])
     eps = torch.randn_like(y)
@@ -67,7 +75,7 @@ def test_backward_vjp_D_form_equals_F_form(tiny_denoiser, tiny_transition):
     max/mean relative diff, cosine similarity, and relative L2 (asserted, not just printed)."""
     denoiser = tiny_denoiser
     obs, act, y = tiny_transition
-    params = selected_parameters(denoiser)
+    params = selected_parameters(denoiser, _default_theta_s_config(denoiser))
 
     sigma = torch.tensor([0.9])
     eps = torch.randn_like(y)
@@ -113,7 +121,7 @@ def test_hutchinson_diagonal_estimate_matches_exact_gauss_newton_diagonal(tiny_d
     across draws and cancels out of this ratio check, so it's omitted here.)"""
     denoiser = tiny_denoiser
     obs, act, y = tiny_transition
-    params = selected_parameters(denoiser)
+    params = selected_parameters(denoiser, _default_theta_s_config(denoiser))
 
     sigma = torch.tensor([0.8])
     eps = torch.randn_like(y)

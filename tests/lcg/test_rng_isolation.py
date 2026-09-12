@@ -27,18 +27,24 @@ sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
 
 from data import Dataset, Episode  # noqa: E402
 from lcg.forward_jvp import (  # noqa: E402
-    frozen_named_parameters,
     make_jvp_bank,
     score_one_jvp_bank,
-    selected_named_parameters,
 )
 from lcg.precision import historical_precision, sample_uniform_historical_transitions  # noqa: E402
-from lcg.theta_s import selected_parameters  # noqa: E402
+from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters, selected_parameters  # noqa: E402
 from models.diffusion import SigmaDistributionConfig  # noqa: E402
 
 IMG_CHANNELS, IMG_SIZE, ACTION_DIM = 3, 8, 2
 NUM_STEPS_CONDITIONING = 1
 TINY_SIGMA_CFG = SigmaDistributionConfig(loc=-0.4, scale=1.2, sigma_min=0.002, sigma_max=20.0)
+
+
+def _default_theta_s_config(denoiser) -> ThetaSConfig:
+    """Current-production-equivalent ThetaSConfig for whichever denoiser is passed --
+    duplicated per test file, matching this suite's existing convention (see conftest.py's
+    default_theta_s_config, the same helper)."""
+    last_idx = len(denoiser.inner_model.unet.u_blocks) - 1
+    return ThetaSConfig(include=(f"unet.u_blocks.{last_idx}.*", "norm_out.*", "conv_out.*"), exclude=())
 
 
 def _make_episode(length):
@@ -78,7 +84,7 @@ def test_numpy_global_rng_preserved_by_transition_sampling(small_dataset):
 
 def test_torch_cpu_global_rng_preserved_by_candidate_bank(tiny_denoiser):
     denoiser = tiny_denoiser
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     d_S = sum(p.numel() for p in theta_s_named.values())
     y_shape = torch.Size([1, IMG_CHANNELS, IMG_SIZE, IMG_SIZE])
 
@@ -96,7 +102,7 @@ def test_torch_cpu_global_rng_preserved_by_candidate_bank(tiny_denoiser):
 def test_torch_cuda_global_rng_preserved_by_candidate_bank(tiny_denoiser):
     device = torch.device("cuda")
     denoiser = tiny_denoiser
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     d_S = sum(p.numel() for p in theta_s_named.values())
     y_shape = torch.Size([1, IMG_CHANNELS, IMG_SIZE, IMG_SIZE])
 
@@ -117,7 +123,7 @@ def test_torch_cuda_global_rng_preserved_by_candidate_bank(tiny_denoiser):
 
 def test_same_seed_bank_is_identical(tiny_denoiser):
     denoiser = tiny_denoiser
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     d_S = sum(p.numel() for p in theta_s_named.values())
     y_shape = torch.Size([1, IMG_CHANNELS, IMG_SIZE, IMG_SIZE])
 
@@ -136,7 +142,7 @@ def test_same_seed_bank_is_identical(tiny_denoiser):
 
 def test_different_seed_bank_is_different(tiny_denoiser):
     denoiser = tiny_denoiser
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     d_S = sum(p.numel() for p in theta_s_named.values())
     y_shape = torch.Size([1, IMG_CHANNELS, IMG_SIZE, IMG_SIZE])
 
@@ -160,7 +166,7 @@ def test_historical_transition_sampling_reproducible(small_dataset):
 def test_historical_precision_reproducible(tiny_denoiser, small_dataset):
     denoiser = tiny_denoiser
     dataset = small_dataset
-    params = selected_parameters(denoiser)
+    params = selected_parameters(denoiser, _default_theta_s_config(denoiser))
     N = dataset.num_steps
 
     h_D_1 = historical_precision(denoiser, params, dataset, TINY_SIGMA_CFG, B=N, N=N, num_mc=3, seed=99)
@@ -175,7 +181,7 @@ def test_historical_precision_reproducible(tiny_denoiser, small_dataset):
 
 def test_candidate_score_reproducible(tiny_denoiser):
     denoiser = tiny_denoiser
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     d_S = sum(p.numel() for p in theta_s_named.values())
     h_D = torch.rand(d_S) + 0.5
@@ -209,7 +215,7 @@ def test_diamond_torch_sequence_independent_of_historical_precision(tiny_denoise
 
     denoiser = tiny_denoiser
     dataset = small_dataset
-    params = selected_parameters(denoiser)
+    params = selected_parameters(denoiser, _default_theta_s_config(denoiser))
     N = dataset.num_steps
 
     torch.manual_seed(S)
@@ -227,7 +233,7 @@ def test_diamond_numpy_sequence_independent_of_historical_precision(tiny_denoise
 
     denoiser = tiny_denoiser
     dataset = small_dataset
-    params = selected_parameters(denoiser)
+    params = selected_parameters(denoiser, _default_theta_s_config(denoiser))
     N = dataset.num_steps
 
     np.random.seed(S)
@@ -243,7 +249,7 @@ def test_diamond_torch_sequence_independent_of_candidate_bank_and_scoring(tiny_d
     baseline_sequence = torch.rand(30)
 
     denoiser = tiny_denoiser
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     d_S = sum(p.numel() for p in theta_s_named.values())
     h_D = torch.rand(d_S) + 0.5  # NOTE: this itself consumes global RNG (test setup, not LCG)
@@ -274,12 +280,12 @@ def test_diamond_torch_sequence_independent_of_candidate_bank_and_scoring(tiny_d
 def test_integration_smoke_rng_preserved_and_outputs_valid(tiny_denoiser, small_dataset):
     denoiser = tiny_denoiser
     dataset = small_dataset
-    params = selected_parameters(denoiser)
+    params = selected_parameters(denoiser, _default_theta_s_config(denoiser))
     N = dataset.num_steps
 
     # test-fixture data (candidate tensors) built BEFORE capturing RNG state -- their
     # construction legitimately consumes global RNG and must not be mistaken for LCG leakage
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     d_S = sum(p.numel() for p in theta_s_named.values())
     n = denoiser.cfg.inner_model.num_steps_conditioning

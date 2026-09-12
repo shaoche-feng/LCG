@@ -12,47 +12,17 @@ from models.diffusion.denoiser import (
     sample_sigma_training_distribution,
 )
 
-from .theta_s import selected_parameters
-
 Candidate = Tuple[Tensor, Tensor, Tensor]  # (x_obs_flat, x_act, y_star), each batch size 1
 
 
 # --------------------------------------------------------------------------------------
 # theta_S <-> named-dict plumbing (functional_call needs dotted names; ordering must match
-# selected_parameters()/h_D exactly). Moved verbatim from the validated forward-JVP
-# diagnostic (scripts/forward_JVP/3-stratum_CRN/diagnose_lcg_forward_jvp_common.py, Stage
-# F1-F6) -- no re-derivation of the JVP mathematics here.
+# lcg.theta_s.selected_named_parameters()/h_D exactly). The canonical selector and its
+# complement (frozen_named_parameters) both live in theta_s.py -- this module only
+# flatten/unflatten support around them.
 # --------------------------------------------------------------------------------------
 
 
-def selected_named_parameters(denoiser: Denoiser) -> Dict[str, torch.nn.Parameter]:
-    inner = denoiser.inner_model
-    last_idx = len(inner.unet.u_blocks) - 1
-    prefixed_modules = [
-        (f"unet.u_blocks.{last_idx}", inner.unet.u_blocks[-1]),
-        ("norm_out", inner.norm_out),
-        ("conv_out", inner.conv_out),
-    ]
-    named = {}
-    for prefix, module in prefixed_modules:
-        for name, p in module.named_parameters():
-            named[f"{prefix}.{name}"] = p
-
-    ref = selected_parameters(denoiser)
-    assert len(named) == len(ref) and all(a is b for a, b in zip(named.values(), ref)), (
-        "selected_named_parameters ordering/membership does not match lcg.theta_s.selected_parameters()"
-    )
-    return named
-
-
-def frozen_named_parameters(denoiser: Denoiser, theta_s_named: Dict[str, torch.nn.Parameter]) -> Dict[str, Tensor]:
-    inner = denoiser.inner_model
-    selected_ids = {id(p) for p in theta_s_named.values()}
-    return {name: p for name, p in inner.named_parameters() if id(p) not in selected_ids}
-
-
-def flatten_dict(named: Dict[str, Tensor]) -> Tensor:
-    return torch.cat([t.reshape(-1) for t in named.values()])
 
 
 def unflatten_to_dict(flat: Tensor, template: Dict[str, Tensor]) -> Dict[str, Tensor]:
@@ -241,13 +211,3 @@ def score_one_jvp_bank(
             total_scores[start : start + B] += contribution / num_entries
 
     return total_scores.detach().cpu()
-
-
-def assert_setup_valid(theta_s_named: Dict[str, Tensor], h_D: Tensor, d_S: int) -> None:
-    flat = flatten_dict(theta_s_named)
-    assert flat.numel() == d_S, f"theta_S flat dim {flat.numel()} != d_S {d_S}"
-    assert h_D.numel() == d_S, f"h_D dim {h_D.numel()} != d_S {d_S}"
-    assert torch.isfinite(h_D).all(), "h_D contains non-finite values"
-    assert (h_D > 0).all(), "h_D is not strictly positive"
-    assert not h_D.requires_grad, "h_D must not require grad"
-    print(f"assert_setup_valid: dim(theta_S)=dim(h_D)={d_S}, h_D finite and >0, h_D.requires_grad=False -- OK")

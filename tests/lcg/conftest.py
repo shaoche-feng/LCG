@@ -24,8 +24,20 @@ def _find_repo_root(start: Path) -> Path:
 _REPO_ROOT = _find_repo_root(Path(__file__).parent)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from lcg.theta_s import ThetaSConfig  # noqa: E402
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig  # noqa: E402
 from models.diffusion.inner_model import InnerModelConfig  # noqa: E402
+
+
+def default_theta_s_config(denoiser: Denoiser) -> ThetaSConfig:
+    """Reconstructs the CURRENT production selection (final decoder u_block + norm_out +
+    conv_out) as an explicit ThetaSConfig, adapting to whichever denoiser is passed (tiny
+    test model or real model) via len(u_blocks) -- a TEST convenience only. Production
+    itself has no implicit default; see config/intrinsic_reward/lcg.yaml for the real,
+    architecture-specific default patterns (which this must stay equivalent to for the
+    real model, per tests/lcg/test_theta_s.py's production-default-reproduction test)."""
+    last_idx = len(denoiser.inner_model.unet.u_blocks) - 1
+    return ThetaSConfig(include=(f"unet.u_blocks.{last_idx}.*", "norm_out.*", "conv_out.*"), exclude=())
 
 TINY_IMG_CHANNELS = 3
 TINY_IMG_SIZE = 8
@@ -58,6 +70,13 @@ def tiny_denoiser() -> Denoiser:
     denoiser = Denoiser(cfg)
     denoiser.eval()
     return denoiser
+
+
+@pytest.fixture
+def theta_s_cfg(tiny_denoiser) -> ThetaSConfig:
+    """The current-production-equivalent ThetaSConfig for tiny_denoiser (see
+    default_theta_s_config)."""
+    return default_theta_s_config(tiny_denoiser)
 
 
 @pytest.fixture

@@ -6,16 +6,23 @@ independent of how candidates happen to be chunked.
 """
 import torch
 from lcg.forward_jvp import (
-    frozen_named_parameters,
     make_jvp_bank,
     score_one_jvp_bank,
-    selected_named_parameters,
 )
+from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
 from models.diffusion import SigmaDistributionConfig
 
 TINY_IMG_CHANNELS = 3
 TINY_IMG_SIZE = 8
 TINY_SIGMA_CFG = SigmaDistributionConfig(loc=-0.4, scale=1.2, sigma_min=0.002, sigma_max=20.0)
+
+
+def _default_theta_s_config(denoiser) -> ThetaSConfig:
+    """Current-production-equivalent ThetaSConfig for whichever denoiser is passed --
+    duplicated per test file, matching this suite's existing convention (see conftest.py's
+    default_theta_s_config, the same helper)."""
+    last_idx = len(denoiser.inner_model.unet.u_blocks) - 1
+    return ThetaSConfig(include=(f"unet.u_blocks.{last_idx}.*", "norm_out.*", "conv_out.*"), exclude=())
 
 
 def _make_candidates(denoiser, n):
@@ -30,7 +37,7 @@ def _make_candidates(denoiser, n):
 
 
 def test_eps_offset_shared_not_per_candidate(tiny_denoiser):
-    theta_s_named = selected_named_parameters(tiny_denoiser)
+    theta_s_named = selected_named_parameters(tiny_denoiser, _default_theta_s_config(tiny_denoiser))
     d_S = sum(p.numel() for p in theta_s_named.values())
     bank = make_jvp_bank(
         TINY_SIGMA_CFG, torch.Size([1, TINY_IMG_CHANNELS, TINY_IMG_SIZE, TINY_IMG_SIZE]), d_S,
@@ -45,7 +52,7 @@ def test_duplicate_candidate_scores_identically_across_chunks(tiny_denoiser):
     """The defining Full-CRN property: a candidate's score must not depend on which
     computational chunk it lands in."""
     denoiser = tiny_denoiser
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     d_S = sum(p.numel() for p in theta_s_named.values())
     h_D = torch.rand(d_S) + 0.5
@@ -68,7 +75,7 @@ def test_chunk_size_does_not_change_scores(tiny_denoiser):
     """Chunk size is purely a batching/throughput choice -- it must not change which
     logical CRN samples are used or the resulting scores."""
     denoiser = tiny_denoiser
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     d_S = sum(p.numel() for p in theta_s_named.values())
     h_D = torch.rand(d_S) + 0.5

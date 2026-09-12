@@ -17,14 +17,31 @@
 _target_: lcg.LCGConfig
 
 enabled: False
-h_d_batch_size: 40
+
+theta_s:
+  _target_: lcg.theta_s.ThetaSConfig
+  # theta_S = the final decoder level's ResBlocks + output norm + output conv (d_S=654,851
+  # under the current agent.denoiser.inner_model.depths=[2,2,2,2] architecture -- "3" below
+  # is that architecture's last u_block index, confirmed by inspecting the real model, not
+  # assumed). Change theta_s here (YAML only, no Python) to ablate which coordinates LCG's
+  # curvature estimate covers -- see tests/lcg/test_theta_s.py for worked examples
+  # (conv_out-only, norm_out+conv_out, broad-include-with-exclude, ...).
+  include:
+    - "unet.u_blocks.3.*"
+    - "norm_out.*"
+    - "conv_out.*"
+  exclude: []
+
+precision_reference_size: 40
 precision_num_mc: 3
 damping: 1e-4
 beta: 1.0
+
 rms_enabled: True
 rms_alpha: 1.0
 rms_ema_decay: 0.99
 rms_eps: 1e-8
+
 candidate_num_mc: 12 #16, 24
 # 16 was benchmarked as the fastest AND lowest-memory candidate chunk size among C in
 # {4,8,16,32,64,96,128,240} at M=12 (22.9s/480 candidates, 958MB peak reserved on an

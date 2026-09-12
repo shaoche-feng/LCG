@@ -7,13 +7,22 @@ the original 480-candidate/B=32,H=15 workload to a handful of tiny synthetic can
 from dataclasses import dataclass
 
 import torch
-from lcg.forward_jvp import frozen_named_parameters, make_jvp_bank, selected_named_parameters
+from lcg.forward_jvp import make_jvp_bank
 from lcg.intrinsic_reward import imagined_candidates_from_batch, make_lcg_intrinsic_reward_fn
+from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
 from models.diffusion import SigmaDistributionConfig
 
 TINY_IMG_CHANNELS = 3
 TINY_IMG_SIZE = 8
 TINY_SIGMA_CFG = SigmaDistributionConfig(loc=-0.4, scale=1.2, sigma_min=0.002, sigma_max=20.0)
+
+
+def _default_theta_s_config(denoiser) -> ThetaSConfig:
+    """Current-production-equivalent ThetaSConfig for whichever denoiser is passed --
+    duplicated per test file, matching this suite's existing convention (see conftest.py's
+    default_theta_s_config, the same helper)."""
+    last_idx = len(denoiser.inner_model.unet.u_blocks) - 1
+    return ThetaSConfig(include=(f"unet.u_blocks.{last_idx}.*", "norm_out.*", "conv_out.*"), exclude=())
 
 
 @dataclass
@@ -56,7 +65,7 @@ def test_full_pipeline_no_candidate_lost_or_duplicated(tiny_denoiser):
         all_candidates.extend(step_candidates)
     assert len(all_candidates) == num_envs * num_steps
 
-    theta_s_named = selected_named_parameters(denoiser)
+    theta_s_named = selected_named_parameters(denoiser, _default_theta_s_config(denoiser))
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     d_S = sum(p.numel() for p in theta_s_named.values())
     h_D = torch.rand(d_S) + 0.5

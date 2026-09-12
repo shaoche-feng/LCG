@@ -51,11 +51,10 @@ def main():
     import torch
 
     from lcg.forward_jvp import (
-        frozen_named_parameters,
         make_jvp_bank,
         score_one_jvp_bank,
-        selected_named_parameters,
     )
+    from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
     from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
     from models.diffusion.inner_model import InnerModelConfig
 
@@ -84,7 +83,10 @@ def main():
     candidates = [(c[0].to(device), c[1].to(device), c[2].to(device)) for c in candidates_all[:NUM_SMOKE_CANDIDATES]]
     print(f"h_D shape={tuple(h_D.shape)}  using {len(candidates)}/{len(candidates_all)} candidates", flush=True)
 
-    theta_s_named = selected_named_parameters(denoiser)
+    # matches config/intrinsic_reward/lcg.yaml's production default for this
+    # depths=[2,2,2,2] architecture (last u_block index 3)
+    theta_s_cfg = ThetaSConfig(include=("unet.u_blocks.3.*", "norm_out.*", "conv_out.*"), exclude=())
+    theta_s_named = selected_named_parameters(denoiser, theta_s_cfg)
     frozen_named = frozen_named_parameters(denoiser, theta_s_named)
     h_D_inv_sqrt = h_D.rsqrt()
 
