@@ -84,7 +84,13 @@ class Trainer(StateDictMixin):
             path_config = Path("config") / "trainer.yaml"
             path_config.parent.mkdir(exist_ok=False, parents=False)
             shutil.move(".hydra/config.yaml", path_config)
-            wandb.save(str(path_config))
+            try:
+                wandb.save(str(path_config))
+            except OSError:
+                # wandb.save() symlinks the file into the run's local wandb dir; this
+                # raises WinError 1314 on Windows without admin/Developer Mode. The
+                # config is already saved locally above, so this is safe to skip.
+                pass
             shutil.copytree(src=root_dir / "src", dst="./src")
             shutil.copytree(src=root_dir / "scripts", dst="./scripts")
 
