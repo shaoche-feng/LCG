@@ -36,7 +36,10 @@ def make_atari_env(
         )
         return env
 
-    env = AsyncVectorEnv([env_fn for _ in range(num_envs)])
+    # context="spawn": the Trainer initializes a CUDA context in this process before
+    # envs are created, and forking (Linux's default) a process that already holds a
+    # CUDA context deadlocks the worker. spawn avoids inheriting that state.
+    env = AsyncVectorEnv([env_fn for _ in range(num_envs)], context="spawn")
 
     # The AsyncVectorEnv resets the env on termination, which means that it will
     # reset the environment if we use the default AtariPreprocessing of gymnasium with
@@ -71,7 +74,8 @@ def make_dm_control_env(
             time_limit=time_limit,
         )
 
-    env = AsyncVectorEnv([env_fn for _ in range(num_envs)])
+    # context="spawn": see comment in make_atari_env above — same CUDA-after-fork deadlock.
+    env = AsyncVectorEnv([env_fn for _ in range(num_envs)], context="spawn")
     env = TorchEnv(env, device)
 
     return env
