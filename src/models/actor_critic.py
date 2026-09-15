@@ -20,9 +20,16 @@ ActorCriticOutput = namedtuple("ActorCriticOutput", "logits_act val hx_cx")
 
 # Squashed-Gaussian continuous policy: clamp log_std for numerical stability (standard practice,
 # e.g. SAC), and keep tanh^-1 away from its +-1 singularities when inverting a replayed action.
+# mean is also clamped: it's an unconstrained linear-layer output (tanh-squashing only bounds the
+# *sampled action*, not mean itself), so nothing otherwise stops it drifting arbitrarily far from
+# the bounded range atanh(+-(1-ATANH_EPS)) can recover a replayed z into (~+-7.26). An unbounded
+# mean there blows up the (z-mean)^2/std^2 term in the Gaussian log-prob without bound, which
+# produced the actor-critic loss divergence observed in training (loss_actions -> 1e9+ within a
+# few dozen epochs, recurring after a full optimizer reset -- i.e. structural, not stale-state).
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
 ATANH_EPS = 1e-6
+MEAN_ABS_MAX = 10.0
 
 
 @dataclass
@@ -120,7 +127,7 @@ class ActorCritic(nn.Module):
 
     def _split_dist_params(self, dist_params: Tensor) -> Tuple[Tensor, Tensor]:
         mean, log_std = dist_params.chunk(2, dim=-1)
-        return mean, log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
+        return mean.clamp(-MEAN_ABS_MAX, MEAN_ABS_MAX), log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
 
     def _squash_and_rescale(self, z: Tensor) -> Tensor:
         scale = 0.5 * (self.action_high - self.action_low)
