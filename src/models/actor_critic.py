@@ -30,6 +30,18 @@ LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
 ATANH_EPS = 1e-6
 MEAN_ABS_MAX = 10.0
+# Direct, hard bound on the (summed-over-action-dims) log-prob used in the REINFORCE actor loss
+# (-log_prob * advantage). Confirmed by debug instrumentation: log_prob reaches +40 from the very
+# first training step after warm-starting from a converged checkpoint, because -log(std) in the
+# Gaussian log-density is unbounded as std shrinks (std floors at exp(LOG_STD_MIN)=0.0067, giving
+# -log(std)~=5.0 *per action dimension*, stacking across dims when several simultaneously have
+# near-floor std -- which a converged, confident policy routinely does). Multiplying that
+# large-*positive* log_prob by an advantage already in the +-10-20 range produces the actor-loss
+# divergence observed in training; clamping log_prob directly bounds this regardless of how small
+# std gets or how many dimensions collapse together, unlike the mean/log_std clamps above (which
+# bound the inputs but not this specific unbounded term in the output).
+LOG_PROB_CLAMP_MIN = -50.0
+LOG_PROB_CLAMP_MAX = 20.0
 
 
 @dataclass
@@ -172,7 +184,7 @@ class ActorCritic(nn.Module):
         # log(1 - tanh(z)^2), numerically stable form (same as torch.distributions.TanhTransform)
         tanh_log_abs_det = 2.0 * (math.log(2.0) - z - F.softplus(-2.0 * z))
         log_abs_det = tanh_log_abs_det + scale.log()
-        return (base_log_prob - log_abs_det).sum(dim=-1)
+        return (base_log_prob - log_abs_det).sum(dim=-1).clamp(LOG_PROB_CLAMP_MIN, LOG_PROB_CLAMP_MAX)
 
     def _continuous_entropy_estimate(self, dist_params: Tensor) -> Tensor:
         """Reparameterized single-sample Monte Carlo estimate of the entropy of the *transformed*
