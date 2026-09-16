@@ -30,4 +30,4 @@ actor_critic:
   img_size: ${env.train.size}
   channels: [32,32,64,64]
   down: [1,1,1,1]
-
+  detach_value_trunk: false  # experimental: see models/actor_critic.py docstring

@@ -56,6 +56,15 @@ class ActorCriticConfig:
     action_low: Optional[List[float]] = None  # required iff continuous_action_dim is set
     action_high: Optional[List[float]] = None  # required iff continuous_action_dim is set
     continuous_reward: bool = False  # False: Atari-style reward-sign lambda returns; True: raw reward
+    # Experimental (causal-isolation study for the epoch-20->30 return regression on
+    # walker/walk): when True, critic_linear reads hx.detach() instead of hx, so the value
+    # loss's gradient no longer reaches the shared encoder/LSTM trunk (policy and entropy
+    # losses are unaffected -- they still backprop through the full, non-detached hx). This
+    # changes ONLY the gradient graph: detach() never alters tensor values, so actions and
+    # values are numerically identical to the default (False) behavior at all times, including
+    # immediately after loading a checkpoint trained with the flag off. Default False preserves
+    # exactly the pre-existing behavior; see tests/models/test_detach_value_trunk.py.
+    detach_value_trunk: bool = False
 
     # NOTE: no `__post_init__` validation of num_actions/continuous_action_dim here, on purpose,
     # mirroring InnerModelConfig/RewEndModelConfig. `num_actions` is left unset (None) in
@@ -81,6 +90,7 @@ class ActorCritic(nn.Module):
 
         self.continuous_action = cfg.continuous_action_dim is not None
         self.continuous_reward = cfg.continuous_reward
+        self.detach_value_trunk = cfg.detach_value_trunk
 
         if self.continuous_action:
             assert cfg.action_low is not None and cfg.action_high is not None, (
@@ -126,7 +136,12 @@ class ActorCritic(nn.Module):
         x = self.encoder(obs)
         x = x.flatten(start_dim=1)
         hx, cx = self.lstm(x, hx_cx)
-        return ActorCriticOutput(self.actor_linear(hx), self.critic_linear(hx).squeeze(dim=1), (hx, cx))
+        # detach_value_trunk (default False, unchanged behavior): hx.detach() has the exact same
+        # values as hx, so `val` is numerically identical either way -- only whether loss_values'
+        # gradient reaches encoder/lstm changes. hx itself (returned below for the next recurrent
+        # step, and used un-detached by actor_linear) is never affected by this local detach.
+        value_input = hx.detach() if self.detach_value_trunk else hx
+        return ActorCriticOutput(self.actor_linear(hx), self.critic_linear(value_input).squeeze(dim=1), (hx, cx))
 
     def _split_dist_params(self, dist_params: Tensor) -> Tuple[Tensor, Tensor]:
         mean, log_std = dist_params.chunk(2, dim=-1)
