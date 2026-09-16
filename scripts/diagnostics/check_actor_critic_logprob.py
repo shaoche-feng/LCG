@@ -123,7 +123,7 @@ def main() -> None:
 
     ac._split_dist_params = patched_split
 
-    action_saturation_all = []
+    action_saturation_all = []  # each entry keeps the action_dim axis: shape (n, action_dim)
     _orig_sample_action = ac.sample_action
 
     def patched_sample_action(dist_params, deterministic=False):
@@ -131,7 +131,8 @@ def main() -> None:
         if action is not None:
             scale = 0.5 * (ac.action_high - ac.action_low)
             normalized = (action - ac.action_low) / scale - 1.0  # in [-1, 1]
-            action_saturation_all.append(normalized.detach().abs().cpu().numpy().flatten())
+            arr = normalized.detach().abs().cpu().numpy()
+            action_saturation_all.append(arr.reshape(-1, arr.shape[-1]))
         return action, z
 
     ac.sample_action = patched_sample_action
@@ -195,6 +196,7 @@ def main() -> None:
     grad_norms_entropy_unweighted, grad_norms_entropy_weighted = [], []
     head_norms_policy_mean, head_norms_policy_logstd = [], []
     head_norms_entropy_mean, head_norms_entropy_logstd = [], []
+    head_norms_entropy_weighted_mean, head_norms_entropy_weighted_logstd = [], []
     c = ac.loss_cfg
 
     def head_norms(W):
@@ -233,6 +235,10 @@ def main() -> None:
         loss_entropy = -c.weight_entropy_loss * entropy_per_sample.mean()
         loss_entropy.backward()
         grad_norms_entropy_weighted.append(global_grad_norm(ac.parameters()))
+        if ac.actor_linear.weight.grad is not None:
+            m, l = head_norms(ac.actor_linear.weight.grad)
+            head_norms_entropy_weighted_mean.append(m)
+            head_norms_entropy_weighted_logstd.append(l)
 
     policy_raw = np.concatenate(records["policy"]) if records["policy"] else np.array([])
     entropy_raw = np.concatenate(records["entropy"]) if records["entropy"] else np.array([])
@@ -282,6 +288,15 @@ def main() -> None:
     print(f"policy-loss  -> log_std head: mean={np.mean(head_norms_policy_logstd):.4f}  max={np.max(head_norms_policy_logstd):.4f}")
     print(f"entropy(unweighted) -> mean head:    mean={np.mean(head_norms_entropy_mean):.4f}  max={np.max(head_norms_entropy_mean):.4f}")
     print(f"entropy(unweighted) -> log_std head: mean={np.mean(head_norms_entropy_logstd):.4f}  max={np.max(head_norms_entropy_logstd):.4f}")
+    print(f"entropy(weighted by weight_entropy_loss={c.weight_entropy_loss}) -> mean head:    "
+          f"mean={np.mean(head_norms_entropy_weighted_mean):.6f}  max={np.max(head_norms_entropy_weighted_mean):.6f}")
+    print(f"entropy(weighted by weight_entropy_loss={c.weight_entropy_loss}) -> log_std head: "
+          f"mean={np.mean(head_norms_entropy_weighted_logstd):.6f}  max={np.max(head_norms_entropy_weighted_logstd):.6f}")
+    policy_logstd_mean = np.mean(head_norms_policy_logstd)
+    entropy_w_logstd_mean = np.mean(head_norms_entropy_weighted_logstd)
+    print(f"policy log_std-head vs weighted-entropy log_std-head ratio: "
+          f"{(entropy_w_logstd_mean / policy_logstd_mean) if policy_logstd_mean > 0 else float('nan'):.6f} "
+          f"(weighted-entropy / policy; <<1 means entropy has negligible influence on log_std relative to policy)")
 
     print(f"\ntotal torch.atanh() calls during the entire run: {atanh_call_count['n']} "
           f"(must be 0 for loss_actions to be confirmed atanh-free)")
@@ -290,7 +305,8 @@ def main() -> None:
     raw_logstd = np.concatenate(raw_logstd_all) if raw_logstd_all else np.array([])
     clamped_std = np.concatenate(clamped_std_all) if clamped_std_all else np.array([])
     raw_mean = np.concatenate(raw_mean_all) if raw_mean_all else np.array([])
-    action_sat = np.concatenate(action_saturation_all) if action_saturation_all else np.array([])
+    action_sat_2d = np.concatenate(action_saturation_all, axis=0) if action_saturation_all else np.zeros((0, 0))
+    action_sat = action_sat_2d.flatten()
     summarize("std (post-clamp)", clamped_std)
     summarize("raw log_std (pre-clamp)", raw_logstd)
     summarize("raw mean (pre-clamp)", raw_mean)
@@ -301,8 +317,13 @@ def main() -> None:
         print(f"action saturation |normalized action| (0=center, 1=at bound): "
               f"mean={action_sat.mean():.4f} median={np.median(action_sat):.4f} "
               f"p99={np.percentile(action_sat, 99):.4f} max={action_sat.max():.4f}")
-        print(f"fraction of actions with |normalized| > 0.99 (near-saturated): "
+        print(f"fraction of actions with |normalized| > 0.99 (near-saturated), overall: "
               f"{(action_sat > 0.99).mean():.4f}")
+        if action_sat_2d.shape[1] > 1:
+            print(f"fraction of actions with |normalized| > 0.99, per action dimension:")
+            for d in range(action_sat_2d.shape[1]):
+                col = action_sat_2d[:, d]
+                print(f"  dim {d}: {(col > 0.99).mean():.4f}  (n={len(col)}, median={np.median(col):.4f})")
 
     print(f"\n=== Finiteness confirmation ===")
     all_finite = (
