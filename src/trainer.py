@@ -45,8 +45,25 @@ class Trainer(StateDictMixin):
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        # Pick a random seed
-        set_seed(torch.seed() % 10 ** 9)
+        # Pick a random seed, unless an explicit reproducible seed was requested (used by the
+        # detach_value_trunk causal-isolation experiment; cfg.common.seed defaults to null, so
+        # this preserves the exact prior behavior -- a fresh OS-entropy seed every launch/resume
+        # -- for every existing config/run).
+        if cfg.common.seed is not None:
+            set_seed(cfg.common.seed)
+        else:
+            set_seed(torch.seed() % 10 ** 9)
+
+        # Opt-in deterministic-CUDA mode (default False, unchanged behavior otherwise). Not a
+        # full determinism guarantee: cuDNN's deterministic mode still has known caveats for
+        # some backward kernels (e.g. certain LSTM/conv backward paths), and
+        # torch.use_deterministic_algorithms(True) is deliberately NOT forced here since it can
+        # raise on ops the diffusion sampler / LSTM path use without a deterministic
+        # implementation. See the experiment report for what was verified reproducible in
+        # practice versus what remains a best-effort reduction in variance.
+        if getattr(cfg.common, "deterministic_cuda", False):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
         # Device
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu", self._rank)

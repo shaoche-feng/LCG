@@ -27,6 +27,7 @@ initialization:
 common:
   devices: 0  # int, list of int, cpu, or all 
   seed: null
+  deterministic_cuda: false  # experimental: opt-in cudnn.deterministic/benchmark, see trainer.py
   resume: False # do not modify, set by scripts/resume.sh only.
 
 checkpointing:
