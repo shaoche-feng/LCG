@@ -108,6 +108,34 @@ def main() -> None:
     ac._tanh_affine_log_prob = patched_tanh_affine
     ac._continuous_entropy_estimate = patched_entropy_estimate
 
+    # ---- additionally capture raw (pre-clamp) mean/log_std, clamped std, and sampled actions,
+    # so we can report std/log_std percentiles, raw_log_std<-5 fraction, and action saturation. ----
+    raw_mean_all, raw_logstd_all, clamped_std_all = [], [], []
+    _orig_split = ac._split_dist_params
+
+    def patched_split(dist_params):
+        raw_mean, raw_log_std = dist_params.chunk(2, dim=-1)
+        raw_mean_all.append(raw_mean.detach().cpu().numpy().flatten())
+        raw_logstd_all.append(raw_log_std.detach().cpu().numpy().flatten())
+        mean, log_std = _orig_split(dist_params)
+        clamped_std_all.append(log_std.exp().detach().cpu().numpy().flatten())
+        return mean, log_std
+
+    ac._split_dist_params = patched_split
+
+    action_saturation_all = []
+    _orig_sample_action = ac.sample_action
+
+    def patched_sample_action(dist_params, deterministic=False):
+        action, z = _orig_sample_action(dist_params, deterministic)
+        if action is not None:
+            scale = 0.5 * (ac.action_high - ac.action_low)
+            normalized = (action - ac.action_low) / scale - 1.0  # in [-1, 1]
+            action_saturation_all.append(normalized.detach().abs().cpu().numpy().flatten())
+        return action, z
+
+    ac.sample_action = patched_sample_action
+
     # ---- build the actual imagined WorldModelEnv actor-training path ----
     dataset = Dataset(args.dataset_path, "train_dataset", cache_in_ram=True)
     dataset.load_from_default_path()
@@ -165,7 +193,13 @@ def main() -> None:
     # forward pass -- so none of these three measurements share a rollout or computation graph.
     grad_norms_policy_loss = []
     grad_norms_entropy_unweighted, grad_norms_entropy_weighted = [], []
+    head_norms_policy_mean, head_norms_policy_logstd = [], []
+    head_norms_entropy_mean, head_norms_entropy_logstd = [], []
     c = ac.loss_cfg
+
+    def head_norms(W):
+        n_out = W.shape[0]
+        return W[: n_out // 2].norm().item(), W[n_out // 2 :].norm().item()
 
     for _ in range(min(10, args.n_forward_calls)):
         ac.zero_grad(set_to_none=True)
@@ -177,6 +211,10 @@ def main() -> None:
         loss_actions = (-log_prob * (lambda_returns - val).detach()).mean()
         loss_actions.backward()
         grad_norms_policy_loss.append(global_grad_norm(ac.parameters()))
+        if ac.actor_linear.weight.grad is not None:
+            m, l = head_norms(ac.actor_linear.weight.grad)
+            head_norms_policy_mean.append(m)
+            head_norms_policy_logstd.append(l)
 
         ac.zero_grad(set_to_none=True)
         _, act, rew, end, trunc, logits_act, val, val_bootstrap, z, infos = ac.env_loop.send(c.backup_every)
@@ -184,6 +222,10 @@ def main() -> None:
         entropy_unweighted = entropy_per_sample.mean()
         entropy_unweighted.backward()
         grad_norms_entropy_unweighted.append(global_grad_norm(ac.parameters()))
+        if ac.actor_linear.weight.grad is not None:
+            m, l = head_norms(ac.actor_linear.weight.grad)
+            head_norms_entropy_mean.append(m)
+            head_norms_entropy_logstd.append(l)
 
         ac.zero_grad(set_to_none=True)
         _, act, rew, end, trunc, logits_act, val, val_bootstrap, z, infos = ac.env_loop.send(c.backup_every)
@@ -235,8 +277,40 @@ def main() -> None:
     print(f"weighted/unweighted ratio: {ratio:.6f}  (expected ~= weight_entropy_loss = {c.weight_entropy_loss}, "
           f"since gradient scales linearly with a scalar loss multiplier)")
 
+    print(f"\n=== Policy vs entropy gradients, split by actor_linear head (mean vs log_std rows) ===")
+    print(f"policy-loss  -> mean head:    mean={np.mean(head_norms_policy_mean):.4f}  max={np.max(head_norms_policy_mean):.4f}")
+    print(f"policy-loss  -> log_std head: mean={np.mean(head_norms_policy_logstd):.4f}  max={np.max(head_norms_policy_logstd):.4f}")
+    print(f"entropy(unweighted) -> mean head:    mean={np.mean(head_norms_entropy_mean):.4f}  max={np.max(head_norms_entropy_mean):.4f}")
+    print(f"entropy(unweighted) -> log_std head: mean={np.mean(head_norms_entropy_logstd):.4f}  max={np.max(head_norms_entropy_logstd):.4f}")
+
     print(f"\ntotal torch.atanh() calls during the entire run: {atanh_call_count['n']} "
           f"(must be 0 for loss_actions to be confirmed atanh-free)")
+
+    print(f"\n=== std / log_std / action saturation ===")
+    raw_logstd = np.concatenate(raw_logstd_all) if raw_logstd_all else np.array([])
+    clamped_std = np.concatenate(clamped_std_all) if clamped_std_all else np.array([])
+    raw_mean = np.concatenate(raw_mean_all) if raw_mean_all else np.array([])
+    action_sat = np.concatenate(action_saturation_all) if action_saturation_all else np.array([])
+    summarize("std (post-clamp)", clamped_std)
+    summarize("raw log_std (pre-clamp)", raw_logstd)
+    summarize("raw mean (pre-clamp)", raw_mean)
+    if len(raw_logstd) > 0:
+        print(f"fraction of raw log_std < -5 (LOG_STD_MIN, the dead-zone threshold): "
+              f"{(raw_logstd < -5).mean():.4f}")
+    if len(action_sat) > 0:
+        print(f"action saturation |normalized action| (0=center, 1=at bound): "
+              f"mean={action_sat.mean():.4f} median={np.median(action_sat):.4f} "
+              f"p99={np.percentile(action_sat, 99):.4f} max={action_sat.max():.4f}")
+        print(f"fraction of actions with |normalized| > 0.99 (near-saturated): "
+              f"{(action_sat > 0.99).mean():.4f}")
+
+    print(f"\n=== Finiteness confirmation ===")
+    all_finite = (
+        np.isfinite(policy_raw).all() and np.isfinite(entropy_raw).all()
+        and np.isfinite(clamped_std).all() and np.isfinite(raw_mean).all()
+        and np.isfinite(action_sat).all() if len(action_sat) else True
+    )
+    print(f"ALL captured values finite: {bool(all_finite)}")
 
     _torch.atanh = _orig_atanh  # restore, in case this module is imported rather than run standalone
 
