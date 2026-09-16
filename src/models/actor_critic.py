@@ -19,29 +19,20 @@ from utils import init_lstm, LossAndLogs
 ActorCriticOutput = namedtuple("ActorCriticOutput", "logits_act val hx_cx")
 
 # Squashed-Gaussian continuous policy: clamp log_std for numerical stability (standard practice,
-# e.g. SAC), and keep tanh^-1 away from its +-1 singularities when inverting a replayed action.
-# mean is also clamped: it's an unconstrained linear-layer output (tanh-squashing only bounds the
-# *sampled action*, not mean itself), so nothing otherwise stops it drifting arbitrarily far from
-# the bounded range atanh(+-(1-ATANH_EPS)) can recover a replayed z into (~+-7.26). An unbounded
-# mean there blows up the (z-mean)^2/std^2 term in the Gaussian log-prob without bound, which
-# produced the actor-critic loss divergence observed in training (loss_actions -> 1e9+ within a
-# few dozen epochs, recurring after a full optimizer reset -- i.e. structural, not stale-state).
+# e.g. SAC). mean is also clamped: it's an unconstrained linear-layer output (tanh-squashing only
+# bounds the *sampled action*, not mean itself), so nothing otherwise stops it drifting.
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
-ATANH_EPS = 1e-6
 MEAN_ABS_MAX = 10.0
-# Direct, hard bound on the (summed-over-action-dims) log-prob used in the REINFORCE actor loss
-# (-log_prob * advantage). Confirmed by debug instrumentation: log_prob reaches +40 from the very
-# first training step after warm-starting from a converged checkpoint, because -log(std) in the
-# Gaussian log-density is unbounded as std shrinks (std floors at exp(LOG_STD_MIN)=0.0067, giving
-# -log(std)~=5.0 *per action dimension*, stacking across dims when several simultaneously have
-# near-floor std -- which a converged, confident policy routinely does). Multiplying that
-# large-*positive* log_prob by an advantage already in the +-10-20 range produces the actor-loss
-# divergence observed in training; clamping log_prob directly bounds this regardless of how small
-# std gets or how many dimensions collapse together, unlike the mean/log_std clamps above (which
-# bound the inputs but not this specific unbounded term in the output).
-LOG_PROB_CLAMP_MIN = -50.0
-LOG_PROB_CLAMP_MAX = 20.0
+# ATANH_EPS previously bounded the atanh() used to reconstruct z from a replayed action for the
+# log_prob computation. That reconstruction was the actual bug (see _tanh_affine_log_prob's
+# docstring): whenever tanh(the true z) saturated in float32, atanh silently pinned the
+# reconstructed z at atanh(1-ATANH_EPS)~=7.2477 regardless of z's true magnitude, producing a
+# systematic (mean - recovered_z) gap that a small std divided into +-tens of thousands. Fixed by
+# carrying the true sampled z through the rollout (sample_action -> env_loop -> forward) instead
+# of reconstructing it -- log_prob_and_entropy no longer calls atanh() at all. Kept only as a
+# documented historical constant / for the regression test that reproduces the old behavior.
+ATANH_EPS = 1e-6
 
 
 @dataclass
@@ -145,11 +136,15 @@ class ActorCritic(nn.Module):
         scale = 0.5 * (self.action_high - self.action_low)
         return self.action_low + (torch.tanh(z) + 1) * scale
 
-    def sample_action(self, dist_params: Tensor, deterministic: bool = False) -> Tensor:
+    def sample_action(self, dist_params: Tensor, deterministic: bool = False) -> Tuple[Tensor, Optional[Tensor]]:
         """Given raw actor output (`logits_act`/`dist_params` from `predict_act_value`), produce
-        an action. Not currently called by `env_loop` (which constructs `Categorical` itself for
-        the discrete path) -- provided so continuous-policy sampling logic lives entirely inside
-        `ActorCritic` for testing, ahead of the `env_loop` integration that will use it later.
+        an action. Called by `env_loop` for both the discrete and continuous paths.
+
+        Returns `(action, z)`. For continuous actions, `z` is the pre-tanh Gaussian sample that
+        produced `action` (detached) -- `env_loop` carries it through the rollout so the actor
+        loss can compute log_prob directly from the *true* sample instead of reconstructing an
+        approximation of it via `atanh(action)`, which is lossy once `tanh(z)` saturates near
+        +-1 (see `log_prob_and_entropy`). For discrete actions `z` is always `None`.
         """
         if self.continuous_action:
             mean, log_std = self._split_dist_params(dist_params)
@@ -157,34 +152,59 @@ class ActorCritic(nn.Module):
                 z = mean
             else:
                 # Reparameterized draw. DIAMOND's actor loss is a REINFORCE/score-function
-                # estimator (-log_prob(act) * advantage.detach()) that recomputes log_prob from
-                # the *replayed* action later (see log_prob_and_entropy), so it never needs a
-                # pathwise gradient through the sampled action itself -- only through the
+                # estimator (-log_prob(z) * advantage.detach()) that recomputes log_prob from
+                # the *replayed*, detached z later (see log_prob_and_entropy), so it never needs
+                # a pathwise gradient through the sampled z itself -- only through the
                 # distribution parameters at replay time. We still draw via rsample() (identical
-                # numerically to sample() for a Normal) as requested, but detach the action before
+                # numerically to sample() for a Normal) as requested, but detach z before
                 # returning it: if left attached, replaying it through log_prob_and_entropy would
-                # add a second, spurious gradient path back to these same parameters (via the
-                # action's own dependency on them), double-counting/corrupting the REINFORCE
-                # gradient. Detaching here matches Categorical.sample()'s implicit detachment.
+                # add a second, spurious gradient path back to these same parameters (via z's own
+                # dependency on them), double-counting/corrupting the REINFORCE gradient.
+                # Detaching here matches Categorical.sample()'s implicit detachment.
                 z = Normal(mean, log_std.exp()).rsample()
-            return self._squash_and_rescale(z).detach()
+            action = self._squash_and_rescale(z).detach()
+            return action, z.detach()
         else:
             if deterministic:
-                return dist_params.argmax(dim=-1)
-            return Categorical(logits=dist_params).sample()
+                return dist_params.argmax(dim=-1), None
+            return Categorical(logits=dist_params).sample(), None
 
     def _tanh_affine_log_prob(self, mean: Tensor, std: Tensor, z: Tensor) -> Tensor:
         """log p_Y(y) for y = low + (tanh(z)+1)*scale, z ~ Normal(mean, std), reduced over the
         action dimension. Shared by the replay-based log_prob (log_prob_and_entropy) and the
-        fresh-sample entropy estimate (_continuous_entropy_estimate) below -- the only difference
-        between the two call sites is whether `z` came from inverting a detached replayed action
-        or from a fresh, non-detached rsample()."""
+        fresh-sample entropy estimate (_continuous_entropy_estimate) below -- both call sites now
+        pass a genuine sample z (either the detached, *actually-sampled* z carried through the
+        rollout by sample_action/env_loop, or a fresh non-detached rsample() for the entropy
+        estimate); neither reconstructs z via atanh(action) any more. That reconstruction used to
+        be the only place z came from for the replay-based call, and was found to silently pin
+        the recovered z at atanh(1-ATANH_EPS)~=7.2477 whenever the true z exceeded that magnitude
+        (i.e. whenever tanh(z) saturated in float32) -- producing a systematic, non-random gap
+        between the (still-unclamped) mean and the recovered z that, divided by a small std,
+        drove log_prob to +-tens of thousands. Passing the real z removes that failure mode at
+        its source rather than bounding its symptom (see the removed LOG_PROB_CLAMP_MIN/MAX)."""
         scale = 0.5 * (self.action_high - self.action_low)
         base_log_prob = Normal(mean, std).log_prob(z)
         # log(1 - tanh(z)^2), numerically stable form (same as torch.distributions.TanhTransform)
         tanh_log_abs_det = 2.0 * (math.log(2.0) - z - F.softplus(-2.0 * z))
         log_abs_det = tanh_log_abs_det + scale.log()
-        return (base_log_prob - log_abs_det).sum(dim=-1).clamp(LOG_PROB_CLAMP_MIN, LOG_PROB_CLAMP_MAX)
+        log_prob = (base_log_prob - log_abs_det).sum(dim=-1)
+        if not torch.isfinite(log_prob).all():
+            n_bad = int((~torch.isfinite(log_prob)).sum().item())
+            raise FloatingPointError(
+                f"_tanh_affine_log_prob produced {n_bad}/{log_prob.numel()} non-finite log_prob "
+                f"value(s) (NaN or Inf) -- refusing to return a corrupted value that could reach "
+                f"loss.backward()/optimizer.step(). Diagnostics: "
+                f"log_prob[min={log_prob[torch.isfinite(log_prob)].min().item() if torch.isfinite(log_prob).any() else float('nan'):.3f}, "
+                f"max_finite={log_prob[torch.isfinite(log_prob)].max().item() if torch.isfinite(log_prob).any() else float('nan'):.3f}] "
+                f"mean[min={mean.detach().min().item():.3f}, max={mean.detach().max().item():.3f}, "
+                f"abs_max={mean.detach().abs().max().item():.3f}] "
+                f"std[min={std.detach().min().item():.6f}, max={std.detach().max().item():.6f}] "
+                f"z[min={z.detach().min().item():.3f}, max={z.detach().max().item():.3f}, "
+                f"abs_max={z.detach().abs().max().item():.3f}] "
+                f"base_log_prob[min={base_log_prob.detach().min().item():.3f}, max={base_log_prob.detach().max().item():.3f}] "
+                f"log_abs_det[min={log_abs_det.detach().min().item():.3f}, max={log_abs_det.detach().max().item():.3f}]"
+            )
+        return log_prob
 
     def _continuous_entropy_estimate(self, dist_params: Tensor) -> Tensor:
         """Reparameterized single-sample Monte Carlo estimate of the entropy of the *transformed*
@@ -212,29 +232,31 @@ class ActorCritic(nn.Module):
         z = Normal(mean, std).rsample()  # fresh draw, independent of any replayed action, not detached
         return -self._tanh_affine_log_prob(mean, std, z)
 
-    def log_prob_and_entropy(self, dist_params: Tensor, action: Tensor) -> Tuple[Tensor, Tensor]:
-        """Compute (log_prob, entropy) for a rollout's stored `action`, reducing over the action
+    def log_prob_and_entropy(
+        self, dist_params: Tensor, action: Tensor, z: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor]:
+        """Compute (log_prob, entropy) for a rollout's stored step, reducing over the action
         dimension so the result has one scalar per sample (matching `Categorical.log_prob`/
         `.entropy`'s shape).
 
         Continuous case: `dist_params` is a fresh (differentiable) forward pass' (mean, log_std).
-        `log_prob` is evaluated at the *replayed* `action` (produced by `sample_action`, which
-        detaches it) by inverting its squash + affine-rescale to recover the pre-squash value --
-        this is the quantity the REINFORCE actor loss needs (`-log_prob(act) * advantage.detach()`
-        in `forward()`), and using a detached action here is correct and intentional for that
-        purpose. `entropy` is a *separate* quantity computed by `_continuous_entropy_estimate`
-        from a fresh, non-detached reparameterized sample -- see that method's docstring for why
-        reusing `-log_prob(action)` here would be a zero-expectation, invalid gradient estimator
-        for entropy specifically (even though it is a valid, unbiased *value* estimate of the
-        entropy itself -- just not of its gradient).
+        `z` is the *true* pre-tanh sample that produced `action`, carried through the rollout by
+        `sample_action`/`env_loop` (see their docstrings) -- `log_prob` is evaluated directly at
+        this detached `z`, which is the quantity the REINFORCE actor loss needs
+        (`-log_prob(z) * advantage.detach()` in `forward()`). `action` itself is unused in the
+        continuous branch (kept as a parameter for interface parity with the discrete branch,
+        which still needs it for `Categorical.log_prob`). `entropy` is a *separate* quantity
+        computed by `_continuous_entropy_estimate` from a fresh, non-detached reparameterized
+        sample -- see that method's docstring for why reusing `-log_prob(z)` here would be a
+        zero-expectation, invalid gradient estimator for entropy specifically (even though it is
+        a valid, unbiased *value* estimate of the entropy itself -- just not of its gradient).
         """
         if self.continuous_action:
+            assert z is not None, "continuous_action requires the sampled z carried by env_loop"
             mean, log_std = self._split_dist_params(dist_params)
             std = log_std.exp()
-            scale = 0.5 * (self.action_high - self.action_low)
-            tanh_z = (action - self.action_low) / scale - 1.0
-            z = torch.atanh(tanh_z.clamp(-1 + ATANH_EPS, 1 - ATANH_EPS))
-            log_prob = self._tanh_affine_log_prob(mean, std, z)
+            policy_z = z.detach()
+            log_prob = self._tanh_affine_log_prob(mean, std, policy_z)
             entropy = self._continuous_entropy_estimate(dist_params)
             return log_prob, entropy
         else:
@@ -243,12 +265,12 @@ class ActorCritic(nn.Module):
 
     def forward(self) -> LossAndLogs:
         c = self.loss_cfg
-        _, act, rew, end, trunc, logits_act, val, val_bootstrap, infos = self.env_loop.send(c.backup_every)
+        _, act, rew, end, trunc, logits_act, val, val_bootstrap, z, infos = self.env_loop.send(c.backup_every)
 
         if self.intrinsic_reward_fn is not None:
             rew = self.intrinsic_reward_fn(infos, rew)
 
-        log_prob, entropy_per_sample = self.log_prob_and_entropy(logits_act, act)
+        log_prob, entropy_per_sample = self.log_prob_and_entropy(logits_act, act, z)
         entropy = entropy_per_sample.mean()
 
         lambda_returns = compute_lambda_returns(

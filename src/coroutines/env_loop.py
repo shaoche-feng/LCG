@@ -28,7 +28,7 @@ def make_env_loop(
 
         while n < num_steps:
             logits_act, val, (hx, cx) = model.predict_act_value(obs, (hx, cx))
-            act = model.sample_action(logits_act)
+            act, z = model.sample_action(logits_act)
 
             if random.random() < epsilon:
                 if env.is_discrete:
@@ -60,7 +60,7 @@ def make_env_loop(
                     for i in range(burnin_obs.size(1)):
                         _, _, (hx[dead], cx[dead]) = model.predict_act_value(burnin_obs[:, i], (hx[dead], cx[dead]))
 
-            all_.append([obs, act, rew, end, trunc, logits_act, val, None])
+            all_.append([obs, act, rew, end, trunc, logits_act, val, z, None])
             infos.append(info)
 
             obs = next_obs
@@ -74,6 +74,11 @@ def make_env_loop(
 
         all_[-1][-1] = val_bootstrap
 
-        all_obs, act, rew, end, trunc, logits_act, val, val_bootstrap = (torch.stack(x, dim=1) for x in zip(*all_))
+        def _maybe_stack(x):
+            # `z` (the continuous policy's pre-tanh sample) is None for every step when the
+            # action space is discrete -- sample_action() only returns it for continuous_action.
+            return None if x[0] is None else torch.stack(x, dim=1)
 
-        num_steps = yield all_obs, act, rew, end, trunc, logits_act, val, val_bootstrap, infos
+        all_obs, act, rew, end, trunc, logits_act, val, z, val_bootstrap = (_maybe_stack(x) for x in zip(*all_))
+
+        num_steps = yield all_obs, act, rew, end, trunc, logits_act, val, val_bootstrap, z, infos
