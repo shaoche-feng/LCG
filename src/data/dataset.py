@@ -1,4 +1,5 @@
 from collections import Counter
+import hashlib
 import multiprocessing as mp
 from pathlib import Path
 import shutil
@@ -137,6 +138,37 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
     def save_to_default_path(self) -> None:
         self._default_path.parent.mkdir(exist_ok=True, parents=True)
         torch.save(self.state_dict(), self._default_path)
+
+    def compute_manifest(self) -> Dict[str, Any]:
+        """Episode-level integrity manifest: per-episode sha256 of the saved file, cross-
+        checked against this dataset's own sampler-visible bookkeeping length. Exists to
+        catch a real bug found during the detach_value_trunk experiment: an in-progress
+        episode's on-disk file can grow (add_episode() with an explicit episode_id saves the
+        file unconditionally) without info.pt's `lengths` entry for that episode ever being
+        re-persisted before a process stop, silently leaving BatchSampler unable to draw the
+        tail of that episode even though the bytes are sitting right there on disk. Purely
+        diagnostic/provenance -- computing this never mutates the dataset."""
+        manifest: Dict[str, Any] = {
+            "num_episodes": int(self.num_episodes),
+            "num_steps": int(self.num_steps),
+            "episodes": {},
+            "length_mismatches": [],
+        }
+        for episode_id in range(self.num_episodes):
+            path = self._get_episode_path(episode_id)
+            if not path.is_file():
+                continue
+            sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            bookkeeping_length = int(self.lengths[episode_id])
+            actual_length = len(Episode.load(path))
+            manifest["episodes"][episode_id] = {
+                "sha256": sha256,
+                "bookkeeping_length": bookkeeping_length,
+                "actual_length": actual_length,
+            }
+            if actual_length != bookkeeping_length:
+                manifest["length_mismatches"].append(episode_id)
+        return manifest
 
     def load_from_default_path(self) -> None:
         if self._default_path.is_file():

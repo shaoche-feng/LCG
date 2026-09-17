@@ -33,6 +33,13 @@ class RunningRMS:
         self.cfg = cfg
         self.s2: Optional[Tensor] = None
 
+    def state_dict(self) -> Dict[str, Optional[Tensor]]:
+        return {"s2": self.s2.clone() if self.s2 is not None else None}
+
+    def load_state_dict(self, state_dict: Dict[str, Optional[Tensor]]) -> None:
+        s2 = state_dict["s2"]
+        self.s2 = s2.clone() if s2 is not None else None
+
     @torch.no_grad()
     def __call__(self, r: Tensor) -> Tensor:
         if not self.cfg.enabled:

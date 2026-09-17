@@ -6,6 +6,7 @@ from functools import partial
 import json
 from pathlib import Path
 import random
+import subprocess
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from omegaconf import OmegaConf
@@ -294,6 +295,49 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     random.seed(seed)
+
+
+class RNGState:
+    """Captures/restores Python `random`, NumPy, and PyTorch (CPU + every visible CUDA
+    device) RNG state as a single unit. Deliberately given `state_dict`/`load_state_dict`
+    so a plain `self.rng_state = RNGState()` attribute on any StateDictMixin owner (e.g.
+    Trainer) is auto-discovered and checkpointed for free, the same way `self.opt` and
+    `self.lr_sched` already are -- no changes needed anywhere else in the save/load path.
+
+    `load_state_dict` mutates GLOBAL interpreter/PyTorch RNG state as a side effect (there
+    is no other way to "restore" these RNGs) -- matches the existing precedent set by
+    `set_seed` above, just capturing/restoring the *current* state instead of reseeding.
+    """
+
+    def state_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "python_random": random.getstate(),
+            "numpy_random": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            d["torch_cuda"] = torch.cuda.get_rng_state_all()
+        return d
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        random.setstate(state_dict["python_random"])
+        np.random.set_state(state_dict["numpy_random"])
+        torch.set_rng_state(state_dict["torch_cpu"])
+        if "torch_cuda" in state_dict and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state_dict["torch_cuda"])
+
+
+def get_git_commit_hash(repo_dir: Optional[Path] = None) -> Optional[str]:
+    """Best-effort: returns None (never raises) if git isn't available or repo_dir isn't
+    inside a git repo -- this is provenance metadata, not something a training run should
+    ever fail over."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True, timeout=5
+        )
+        return out.stdout.strip() if out.returncode == 0 else None
+    except Exception:
+        return None
 
 
 def skip_if_run_is_over(func: Callable) -> Callable:

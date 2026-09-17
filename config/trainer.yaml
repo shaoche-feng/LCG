@@ -27,11 +27,13 @@ initialization:
 common:
   devices: 0  # int, list of int, cpu, or all 
   seed: null
+  deterministic_cuda: false  # experimental: opt-in cudnn.deterministic/benchmark, see trainer.py
   resume: False # do not modify, set by scripts/resume.sh only.
 
 checkpointing:
   save_agent_every: 5
   num_to_keep: 11  # number of checkpoints to keep, use null to disable
+  save_dataset_manifest: false  # experimental: per-episode sha256 + length-integrity manifest each save, see trainer.py
 
 collection:
   train:

@@ -24,10 +24,12 @@ from utils import (
     CommonTools,
     configure_opt,
     count_parameters,
+    get_git_commit_hash,
     get_lr_sched,
     keep_agent_copies_every,
     Logs,
     process_confusion_matrices_if_any_and_compute_classification_metrics,
+    RNGState,
     save_info_for_import_script,
     save_with_backup,
     set_seed,
@@ -45,8 +47,33 @@ class Trainer(StateDictMixin):
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        # Pick a random seed
-        set_seed(torch.seed() % 10 ** 9)
+        # Pick a random seed, unless an explicit reproducible seed was requested (needed for
+        # the resume-fidelity integration test and the A-E state-effect experiment; defaults
+        # to null, so this preserves the exact prior behavior -- a fresh OS-entropy seed
+        # every launch/resume -- for every existing config/run).
+        if cfg.common.seed is not None:
+            set_seed(cfg.common.seed)
+        else:
+            set_seed(torch.seed() % 10 ** 9)
+
+        # `self.rng_state`'s presence (no leading underscore) means StateDictMixin picks it
+        # up automatically in state_dict()/load_state_dict(), exactly like self.opt and
+        # self.lr_sched already are -- no other code path needs to change for RNG to be
+        # captured/restored at every checkpoint save/load. See load_state_checkpoint() for
+        # the backward-compatibility handling of pre-existing state.pt files that predate
+        # this and have no "rng_state" key.
+        self.rng_state = RNGState()
+
+        # Opt-in deterministic-CUDA mode (default False, unchanged behavior otherwise). Not a
+        # full determinism guarantee: cuDNN's deterministic mode still has known caveats for
+        # some backward kernels (e.g. certain LSTM/conv backward paths), and
+        # torch.use_deterministic_algorithms(True) is deliberately NOT forced here since it
+        # can raise on ops the diffusion sampler / LSTM path use without a deterministic
+        # implementation. The resume-fidelity integration test documents what this does and
+        # does not guarantee in practice.
+        if getattr(cfg.common, "deterministic_cuda", False):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
         # Device
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu", self._rank)
@@ -498,7 +525,21 @@ class Trainer(StateDictMixin):
         # Trusted, locally generated DIAMOND state (includes Dataset state: numpy arrays, Counters,
         # etc.), not just tensor weights -- weights_only=False is required for PyTorch >=2.6, whose
         # default changed to weights_only=True.
-        self.load_state_dict(torch.load(self._path_state_ckpt, map_location=self._device, weights_only=False))
+        state_dict = torch.load(self._path_state_ckpt, map_location=self._device, weights_only=False)
+        if "rng_state" not in state_dict:
+            # Backward compatibility: a state.pt saved before RNG checkpointing existed has no
+            # "rng_state" key. StateDictMixin.load_state_dict() asserts the key set matches
+            # exactly, so inject a placeholder (this process's own current, freshly-seeded RNG
+            # state) rather than restoring anything -- resume proceeds exactly as it always did
+            # for old checkpoints, just without RNG-trajectory fidelity, and says so clearly.
+            print(
+                f"WARNING: {self._path_state_ckpt} predates RNG checkpointing (no 'rng_state' "
+                f"key). Resuming with a fresh RNG state, not a restored one -- the resumed run's "
+                f"random draws (dataset sampling order, diffusion noise, etc.) will NOT match "
+                f"what the original process would have drawn next."
+            )
+            state_dict["rng_state"] = self.rng_state.state_dict()
+        self.load_state_dict(state_dict)
 
     def save_checkpoint(self) -> None:
         if self._rank == 0:
@@ -507,3 +548,29 @@ class Trainer(StateDictMixin):
             self.test_dataset.save_to_default_path()
             self._keep_agent_copies(self.agent.state_dict(), self.epoch)
             self._save_info_for_import_script(self.epoch)
+            self._save_provenance_and_manifests()
+
+    def _save_provenance_and_manifests(self) -> None:
+        # Side files, not part of the resumable state_dict: informational/diagnostic, meant
+        # for auditing a checkpoint after the fact (what code, what config, is the dataset on
+        # disk internally consistent) rather than for driving resume behavior. Provenance is
+        # cheap (a few KB) and always written; the dataset manifest re-hashes every episode
+        # file on disk, which is fine for this project's small dataset but would be a real
+        # per-epoch cost for a much larger one (e.g. LCG-vs-Random) -- gated behind an
+        # explicit opt-in flag, default off, so no existing or future run pays for it unless
+        # asked.
+        provenance = {
+            "epoch": self.epoch,
+            "git_commit": get_git_commit_hash(),
+            "config_yaml": OmegaConf.to_yaml(self._cfg),
+        }
+        torch.save(provenance, self._path_ckpt_dir / "provenance.pt")
+        if getattr(self._cfg.checkpointing, "save_dataset_manifest", False):
+            torch.save(
+                {
+                    "epoch": self.epoch,
+                    "train_dataset": self.train_dataset.compute_manifest(),
+                    "test_dataset": self.test_dataset.compute_manifest(),
+                },
+                self._path_ckpt_dir / "dataset_manifest.pt",
+            )
