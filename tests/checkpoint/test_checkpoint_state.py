@@ -65,6 +65,37 @@ def test_rng_state_round_trip_torch_cpu():
     assert torch.equal(got, ref)
 
 
+def test_rng_state_round_trip_survives_map_location_relocation(tmp_path):
+    """Regression test for a real bug found during the resume-fidelity integration test:
+    Trainer.load_state_checkpoint() calls torch.load(..., map_location=self._device), which
+    relocates EVERY tensor found during unpickling onto that device -- RNG state included, even
+    though torch.set_rng_state()/cuda.set_rng_state_all() both require CPU-resident
+    ByteTensors. Without RNGState.load_state_dict() defensively moving back to CPU, resuming
+    on any CUDA device raised TypeError: RNG state must be a torch.ByteTensor."""
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("requires CUDA to exercise the map_location relocation this bug depends on")
+
+    torch.manual_seed(7)
+    torch.rand(3)
+    snapshot = RNGState().state_dict()
+    ref = torch.rand(10)
+
+    path = tmp_path / "rng.pt"
+    torch.save(snapshot, path)
+
+    torch.manual_seed(0)
+    torch.rand(100)
+
+    # The exact call Trainer.load_state_checkpoint() makes: map_location relocates tensors.
+    loaded = torch.load(path, map_location=torch.device("cuda:0"), weights_only=False)
+    assert loaded["torch_cpu"].is_cuda, "test setup sanity check: map_location should have relocated this"
+
+    RNGState().load_state_dict(loaded)  # must not raise
+    got = torch.rand(10)
+    assert torch.equal(got, ref)
+
+
 def test_rng_state_save_load_via_torch_save(tmp_path):
     """The actual persistence path: torch.save/load (not just in-memory), matching how
     Trainer actually checkpoints this."""

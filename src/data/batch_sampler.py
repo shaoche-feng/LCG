@@ -1,10 +1,17 @@
-from typing import Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Union
 
 import numpy as np
 import torch
 
 from .dataset import Dataset
 from .segment import SegmentId
+
+# Fixed, explicit component identifiers for deriving independent per-component RNG streams
+# (see utils.derive_component_seed). NEVER use Python's randomized hash() for this -- it's
+# salted per-process by default (PYTHONHASHSEED), so the SAME component name would derive a
+# DIFFERENT seed on every run, defeating the entire point of a reproducible, component-local
+# stream.
+COMPONENT_SEED_ID = {"denoiser": 0, "rew_end_model": 1, "actor_critic": 2}
 
 
 class BatchSampler(torch.utils.data.Sampler):
@@ -17,6 +24,7 @@ class BatchSampler(torch.utils.data.Sampler):
         seq_length: int,
         sample_weights: Optional[List[float]] = None,
         can_sample_beyond_end: bool = False,
+        rng: Optional[Union[np.random.Generator, np.random.SeedSequence, int]] = None,
     ) -> None:
         super().__init__(dataset)
         assert isinstance(dataset, Dataset)
@@ -27,6 +35,15 @@ class BatchSampler(torch.utils.data.Sampler):
         self.batch_size = batch_size
         self.seq_length = seq_length
         self.can_sample_beyond_end = can_sample_beyond_end
+        # rng=None (the historical default) falls back to np.random.default_rng(None), which
+        # seeds from OS entropy -- i.e. still an independent stream per BatchSampler instance,
+        # just no longer the single process-global np.random state every caller used to share.
+        # This is a real behavior change (see derive_component_seed's docstring for why it's
+        # required), but for the *unseeded* case it is strictly a decorrelation improvement:
+        # no existing call site relied on drawing from a SHARED stream with any other sampler.
+        self._rng: np.random.Generator = (
+            rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+        )
 
     def __len__(self):
         raise NotImplementedError
@@ -34,6 +51,12 @@ class BatchSampler(torch.utils.data.Sampler):
     def __iter__(self) -> Generator[List[SegmentId], None, None]:
         while True:
             yield self.sample()
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"bit_generator_state": self._rng.bit_generator.state}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self._rng.bit_generator.state = state_dict["bit_generator_state"]
 
     def sample(self) -> List[SegmentId]:
         num_episodes = self.dataset.num_episodes
@@ -52,18 +75,18 @@ class BatchSampler(torch.utils.data.Sampler):
 
         episodes_partition = np.arange(self.rank, num_episodes, self.world_size)
         weights = np.array(weights[self.rank::self.world_size])
-        episode_ids = np.random.choice(episodes_partition, size=self.batch_size, replace=True, p=weights / weights.sum())
-        timesteps = np.random.randint(low=0, high=self.dataset.lengths[episode_ids])
+        episode_ids = self._rng.choice(episodes_partition, size=self.batch_size, replace=True, p=weights / weights.sum())
+        timesteps = self._rng.integers(low=0, high=self.dataset.lengths[episode_ids])
 
         # padding allowed, both before start and after end
         if self.can_sample_beyond_end:
-            starts = timesteps - np.random.randint(0, self.seq_length, len(timesteps))
+            starts = timesteps - self._rng.integers(0, self.seq_length, len(timesteps))
             stops = starts + self.seq_length
 
         # padding allowed only before start
         else:
             stops = np.minimum(
-                self.dataset.lengths[episode_ids], timesteps + 1 + np.random.randint(0, self.seq_length, len(timesteps))
+                self.dataset.lengths[episode_ids], timesteps + 1 + self._rng.integers(0, self.seq_length, len(timesteps))
             )
             starts = stops - self.seq_length
 

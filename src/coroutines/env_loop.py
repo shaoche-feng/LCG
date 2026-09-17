@@ -1,5 +1,5 @@
 import random
-from typing import Generator, Tuple, Union
+from typing import Generator, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -8,20 +8,68 @@ from . import coroutine
 from envs import TorchEnv, WorldModelEnv
 
 
+class RolloutHxCxState:
+    """Mutable holder for ONE env_loop coroutine's model-LSTM rollout state (hx, cx), so it
+    can be read for checkpointing and written for resume from OUTSIDE the coroutine --
+    generators otherwise keep their locals opaque. One instance per env_loop; never share
+    across multiple env_loop coroutines using the same model (e.g. a real-env collector and
+    the imagined-rollout trainer each have their own env_loop over the SAME ActorCritic, and
+    would corrupt each other's rollout state if they shared one holder).
+    """
+
+    def __init__(self) -> None:
+        self.hx: Optional[torch.Tensor] = None
+        self.cx: Optional[torch.Tensor] = None
+        # False until env_loop's first real iteration in THIS process sets hx/cx -- guards
+        # against "resuming" from a holder that was loaded from a checkpoint but never
+        # actually populated (e.g. actor_critic training hadn't started yet when saved).
+        self.initialized: bool = False
+
+    def state_dict(self) -> dict:
+        return {"hx": self.hx, "cx": self.cx, "initialized": self.initialized}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.hx = state_dict["hx"]
+        self.cx = state_dict["cx"]
+        self.initialized = state_dict["initialized"]
+
+
 @coroutine
 def make_env_loop(
-    env: Union[TorchEnv, WorldModelEnv], model: nn.Module, epsilon: float = 0.0
+    env: Union[TorchEnv, WorldModelEnv],
+    model: nn.Module,
+    epsilon: float = 0.0,
+    hx_cx_state: Optional[RolloutHxCxState] = None,
 ) -> Generator[Tuple[torch.Tensor, ...], int, None]:
+    """hx_cx_state=None (every existing call site: real-env train/test collectors) preserves
+    the exact prior behavior -- hx/cx always start at zero, env.reset() always runs. Only
+    ActorCritic.setup_training's imagined-rollout env_loop passes a real hx_cx_state, opting
+    into resumable rollout continuity: if that state was already `initialized` (i.e. loaded
+    from a checkpoint saved mid-rollout) AND `env` is a WorldModelEnv with its buffers already
+    restored (see WorldModelEnv.load_rollout_state_dict, which Trainer calls before this
+    coroutine's first real .send() on resume), hx/cx and the current observation are taken
+    from that saved state instead of a fresh zero-init + env.reset() -- reset() would discard
+    the just-restored WorldModelEnv buffers.
+    """
     num_steps = yield
 
-    hx = torch.zeros(env.num_envs, model.lstm_dim, device=model.device)
-    cx = torch.zeros(env.num_envs, model.lstm_dim, device=model.device)
+    resuming = hx_cx_state is not None and hx_cx_state.initialized
+    if resuming:
+        hx, cx = hx_cx_state.hx, hx_cx_state.cx
+    else:
+        hx = torch.zeros(env.num_envs, model.lstm_dim, device=model.device)
+        cx = torch.zeros(env.num_envs, model.lstm_dim, device=model.device)
 
-    seed = random.randint(0, 2**31 - 1)
-    obs, _ = env.reset(seed=[seed + i for i in range(env.num_envs)])
+    if resuming and hasattr(env, "obs_buffer"):
+        obs = env.obs_buffer[:, -1]
+    else:
+        seed = random.randint(0, 2**31 - 1)
+        obs, _ = env.reset(seed=[seed + i for i in range(env.num_envs)])
 
     while True:
         hx, cx = hx.detach(), cx.detach()
+        if hx_cx_state is not None:
+            hx_cx_state.hx, hx_cx_state.cx, hx_cx_state.initialized = hx, cx, True
         all_ = []
         infos = []
         n = 0

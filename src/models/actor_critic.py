@@ -11,7 +11,7 @@ from torch.distributions.normal import Normal
 import torch.nn.functional as F
 
 from .blocks import Conv3x3, SmallResBlock
-from coroutines.env_loop import make_env_loop
+from coroutines.env_loop import make_env_loop, RolloutHxCxState
 from envs import TorchEnv, WorldModelEnv
 from utils import init_lstm, LossAndLogs
 
@@ -100,6 +100,11 @@ class ActorCritic(nn.Module):
         init_lstm(self.lstm)
 
         self.env_loop = None
+        # Owned exclusively by THIS ActorCritic's own imagined-rollout env_loop (see
+        # setup_training) -- real-env train/test collectors build a SEPARATE env_loop over
+        # this same model with hx_cx_state=None (unchanged behavior), never this one, so
+        # there's no risk of the two rollout streams corrupting each other's hx/cx.
+        self.rollout_hx_cx_state = RolloutHxCxState()
         self.loss_cfg = None
         self.intrinsic_reward_fn = None
 
@@ -109,7 +114,7 @@ class ActorCritic(nn.Module):
 
     def setup_training(self, rl_env: Union[TorchEnv, WorldModelEnv], loss_cfg: ActorCriticLossConfig) -> None:
         assert self.env_loop is None and self.loss_cfg is None
-        self.env_loop = make_env_loop(rl_env, self)
+        self.env_loop = make_env_loop(rl_env, self, hx_cx_state=self.rollout_hx_cx_state)
         self.loss_cfg = loss_cfg
 
     def set_intrinsic_reward_fn(self, fn) -> None:

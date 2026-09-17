@@ -2,7 +2,7 @@ from functools import partial
 from pathlib import Path
 import shutil
 import time
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from hydra.utils import instantiate
 import numpy as np
@@ -15,7 +15,9 @@ import wandb
 
 from agent import Agent, get_action_space_kwargs
 from coroutines.collector import make_collector, NumToCollect
+from coroutines.env_loop import RolloutHxCxState
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
+from data.batch_sampler import COMPONENT_SEED_ID
 from envs import make_atari_env, make_dm_control_env, WorldModelEnv
 from lcg import LCGConfig, LCGLifecycle
 from utils import (
@@ -24,6 +26,7 @@ from utils import (
     CommonTools,
     configure_opt,
     count_parameters,
+    derive_component_seed,
     get_git_commit_hash,
     get_lr_sched,
     keep_agent_copies_every,
@@ -39,6 +42,66 @@ from utils import (
 )
 
 
+class ResumeFidelityState:
+    """Groups every piece of state needed for the actor-critic's imagined-rollout machinery
+    to resume EXACTLY (not just approximately) -- distinct from self.opt/self.lr_sched/
+    self.rng_state, which Trainer already checkpoints independently:
+
+      - Each component's OWN BatchSampler RNG stream (data.batch_sampler.BatchSampler +
+        utils.derive_component_seed): denoiser/rew_end_model/actor_critic each draw from an
+        independent numpy.random.Generator instead of sharing global np.random state, so one
+        component's sampling can never desync another's.
+      - WorldModelEnv's preload-block replay state (see WorldModelEnv.make_generator_init):
+        which exact 256 SegmentIds are in the current in-flight preload block and how far
+        into it we've yielded, so resuming replays that block instead of drawing a fresh one.
+      - WorldModelEnv's live rollout buffers (obs_buffer/act_buffer/hx_rew_end/cx_rew_end/
+        ep_len) -- absent (None) until the first real use.
+      - The actor-critic's own rollout LSTM hx/cx (coroutines.env_loop.RolloutHxCxState).
+
+    Auto-discovered and checkpointed by Trainer's StateDictMixin machinery exactly like
+    self.opt/self.lr_sched/self.rng_state already are, via a single
+    `self.resume_fidelity_state = ResumeFidelityState(...)` attribute (see Trainer.__init__).
+    Every piece is optional/gracefully-absent (model_free runs have no WorldModelEnv; a
+    checkpoint saved before actor_critic ever trained has no rollout buffers yet), so a
+    checkpoint taken at ANY point round-trips without special-casing by the caller.
+    """
+
+    def __init__(
+        self,
+        batch_samplers: Dict[str, BatchSampler],
+        world_model_env: Optional[WorldModelEnv],
+        rollout_hx_cx_state: Optional[RolloutHxCxState],
+    ) -> None:
+        self.batch_samplers = batch_samplers
+        self.world_model_env = world_model_env
+        self.rollout_hx_cx_state = rollout_hx_cx_state
+
+    def state_dict(self) -> Dict[str, Any]:
+        sd: Dict[str, Any] = {"batch_samplers": {name: bs.state_dict() for name, bs in self.batch_samplers.items()}}
+        if self.world_model_env is not None:
+            sd["world_model_env_preload"] = self.world_model_env.preload_state_dict()
+            sd["world_model_env_rollout"] = self.world_model_env.rollout_state_dict()
+        if self.rollout_hx_cx_state is not None:
+            sd["rollout_hx_cx"] = self.rollout_hx_cx_state.state_dict()
+        return sd
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        for name, sub_sd in state_dict.get("batch_samplers", {}).items():
+            if name in self.batch_samplers:
+                self.batch_samplers[name].load_state_dict(sub_sd)
+        if self.world_model_env is not None and "world_model_env_preload" in state_dict:
+            # Must happen before the imagined-rollout env_loop's first real .send() in this
+            # process -- see WorldModelEnv.make_generator_init's docstring. Trainer calls
+            # load_state_dict() (hence this) during __init__, well before trainer.run()
+            # starts any actual training, so that ordering holds.
+            self.world_model_env.load_preload_state_dict(state_dict["world_model_env_preload"])
+            rollout_sd = state_dict.get("world_model_env_rollout")
+            if rollout_sd is not None:
+                self.world_model_env.load_rollout_state_dict(rollout_sd)
+        if self.rollout_hx_cx_state is not None and "rollout_hx_cx" in state_dict:
+            self.rollout_hx_cx_state.load_state_dict(state_dict["rollout_hx_cx"])
+
+
 class Trainer(StateDictMixin):
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -52,9 +115,10 @@ class Trainer(StateDictMixin):
         # to null, so this preserves the exact prior behavior -- a fresh OS-entropy seed
         # every launch/resume -- for every existing config/run).
         if cfg.common.seed is not None:
-            set_seed(cfg.common.seed)
+            self._resolved_seed = cfg.common.seed
         else:
-            set_seed(torch.seed() % 10 ** 9)
+            self._resolved_seed = torch.seed() % 10 ** 9
+        set_seed(self._resolved_seed)
 
         # `self.rng_state`'s presence (no leading underscore) means StateDictMixin picks it
         # up automatically in state_dict()/load_state_dict(), exactly like self.opt and
@@ -185,20 +249,31 @@ class Trainer(StateDictMixin):
             pin_memory_device=str(self._device) if self._use_cuda else "",
         )
 
-        make_batch_sampler = partial(BatchSampler, self.train_dataset, self._rank, self._world_size)
+        # rng=derive_component_seed(...): each component's BatchSampler draws from its OWN
+        # independent numpy Generator instead of sharing global np.random state (see
+        # ResumeFidelityState's docstring) -- required so that, e.g., actor_critic's
+        # WorldModelEnv preload burst can never desync denoiser/rew_end_model's sampling.
+        make_batch_sampler = lambda *args, **kwargs: BatchSampler(
+            self.train_dataset, self._rank, self._world_size, *args,
+            rng=derive_component_seed(self._resolved_seed, COMPONENT_SEED_ID[kwargs.pop("_component_name")]),
+            **kwargs,
+        )
 
         def get_sample_weights(sample_weights: List[float]) -> Optional[List[float]]:
             return None if (self._is_static_dataset and cfg.static_dataset.ignore_sample_weights) else sample_weights
 
         c = cfg.denoiser.training
         seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
-        bs = make_batch_sampler(c.batch_size, seq_length, get_sample_weights(c.sample_weights))
-        dl_denoiser_train = make_data_loader(batch_sampler=bs)
+        bs_denoiser = make_batch_sampler(c.batch_size, seq_length, get_sample_weights(c.sample_weights), _component_name="denoiser")
+        dl_denoiser_train = make_data_loader(batch_sampler=bs_denoiser)
         dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length)
 
         c = cfg.rew_end_model.training
-        bs = make_batch_sampler(c.batch_size, c.seq_length, get_sample_weights(c.sample_weights), can_sample_beyond_end=True)
-        dl_rew_end_model_train = make_data_loader(batch_sampler=bs)
+        bs_rew_end_model = make_batch_sampler(
+            c.batch_size, c.seq_length, get_sample_weights(c.sample_weights), can_sample_beyond_end=True,
+            _component_name="rew_end_model",
+        )
+        dl_rew_end_model_train = make_data_loader(batch_sampler=bs_rew_end_model)
         dl_rew_end_model_test = DatasetTraverser(self.test_dataset, c.batch_size, c.seq_length)
 
         self._data_loader_train = CommonTools(dl_denoiser_train, dl_rew_end_model_train, None)
@@ -210,12 +285,13 @@ class Trainer(StateDictMixin):
 
         if self._is_model_free:
             rl_env = make_env(num_envs=cfg.actor_critic.training.batch_size, device=self._device, **env_kwargs_train)
+            bs_actor_critic = None
 
         else:
             c = cfg.actor_critic.training
             sl = cfg.agent.denoiser.inner_model.num_steps_conditioning
-            bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
-            dl_actor_critic = make_data_loader(batch_sampler=bs)
+            bs_actor_critic = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights), _component_name="actor_critic")
+            dl_actor_critic = make_data_loader(batch_sampler=bs_actor_critic)
             wm_env_cfg = instantiate(cfg.world_model_env)
             rl_env = WorldModelEnv(
                 self.agent.denoiser, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg,
@@ -230,6 +306,19 @@ class Trainer(StateDictMixin):
         sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
         actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
         self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
+
+        # See ResumeFidelityState's docstring: everything needed for the actor-critic's
+        # imagined-rollout machinery to resume exactly, grouped into one StateDictMixin-
+        # discovered field (non-underscore attribute name) alongside self.opt/self.lr_sched/
+        # self.rng_state.
+        batch_samplers = {"denoiser": bs_denoiser, "rew_end_model": bs_rew_end_model}
+        if bs_actor_critic is not None:
+            batch_samplers["actor_critic"] = bs_actor_critic
+        self.resume_fidelity_state = ResumeFidelityState(
+            batch_samplers=batch_samplers,
+            world_model_env=rl_env if not self._is_model_free else None,
+            rollout_hx_cx_state=self.agent.actor_critic.rollout_hx_cx_state,
+        )
 
         # LCG intrinsic-reward lifecycle -- disabled unless
         # cfg.intrinsic_reward.enabled is True (default False, see
@@ -539,6 +628,22 @@ class Trainer(StateDictMixin):
                 f"what the original process would have drawn next."
             )
             state_dict["rng_state"] = self.rng_state.state_dict()
+        if "resume_fidelity_state" not in state_dict:
+            # Backward compatibility: a state.pt saved before component-local sampler RNG /
+            # WorldModelEnv preload-replay / rollout-hx_cx checkpointing existed has no
+            # "resume_fidelity_state" key. Inject this process's own current (freshly seeded)
+            # state as a placeholder rather than restoring anything -- resume proceeds, just
+            # without exact-resume fidelity for the imagined-rollout machinery specifically.
+            print(
+                f"WARNING: {self._path_state_ckpt} predates resume-fidelity checkpointing (no "
+                f"'resume_fidelity_state' key). Exact resume is NOT available from this "
+                f"checkpoint: each component's BatchSampler will start from a fresh RNG "
+                f"stream, and the actor-critic's imagined-rollout WorldModelEnv will draw a "
+                f"brand new preload block and reset its rollout buffers/LSTM state from "
+                f"scratch (matching this codebase's ORIGINAL behavior, before this feature) "
+                f"instead of continuing exactly where the original process left off."
+            )
+            state_dict["resume_fidelity_state"] = self.resume_fidelity_state.state_dict()
         self.load_state_dict(state_dict)
 
     def save_checkpoint(self) -> None:
@@ -561,6 +666,7 @@ class Trainer(StateDictMixin):
         # asked.
         provenance = {
             "epoch": self.epoch,
+            "resolved_seed": self._resolved_seed,
             "git_commit": get_git_commit_hash(),
             "config_yaml": OmegaConf.to_yaml(self._cfg),
         }

@@ -322,9 +322,27 @@ class RNGState:
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         random.setstate(state_dict["python_random"])
         np.random.set_state(state_dict["numpy_random"])
-        torch.set_rng_state(state_dict["torch_cpu"])
+        # torch.set_rng_state/cuda.set_rng_state_all both require CPU-resident ByteTensors --
+        # but this state_dict may have just come through torch.load(..., map_location=device)
+        # (Trainer.load_state_checkpoint() uses that map_location so model/optimizer tensors
+        # land on the right device), which silently relocates EVERY tensor found during
+        # unpickling, RNG state included. .cpu() is a no-op if it's already on CPU, so this is
+        # safe regardless of where the state_dict came from.
+        torch.set_rng_state(state_dict["torch_cpu"].cpu())
         if "torch_cuda" in state_dict and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(state_dict["torch_cuda"])
+            torch.cuda.set_rng_state_all([t.cpu() for t in state_dict["torch_cuda"]])
+
+
+def derive_component_seed(base_seed: int, component_id: int) -> np.random.SeedSequence:
+    """Deterministically derives an independent, well-separated seed for one component's own
+    RNG stream from a single experiment-level base seed. Uses numpy's SeedSequence (the
+    documented, recommended way to spawn multiple independent streams from one seed -- unlike
+    naive approaches such as `base_seed + component_id`, SeedSequence's hashing avoids
+    correlated/overlapping streams). `component_id` must be a FIXED integer identifier (see
+    e.g. data.batch_sampler.COMPONENT_SEED_ID) -- never Python's built-in hash() on a name,
+    which is randomly salted per-process by default and would silently break reproducibility.
+    """
+    return np.random.SeedSequence([base_seed, component_id])
 
 
 def get_git_commit_hash(repo_dir: Optional[Path] = None) -> Optional[str]:
