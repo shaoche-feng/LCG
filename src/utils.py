@@ -345,6 +345,30 @@ def derive_component_seed(base_seed: int, component_id: int) -> np.random.SeedSe
     return np.random.SeedSequence([base_seed, component_id])
 
 
+def derive_torch_generator(base_seed: int, component_id: int) -> torch.Generator:
+    """Deterministic, component-isolated torch.Generator for a DataLoader's own `generator=`
+    argument -- NOT the BatchSampler's own RNG (that already uses derive_component_seed via a
+    separate numpy Generator). Without an explicit generator, torch.utils.data.DataLoader
+    (even with num_workers=0 and a custom batch_sampler) still draws one CPU-RNG value on
+    EVERY `iter(data_loader)` call, in `_BaseDataLoaderIter.__init__`'s `_base_seed`
+    computation -- consuming from the GLOBAL default generator whenever loader.generator is
+    None. Found via the resume-fidelity integration test: WorldModelEnv's data_loader is only
+    ever `iter()`'d lazily, the first time make_generator_init's coroutine actually resumes
+    (not at construction) -- in a continuing process this happens once, early; in a resumed
+    process (a brand-new WorldModelEnv/DataLoader object even though rollout STATE was
+    restored from checkpoint) it happens once too, but at whatever later point the first
+    preload refill occurs -- permanently offsetting the shared global CPU RNG stream relative
+    to the continuing run from that point on, with no relation to correctness of any restored
+    state. Seeding this generator deterministically from the same component-seed derivation
+    used elsewhere makes `_base_seed` reproducible AND independent of the global stream,
+    eliminating the interference entirely rather than working around its timing."""
+    seed_seq = derive_component_seed(base_seed, component_id)
+    seed_int = int(seed_seq.generate_state(1, dtype=np.uint64)[0])
+    generator = torch.Generator()
+    generator.manual_seed(seed_int)
+    return generator
+
+
 def get_git_commit_hash(repo_dir: Optional[Path] = None) -> Optional[str]:
     """Best-effort: returns None (never raises) if git isn't available or repo_dir isn't
     inside a git repo -- this is provenance metadata, not something a training run should

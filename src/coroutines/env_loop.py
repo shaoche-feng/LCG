@@ -68,8 +68,6 @@ def make_env_loop(
 
     while True:
         hx, cx = hx.detach(), cx.detach()
-        if hx_cx_state is not None:
-            hx_cx_state.hx, hx_cx_state.cx, hx_cx_state.initialized = hx, cx, True
         all_ = []
         infos = []
         n = 0
@@ -121,6 +119,16 @@ def make_env_loop(
             val_bootstrap[dead] = val_final_obs
 
         all_[-1][-1] = val_bootstrap
+
+        if hx_cx_state is not None:
+            # Captured HERE (right before yielding, i.e. right before this coroutine suspends
+            # and a checkpoint could be taken), using the hx/cx this rollout actually ENDED
+            # on -- NOT at the top of the loop, which would capture the value this iteration
+            # STARTED from (i.e. the previous call's ending state, one step stale). Found via
+            # the resume-fidelity integration test: capturing at the top made a resumed run's
+            # first post-resume step silently reuse the hx/cx from two calls before the save
+            # point instead of the correct immediately-prior one.
+            hx_cx_state.hx, hx_cx_state.cx, hx_cx_state.initialized = hx.detach(), cx.detach(), True
 
         def _maybe_stack(x):
             # `z` (the continuous policy's pre-tanh sample) is None for every step when the

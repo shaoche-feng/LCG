@@ -27,6 +27,7 @@ from utils import (
     configure_opt,
     count_parameters,
     derive_component_seed,
+    derive_torch_generator,
     get_git_commit_hash,
     get_lr_sched,
     keep_agent_copies_every,
@@ -265,7 +266,10 @@ class Trainer(StateDictMixin):
         c = cfg.denoiser.training
         seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
         bs_denoiser = make_batch_sampler(c.batch_size, seq_length, get_sample_weights(c.sample_weights), _component_name="denoiser")
-        dl_denoiser_train = make_data_loader(batch_sampler=bs_denoiser)
+        dl_denoiser_train = make_data_loader(
+            batch_sampler=bs_denoiser,
+            generator=derive_torch_generator(self._resolved_seed, COMPONENT_SEED_ID["denoiser"]),
+        )
         dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length)
 
         c = cfg.rew_end_model.training
@@ -273,7 +277,10 @@ class Trainer(StateDictMixin):
             c.batch_size, c.seq_length, get_sample_weights(c.sample_weights), can_sample_beyond_end=True,
             _component_name="rew_end_model",
         )
-        dl_rew_end_model_train = make_data_loader(batch_sampler=bs_rew_end_model)
+        dl_rew_end_model_train = make_data_loader(
+            batch_sampler=bs_rew_end_model,
+            generator=derive_torch_generator(self._resolved_seed, COMPONENT_SEED_ID["rew_end_model"]),
+        )
         dl_rew_end_model_test = DatasetTraverser(self.test_dataset, c.batch_size, c.seq_length)
 
         self._data_loader_train = CommonTools(dl_denoiser_train, dl_rew_end_model_train, None)
@@ -291,7 +298,10 @@ class Trainer(StateDictMixin):
             c = cfg.actor_critic.training
             sl = cfg.agent.denoiser.inner_model.num_steps_conditioning
             bs_actor_critic = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights), _component_name="actor_critic")
-            dl_actor_critic = make_data_loader(batch_sampler=bs_actor_critic)
+            dl_actor_critic = make_data_loader(
+                batch_sampler=bs_actor_critic,
+                generator=derive_torch_generator(self._resolved_seed, COMPONENT_SEED_ID["actor_critic"]),
+            )
             wm_env_cfg = instantiate(cfg.world_model_env)
             rl_env = WorldModelEnv(
                 self.agent.denoiser, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg,

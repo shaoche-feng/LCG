@@ -6,10 +6,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from coroutines.env_loop import RolloutHxCxState
+from coroutines.env_loop import make_env_loop, RolloutHxCxState
 from data import BatchSampler, collate_segments_to_batch, Dataset, Episode
 from data.batch_sampler import COMPONENT_SEED_ID
 from envs.world_model_env import WorldModelEnv, WorldModelEnvConfig
+from models.actor_critic import ActorCritic, ActorCriticConfig
 from models.diffusion import Denoiser, DenoiserConfig, DiffusionSamplerConfig
 from models.diffusion.inner_model import InnerModelConfig
 from models.rew_end_model import RewEndModel, RewEndModelConfig
@@ -240,6 +241,111 @@ def test_rollout_hx_cx_state_round_trip():
 # ---------------------------------------------------------------------------------------------
 # Backward compatibility
 # ---------------------------------------------------------------------------------------------
+
+class _FakeDeterministicEnv:
+    """Minimal env_loop-compatible env: never truncates/ends (isolates hx_cx_state's handoff
+    timing from death-handling entirely), and returns a FIXED, precomputed observation
+    sequence (not random) so two independently-constructed rollouts fed the same seed of
+    actions see bit-identical observations -- required to compare an uninterrupted
+    continuation against a resumed one call-for-call."""
+
+    def __init__(self, num_envs, obs_shape, num_calls_worth):
+        self.num_envs = num_envs
+        self.obs_shape = obs_shape
+        self.is_discrete = False
+        self.action_dim = 2
+        self.action_low = torch.tensor([-1.0, -1.0])
+        self.action_high = torch.tensor([1.0, 1.0])
+        g = torch.Generator().manual_seed(0)
+        self._obs_sequence = [torch.rand(num_envs, *obs_shape, generator=g) for _ in range(num_calls_worth)]
+        self._t = 0
+
+    def reset(self, seed=None):
+        self._t = 0
+        return self._obs_sequence[0], {}
+
+    def step(self, act):
+        self._t += 1
+        obs = self._obs_sequence[self._t % len(self._obs_sequence)]
+        rew = torch.zeros(self.num_envs)
+        end = torch.zeros(self.num_envs, dtype=torch.bool)
+        trunc = torch.zeros(self.num_envs, dtype=torch.bool)
+        return obs, rew, end, trunc, {}
+
+    def prime_for_resume(self, t, obs):
+        """Simulate a WorldModelEnv whose rollout buffers were already restored from a
+        checkpoint before make_env_loop resumes: set the step counter so this fake env's
+        deterministic sequence continues from the right point (instead of restarting at t=0
+        via reset()), and expose `obs_buffer` -- make_env_loop's resume path checks
+        `hasattr(env, "obs_buffer")` and, when true, reads the current observation from
+        `env.obs_buffer[:, -1]` instead of calling env.reset(). Without this, the fake env
+        has no obs_buffer attribute, the hasattr check fails, and the resume path silently
+        falls through to a fresh reset() -- which is a gap in this test double, not a bug in
+        make_env_loop itself, since the real WorldModelEnv always has obs_buffer by the time
+        this coroutine resumes."""
+        self._t = t
+        self.obs_buffer = obs.unsqueeze(1)
+
+
+def make_tiny_ac(action_dim=2, lstm_dim=8, img_size=8):
+    cfg = ActorCriticConfig(
+        lstm_dim=lstm_dim, img_channels=3, img_size=img_size, channels=[4], down=[0],
+        continuous_action_dim=action_dim, action_low=[-1.0] * action_dim, action_high=[1.0] * action_dim,
+    )
+    return ActorCritic(cfg)
+
+
+def test_env_loop_hx_cx_state_resume_matches_uninterrupted_continuation():
+    """Regression test for the off-by-one timing bug the resume-fidelity integration test
+    itself caught: a checkpoint taken right after call N must let a FRESH env_loop's call
+    N+1 reproduce exactly what the ORIGINAL, uninterrupted env_loop's call N+1 produces --
+    not what its call N produced (the pre-fix bug: hx_cx_state was written at the TOP of
+    each call, capturing the value that call STARTED from, one call stale)."""
+    torch.manual_seed(0)
+    model_ref = make_tiny_ac()
+    model_ref.critic_linear.weight.data.normal_(0, 0.1)  # break the all-zero init so hx/cx
+    model_ref.actor_linear.weight.data.normal_(0, 0.1)   # actually evolve call-to-call
+
+    # Second, identically-initialized model (state_dict copy) for the resumed arm.
+    model_resumed = make_tiny_ac()
+    model_resumed.load_state_dict(model_ref.state_dict())
+
+    env_ref = _FakeDeterministicEnv(num_envs=3, obs_shape=(3, 8, 8), num_calls_worth=5)
+    state_ref = RolloutHxCxState()
+    loop_ref = make_env_loop(env_ref, model_ref, hx_cx_state=state_ref)
+    loop_ref.send(4)  # call 1
+    loop_ref.send(4)  # call 2 -- checkpoint taken right after this
+
+    saved_sd = state_ref.state_dict()
+    saved_torch_rng = torch.get_rng_state()  # what Trainer's RNGState would also snapshot here
+    # Snapshot the checkpoint-time position BEFORE running call 3 on loop_ref -- env_ref._t
+    # keeps advancing once call 3 runs, so reading it afterward would capture call 3's ending
+    # position instead of the checkpoint position, silently priming the resumed arm one call
+    # too far ahead.
+    checkpoint_t = env_ref._t
+    checkpoint_obs = env_ref._obs_sequence[checkpoint_t % len(env_ref._obs_sequence)]
+    ref_call3_output = loop_ref.send(4)  # call 3 (uninterrupted reference continuation)
+
+    env_resumed = _FakeDeterministicEnv(num_envs=3, obs_shape=(3, 8, 8), num_calls_worth=5)
+    # Mirror what Trainer's resume path does for a real WorldModelEnv: restore its rollout
+    # buffers (here, just the deterministic sequence position + current obs) BEFORE the
+    # env_loop coroutine's first resumed .send() -- without this, env_resumed has no
+    # obs_buffer, make_env_loop's `hasattr(env, "obs_buffer")` check fails, and it falls
+    # through to a fresh env.reset(), restarting the deterministic sequence at t=0 instead of
+    # continuing from where env_ref left off.
+    env_resumed.prime_for_resume(t=checkpoint_t, obs=checkpoint_obs)
+    state_resumed = RolloutHxCxState()
+    state_resumed.load_state_dict(saved_sd)
+    torch.set_rng_state(saved_torch_rng)  # mirrors RNGState.load_state_dict's restoration
+    loop_resumed = make_env_loop(env_resumed, model_resumed, hx_cx_state=state_resumed)
+    resumed_call_output = loop_resumed.send(4)  # the FIRST call after "resume" == call 3
+
+    # Compare the val (critic output) tensor from each -- a function of the model forward
+    # pass on (obs, hx, cx), so equal iff hx/cx (and everything else) matched exactly.
+    ref_val = ref_call3_output[6]
+    resumed_val = resumed_call_output[6]
+    assert torch.equal(ref_val, resumed_val)
+
 
 def test_resume_fidelity_state_load_tolerates_missing_keys(tmp_path):
     """Simulates loading an old-format checkpoint dict (predates this feature): the inner
