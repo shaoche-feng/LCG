@@ -16,7 +16,7 @@ import wandb
 
 from agent import Agent, get_action_space_kwargs
 from coroutines.collector import make_collector, NumToCollect
-from coroutines.env_loop import RolloutHxCxState
+from coroutines.env_loop import EnvResetSeedState, RolloutHxCxState
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
 from data.batch_sampler import COMPONENT_SEED_ID
 from envs import make_atari_env, make_dm_control_env, WorldModelEnv
@@ -66,14 +66,22 @@ class ResumeFidelityState:
         docstrings) -- checkpointed explicitly here for the exact same reason rollout_hx_cx_state
         is: nn.Module.load_state_dict()'s recursion would silently never invoke an override on
         a nested module (see DrQExplorationState's docstring for the full explanation).
+      - The real train/test collectors' deterministic env.reset() seed streams
+        (coroutines.env_loop.EnvResetSeedState) -- actor-critic-agnostic (both ActorCritic and
+        DrQActorCritic runs use these). Together with make_collector's flush_before_reset mode
+        (see Trainer.__init__'s train-collector construction), this is what makes ongoing real
+        train collection resume exactly: the collector is always rebuilt from a fully known,
+        freshly-reset state at every checkpoint boundary, so no OTHER collector-local state
+        (buffer, episode_ids, frame-stack/LSTM hx/cx, or the real env's own internal state)
+        needs to be separately checkpointed at all -- only this seed stream's position does.
 
     Auto-discovered and checkpointed by Trainer's StateDictMixin machinery exactly like
     self.opt/self.lr_sched/self.rng_state already are, via a single
     `self.resume_fidelity_state = ResumeFidelityState(...)` attribute (see Trainer.__init__).
     Every piece is optional/gracefully-absent (model_free runs have no WorldModelEnv; a
     checkpoint saved before actor_critic ever trained has no rollout buffers yet; a non-DrQ run
-    has no drq_exploration_states), so a checkpoint taken at ANY point round-trips without
-    special-casing by the caller.
+    has no drq_exploration_states; a static-dataset run has no collectors at all), so a
+    checkpoint taken at ANY point round-trips without special-casing by the caller.
     """
 
     def __init__(
@@ -82,6 +90,7 @@ class ResumeFidelityState:
         world_model_env: Optional[WorldModelEnv],
         rollout_hx_cx_state: Optional[RolloutHxCxState],
         drq_exploration_states: Optional[Dict[str, Any]] = None,
+        collector_reset_states: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.batch_samplers = batch_samplers
         self.world_model_env = world_model_env
@@ -89,6 +98,8 @@ class ResumeFidelityState:
         # name -> object exposing state_dict()/load_state_dict() (DrQExplorationState or
         # DrQGeneratorState); None for a non-DrQ actor-critic. See Trainer.__init__.
         self.drq_exploration_states = drq_exploration_states
+        # name -> EnvResetSeedState (e.g. "train"/"test"); None for a static-dataset run.
+        self.collector_reset_states = collector_reset_states
 
     def state_dict(self) -> Dict[str, Any]:
         sd: Dict[str, Any] = {"batch_samplers": {name: bs.state_dict() for name, bs in self.batch_samplers.items()}}
@@ -99,6 +110,8 @@ class ResumeFidelityState:
             sd["rollout_hx_cx"] = self.rollout_hx_cx_state.state_dict()
         if self.drq_exploration_states is not None:
             sd["drq_exploration_states"] = {k: v.state_dict() for k, v in self.drq_exploration_states.items()}
+        if self.collector_reset_states is not None:
+            sd["collector_reset_states"] = {k: v.state_dict() for k, v in self.collector_reset_states.items()}
         return sd
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
@@ -120,6 +133,10 @@ class ResumeFidelityState:
             for k, v in self.drq_exploration_states.items():
                 if k in state_dict["drq_exploration_states"]:
                     v.load_state_dict(state_dict["drq_exploration_states"][k])
+        if self.collector_reset_states is not None and "collector_reset_states" in state_dict:
+            for k, v in self.collector_reset_states.items():
+                if k in state_dict["collector_reset_states"]:
+                    v.load_state_dict(state_dict["collector_reset_states"][k])
 
 
 class Trainer(StateDictMixin):
@@ -270,19 +287,62 @@ class Trainer(StateDictMixin):
                 # imagined-training loop below, even though all three drive the SAME learned
                 # weights.
                 train_model = self.agent.actor_critic.make_collector_binding(
-                    env=train_env, noise_generator=self.agent.actor_critic.real_collection_exploration_state.generator
+                    env=train_env,
+                    noise_generator=self.agent.actor_critic.real_collection_exploration_state.generator,
+                    deterministic=False,
                 )
+                # deterministic=True: evaluation must be observation -> actor -> mu (rescaled)
+                # -> env action, with NO exploration Gaussian noise -- cfg.collection.test.epsilon
+                # defaulting to 0.0 already suppresses env_loop's SEPARATE random-action-
+                # replacement, but that does nothing about DrQActorCritic's own noise, which is
+                # only actually skipped by sample_action's deterministic branch. See
+                # DrQPolicyBinding's docstring.
                 test_model = self.agent.actor_critic.make_collector_binding(
-                    env=test_env, noise_generator=self.agent.actor_critic.eval_exploration_state.generator
+                    env=test_env,
+                    noise_generator=self.agent.actor_critic.eval_exploration_state.generator,
+                    deterministic=True,
                 )
             else:
                 train_model = self.agent.actor_critic
                 test_model = self.agent.actor_critic
+
+            # Deterministic, checkpointable env.reset() seed streams -- independent of every
+            # other RNG stream, actor-critic-agnostic (both ActorCritic and DrQActorCritic use
+            # these) -- see EnvResetSeedState's docstring. Wired into ResumeFidelityState below.
+            self._train_collector_reset_state = EnvResetSeedState(
+                np.random.default_rng(derive_component_seed(self._resolved_seed, COMPONENT_SEED_ID["train_collector_reset"]))
+            )
+            self._test_collector_reset_state = EnvResetSeedState(
+                np.random.default_rng(derive_component_seed(self._resolved_seed, COMPONENT_SEED_ID["test_collector_reset"]))
+            )
+
             self._train_collector = make_collector(
-                train_env, train_model, self.train_dataset, cfg.collection.train.epsilon
+                train_env,
+                train_model,
+                self.train_dataset,
+                cfg.collection.train.epsilon,
+                # reset_every_collect+flush_before_reset together: a checkpoint-safe collection
+                # boundary at the end of EVERY epoch's collection batch (right before
+                # Trainer.save_checkpoint() runs) -- whatever's been collected so far is always
+                # persisted, then the whole collector (env, frame-stack/LSTM state) is rebuilt
+                # from a deterministic seed, identically whether or not a checkpoint/resume
+                # actually happens there. See make_collector's own docstring for the full
+                # rationale and the tradeoff (episodes now cut off at steps_per_epoch rather
+                # than running to their natural length, in exchange for exact resume fidelity
+                # of real-env collection -- required because this Trainer's checkpoint/resume
+                # path otherwise has no way to reproduce hidden env_loop/collector/environment
+                # state that isn't part of any checkpointed field).
+                reset_every_collect=True,
+                flush_before_reset=True,
+                reset_seed_state=self._train_collector_reset_state,
             )
             self._test_collector = make_collector(
-                test_env, test_model, self.test_dataset, cfg.collection.test.epsilon, reset_every_collect=True
+                test_env,
+                test_model,
+                self.test_dataset,
+                cfg.collection.test.epsilon,
+                reset_every_collect=True,
+                reset_seed_state=self._test_collector_reset_state,
             )
 
         ######################################################
@@ -433,11 +493,18 @@ class Trainer(StateDictMixin):
                 "real_collection_exploration_state": self.agent.actor_critic.real_collection_exploration_state,
                 "eval_exploration_state": self.agent.actor_critic.eval_exploration_state,
             }
+        collector_reset_states = None
+        if not self._is_static_dataset and self._rank == 0:
+            collector_reset_states = {
+                "train": self._train_collector_reset_state,
+                "test": self._test_collector_reset_state,
+            }
         self.resume_fidelity_state = ResumeFidelityState(
             batch_samplers=batch_samplers,
             world_model_env=rl_env if not self._is_model_free else None,
             rollout_hx_cx_state=self.agent.actor_critic.rollout_hx_cx_state,
             drq_exploration_states=drq_exploration_states,
+            collector_reset_states=collector_reset_states,
         )
 
         # LCG intrinsic-reward lifecycle -- disabled unless

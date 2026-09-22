@@ -158,7 +158,16 @@ class DrQExplorationState:
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         generator_state = state_dict.get("generator_state")
         if generator_state is not None and self.generator is not None:
-            self.generator.set_state(generator_state)
+            # torch.Generator.set_state() always requires a CPU ByteTensor, EVEN for a CUDA
+            # generator (get_state() always returns one too) -- but Trainer.load_state_checkpoint
+            # loads the whole checkpoint via torch.load(..., map_location=self._device), which
+            # remaps EVERY tensor found in the pickle (not just model weights) onto that device,
+            # silently turning this originally-CPU state tensor into a CUDA one by the time it
+            # reaches here. Move it back to CPU explicitly rather than relying on map_location
+            # never doing that -- found via an actual end-to-end CUDA Trainer resume, not a unit
+            # test (the in-memory state_dict()/load_state_dict() round-trip tests never go
+            # through torch.save/torch.load at all, so never exercised this).
+            self.generator.set_state(generator_state.cpu())
         self.schedule_step = state_dict.get("schedule_step", 0)
 
 
@@ -180,7 +189,9 @@ class DrQGeneratorState:
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         generator_state = state_dict.get("generator_state")
         if generator_state is not None and self.generator is not None:
-            self.generator.set_state(generator_state)
+            # See DrQExplorationState.load_state_dict's comment: set_state() requires CPU,
+            # regardless of map_location remapping this tensor onto the checkpoint's device.
+            self.generator.set_state(generator_state.cpu())
 
 
 @dataclass
@@ -351,26 +362,37 @@ def _soft_update(target: nn.Module, online: nn.Module, tau: float) -> None:
 
 
 class DrQPolicyBinding:
-    """Binds a shared DrQActorCritic to ONE specific env AND ONE specific exploration-noise
-    generator, for ONE specific env_loop instance -- so cold-start seeding and RNG state are
-    both correctly scoped per loop instead of living on the shared actor -- see the module
-    docstring's "per-loop isolation" section. Exposes exactly the surface
-    coroutines.env_loop.make_env_loop / coroutines.collector.make_collector need
-    (predict_act_value, sample_action, initial_hx_cx, lstm_dim, device), delegating all actual
-    computation (and all trainable parameters) to the wrapped model -- multiple bindings over
-    the SAME DrQActorCritic share every weight, but never share env references, cold-start
-    state, or noise-generator state: none of it lives on either the binding or the model,
-    predict_act_value/sample_action derive it fresh from their own arguments every call."""
+    """Binds a shared DrQActorCritic to ONE specific env, ONE specific exploration-noise
+    generator, AND ONE specific deterministic/stochastic policy, for ONE specific env_loop
+    instance -- so cold-start seeding, RNG state, AND determinism are all correctly scoped per
+    loop instead of living on the shared actor -- see the module docstring's "per-loop
+    isolation" section. Exposes exactly the surface coroutines.env_loop.make_env_loop /
+    coroutines.collector.make_collector need (predict_act_value, sample_action, initial_hx_cx,
+    lstm_dim, device), delegating all actual computation (and all trainable parameters) to the
+    wrapped model -- multiple bindings over the SAME DrQActorCritic share every weight, but
+    never share env references, cold-start state, noise-generator state, or determinism: none
+    of it lives on either the binding or the model, predict_act_value/sample_action derive it
+    fresh from their own arguments every call.
+
+    `deterministic` is set ONCE per binding, not threaded through by the caller: env_loop.py
+    calls `model.sample_action(logits_act)` with no deterministic argument at all (kept
+    deliberately generic, see env_loop.py's docstring), so which policy a given loop runs --
+    imagined-training (stochastic), real-env train collection (stochastic), or real-env
+    eval/test collection (deterministic) -- has to be a property of WHICH BINDING is wired into
+    that loop, not something env_loop.py passes through. See Trainer.__init__'s
+    make_collector_binding(deterministic=True) call for the eval/test collector."""
 
     def __init__(
         self,
         model: "DrQActorCritic",
         env: Optional[Union[TorchEnv, WorldModelEnv]] = None,
         noise_generator: Optional[torch.Generator] = None,
+        deterministic: bool = False,
     ) -> None:
         self.model = model
         self.env = env
         self.noise_generator = noise_generator
+        self.deterministic = deterministic
 
     @property
     def lstm_dim(self) -> int:
@@ -386,8 +408,12 @@ class DrQPolicyBinding:
     def predict_act_value(self, obs: Tensor, hx_cx: Tuple[Tensor, Tensor]):
         return self.model.predict_act_value(obs, hx_cx, env=self.env)
 
-    def sample_action(self, dist_params: Tensor, deterministic: bool = False) -> Tuple[Tensor, Optional[Tensor]]:
-        return self.model.sample_action(dist_params, deterministic=deterministic, generator=self.noise_generator)
+    def sample_action(self, dist_params: Tensor, deterministic: Optional[bool] = None) -> Tuple[Tensor, Optional[Tensor]]:
+        # `deterministic=None` (env_loop.py's own call, and this binding's normal use) defers
+        # to this binding's own fixed policy; an explicit True/False (e.g. a direct test call)
+        # overrides it for that one call only, without changing the binding's own setting.
+        det = self.deterministic if deterministic is None else deterministic
+        return self.model.sample_action(dist_params, deterministic=det, generator=self.noise_generator)
 
 
 class DrQActorCritic(nn.Module):
@@ -486,26 +512,34 @@ class DrQActorCritic(nn.Module):
         self.exploration_state.generator = noise_generator
         self.env_loop = make_env_loop(
             rl_env,
-            DrQPolicyBinding(self, env=rl_env, noise_generator=noise_generator),
+            DrQPolicyBinding(self, env=rl_env, noise_generator=noise_generator, deterministic=False),
             hx_cx_state=self.rollout_hx_cx_state,
         )
         self.loss_cfg = loss_cfg
 
     def make_collector_binding(
-        self, env: Optional[Union[TorchEnv, WorldModelEnv]] = None, noise_generator: Optional[torch.Generator] = None
+        self,
+        env: Optional[Union[TorchEnv, WorldModelEnv]] = None,
+        noise_generator: Optional[torch.Generator] = None,
+        deterministic: bool = False,
     ) -> DrQPolicyBinding:
         """Constructs an INDEPENDENT DrQPolicyBinding for a real-env collector (train or test),
-        so its cold-start/frame-stack state AND its noise stream are scoped to that collector's
-        own env_loop instance -- never shared with the imagined-training loop or with another
-        collector (a separate call for the train collector and the test collector each gets its
-        own binding, hence its own frame-stack initialization and its own RNG stream -- pass
-        `self.real_collection_exploration_state.generator` / `self.eval_exploration_state.
-        generator` respectively, or None for a purely deterministic caller, e.g. evaluation
-        that always passes deterministic=True and so never touches `noise_generator` at all).
-        `env` is typically a real TorchEnv (no obs_buffer), so cold-start there uses the
-        repeat-current-observation path on every episode reset, not just the first -- see
-        predict_act_value's docstring."""
-        return DrQPolicyBinding(self, env=env, noise_generator=noise_generator)
+        so its cold-start/frame-stack state, its noise stream, AND its determinism are all
+        scoped to that collector's own env_loop instance -- never shared with the
+        imagined-training loop or with another collector (a separate call for the train
+        collector and the test collector each gets its own binding, hence its own frame-stack
+        initialization and its own RNG stream -- pass `self.real_collection_exploration_state.
+        generator` / `self.eval_exploration_state.generator` respectively). `deterministic=True`
+        (the caller's job to request -- e.g. Trainer's test/eval collector) makes every
+        sample_action call on this binding take DrQActorCritic.sample_action's deterministic
+        branch (mu, rescaled, no noise draw, no generator touched, see that method's docstring)
+        regardless of `noise_generator`, so passing a generator alongside deterministic=True is
+        harmless -- it simply goes unused, preserved here only so eval keeps its own
+        independent, checkpointed RNG stream in case anything ever calls this binding with an
+        explicit deterministic=False override. `env` is typically a real TorchEnv (no
+        obs_buffer), so cold-start there uses the repeat-current-observation path on every
+        episode reset, not just the first -- see predict_act_value's docstring."""
+        return DrQPolicyBinding(self, env=env, noise_generator=noise_generator, deterministic=deterministic)
 
     def set_intrinsic_reward_fn(self, fn) -> None:
         """Same hook/contract as ActorCritic.set_intrinsic_reward_fn -- substitutes the reward
@@ -859,7 +893,15 @@ class DrQActorCritic(nn.Module):
             eps = self._sample_noise(
                 mu_boot.shape, noise_std, self.loss_cfg.noise_clip, mu_boot.device, self.exploration_state.generator
             )
-            a_boot = (mu_boot + eps).clamp(-1.0, 1.0)
+            a_boot_canonical = (mu_boot + eps).clamp(-1.0, 1.0)
+            # The critic must see the SAME action coordinate system everywhere: a_t_flat above
+            # (fed to the online critic) is environment-scale, straight from the rollout (see
+            # sample_action's own self._rescale(...) call) -- but the actor's raw output is
+            # always canonical [-1, 1] (DrQActor.forward's final tanh), never rescaled itself.
+            # Without this, the target critic would silently see a different action coordinate
+            # system than the online critic whenever action bounds aren't exactly [-1, 1] (the
+            # bug is invisible for e.g. walker/walk, whose bounds happen to already be [-1, 1]).
+            a_boot = self._rescale(a_boot_canonical)
             tq1, tq2 = self.target_critic(features_boot, a_boot)
             target_q = torch.min(tq1, tq2)
             td_target = returns_flat + discount_flat * not_done_flat * target_q
@@ -923,10 +965,15 @@ class DrQActorCritic(nn.Module):
 
         features = self.encoder(s_t_aug).detach()
         mu = self.actor(features)
+        # Same environment-scale rescale as critic_update's bootstrap action (see its comment)
+        # -- and NOT detached: gradients must flow Q -> environment action -> canonical mu ->
+        # actor through this rescale (a plain differentiable affine map, see _rescale), or the
+        # actor would never receive a gradient at all.
+        mu_env = self._rescale(mu)
 
         self._set_critic_requires_grad(False)
         try:
-            q1_pi, q2_pi = self.critic(features, mu)
+            q1_pi, q2_pi = self.critic(features, mu_env)
             loss_actor = -torch.min(q1_pi, q2_pi).mean()
 
             opt_actor.zero_grad()

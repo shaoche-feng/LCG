@@ -9,7 +9,7 @@ from tqdm import tqdm
 from . import coroutine
 from data import Episode, Dataset
 from envs import TorchEnv
-from .env_loop import make_env_loop
+from .env_loop import EnvResetSeedState, make_env_loop
 from utils import Logs
 
 
@@ -21,7 +21,25 @@ def make_collector(
     epsilon: float = 0.0,
     reset_every_collect: bool = False,
     verbose: bool = True,
+    reset_seed_state: Optional[EnvResetSeedState] = None,
+    flush_before_reset: bool = False,
 ) -> Generator[Logs, int, None]:
+    """reset_seed_state=None, flush_before_reset=False (every existing call site) preserve the
+    exact prior behavior. Passing both together (see Trainer.__init__'s train collector) turns
+    on a checkpoint-safe collection mode: at the end of EVERY `.send()` call (i.e. every epoch's
+    collection batch, where Trainer.save_checkpoint() runs), whatever's been buffered for each
+    env since its last flush is ALWAYS persisted (flush_before_reset overrides
+    reset_every_collect's usual "discard the in-progress episode" behavior for that env) and
+    treated as closed (episode_ids cleared, buffer cleared, logged) even if the real env hasn't
+    actually terminated there, and then the whole collector (env_loop, hence env.reset(), hence
+    the model's frame-stack/LSTM state) is rebuilt from scratch via a DETERMINISTIC seed drawn
+    from reset_seed_state -- so a checkpoint/resume cycle and an uninterrupted run reach that
+    boundary in an IDENTICAL, freshly-reset state, and no collector-local Python state (buffer,
+    episode_ids, dead) or hidden env_loop/env state needs to be separately checkpointed at all.
+    The cost: episodes are now cut off at collection-batch boundaries rather than running to
+    their natural length whenever that's shorter than steps_per_epoch -- see
+    Trainer.__init__'s docstring/comment for this tradeoff. See tests/coroutines/
+    test_collector_resume_fidelity.py for the uninterrupted-vs-resumed equivalence this buys."""
     num_envs = env.num_envs
 
     env_loop, buffer, episode_ids, dead = (None,) * 4
@@ -42,7 +60,7 @@ def make_collector(
 
     def reset():
         nonlocal env_loop, episode_ids, dead
-        env_loop = make_env_loop(env, model, epsilon)
+        env_loop = make_env_loop(env, model, epsilon, reset_seed_state=reset_seed_state)
         episode_ids = defaultdict(lambda: None)
         dead = [None] * num_envs
 
@@ -67,8 +85,11 @@ def make_collector(
 
         count_dead = 0
         for i in range(num_envs):
-            # Store incomplete episodes only when reset_every_collect is set to False (train)
-            add_to_dataset = dead[i] or (can_stop and not reset_every_collect)
+            # Store incomplete episodes when reset_every_collect is False (the original train
+            # behavior: episodes grow seamlessly across collection calls) OR when
+            # flush_before_reset is True (the new checkpoint-safe train mode: always persist
+            # what's been collected so far, then close out below regardless of reset_every_collect).
+            add_to_dataset = dead[i] or (can_stop and (flush_before_reset or not reset_every_collect))
             if add_to_dataset:
                 info = {"final_observation": infos["final_observation"][count_dead]} if dead[i] else {}
                 ep = Episode(*(torch.cat(x, dim=0) for x in zip(*buffer[i])), info).to("cpu")
@@ -76,7 +97,13 @@ def make_collector(
                     ep = dataset.load_episode(episode_ids[i]) + ep
                 episode_ids[i] = dataset.add_episode(ep, episode_id=episode_ids[i])
 
-            if dead[i]:
+            # Natural termination always closes the episode; flush_before_reset additionally
+            # forces a close at the collection-batch boundary even if the real env didn't
+            # actually terminate there (that env's NEXT collected step, after reset() below,
+            # starts a genuinely new episode rather than silently continuing the old one under
+            # a stale episode_id whose underlying env/frame-stack state no longer matches it).
+            closing = dead[i] or (can_stop and flush_before_reset)
+            if closing:
                 to_log.append(
                     {
                         f"{dataset.name}/episode_id": episode_ids[i],

@@ -22,6 +22,11 @@ COMPONENT_SEED_ID = {
     "drq_imagination_noise": 3,
     "drq_real_collection_noise": 4,
     "drq_eval_noise": 5,
+    # Deterministic env.reset() seed streams for the real train/test collectors (see
+    # coroutines.env_loop.EnvResetSeedState) -- independent of every RNG stream above, and
+    # actor-critic-agnostic (ActorCritic and DrQActorCritic runs both use these).
+    "train_collector_reset": 6,
+    "test_collector_reset": 7,
 }
 
 

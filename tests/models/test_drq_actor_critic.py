@@ -590,6 +590,57 @@ def test_generator_state_round_trip_cuda():
     assert torch.equal(draw1, draw2)
 
 
+def test_generator_state_load_survives_map_location_device_remap():
+    """Regression test: Trainer.load_state_checkpoint() loads the WHOLE checkpoint via
+    torch.load(..., map_location=self._device), which remaps EVERY tensor found in the pickle
+    (not just model weights) onto that device -- including this state tensor, which
+    torch.Generator.get_state() always produces as CPU regardless of the generator's own
+    device. Simulates that remap directly (moving the saved state tensor to CUDA before
+    load_state_dict, exactly what map_location does) rather than going through an actual
+    Trainer/torch.save/torch.load cycle. Found via a real end-to-end CUDA Trainer resume, not a
+    unit test -- the round-trip test above never simulated this because it never leaves memory."""
+    if not torch.cuda.is_available():
+        return
+    from utils import derive_torch_generator
+
+    state = DrQGeneratorState()
+    state.generator = derive_torch_generator(0, 4, device="cuda")
+    torch.randn(5, device="cuda", generator=state.generator)
+    sd = state.state_dict()
+    assert sd["generator_state"].device.type == "cpu"  # get_state() always returns CPU
+    sd["generator_state"] = sd["generator_state"].to("cuda")  # simulate map_location="cuda"
+
+    state2 = DrQGeneratorState()
+    state2.generator = derive_torch_generator(0, 999, device="cuda")
+    state2.load_state_dict(sd)  # must not raise, despite the CUDA-resident state tensor
+
+    draw1 = torch.randn(5, device="cuda", generator=state.generator)
+    draw2 = torch.randn(5, device="cuda", generator=state2.generator)
+    assert torch.equal(draw1, draw2)
+
+
+def test_exploration_state_load_survives_map_location_device_remap():
+    if not torch.cuda.is_available():
+        return
+    from utils import derive_torch_generator
+
+    state = DrQExplorationState()
+    state.generator = derive_torch_generator(0, 3, device="cuda")
+    state.schedule_step = 7
+    torch.randn(5, device="cuda", generator=state.generator)
+    sd = state.state_dict()
+    sd["generator_state"] = sd["generator_state"].to("cuda")
+
+    state2 = DrQExplorationState()
+    state2.generator = derive_torch_generator(0, 998, device="cuda")
+    state2.load_state_dict(sd)
+    assert state2.schedule_step == 7
+
+    draw1 = torch.randn(5, device="cuda", generator=state.generator)
+    draw2 = torch.randn(5, device="cuda", generator=state2.generator)
+    assert torch.equal(draw1, draw2)
+
+
 # ---------------------------------------------------------------------------------------------
 # 6. Augmentation: identical shift across all K stacked frames.
 # ---------------------------------------------------------------------------------------------
@@ -1143,3 +1194,176 @@ def test_actor_grad_clipping_never_touches_critic_or_encoder_grad():
             assert p.grad is None
         else:
             assert torch.equal(p.grad, g_before)
+
+
+# ---------------------------------------------------------------------------------------------
+# 15. Deterministic evaluation (DrQPolicyBinding.deterministic).
+# ---------------------------------------------------------------------------------------------
+
+def test_eval_binding_repeated_calls_produce_identical_actions():
+    ac = make_ac(action_dim=2, img_size=8)
+    num_envs = 3
+    binding = DrQPolicyBinding(ac, env=None, noise_generator=torch.Generator().manual_seed(0), deterministic=True)
+    hx, cx = binding.initial_hx_cx(num_envs)
+    obs = torch.rand(num_envs, 3, 8, 8)
+    mu, _, _ = binding.predict_act_value(obs, (hx, cx))
+
+    action1, aux1 = binding.sample_action(mu)
+    action2, aux2 = binding.sample_action(mu)
+    assert aux1 is None and aux2 is None
+    assert torch.equal(action1, action2)
+    assert torch.allclose(action1, ac._rescale(mu))
+
+
+def test_eval_binding_consumes_no_exploration_rng_state():
+    ac = make_ac(action_dim=2, img_size=8)
+    gen = torch.Generator().manual_seed(0)
+    binding = DrQPolicyBinding(ac, env=None, noise_generator=gen, deterministic=True)
+    mu = torch.zeros(4, 2)
+
+    state_before = gen.get_state().clone()
+    binding.sample_action(mu)
+    binding.sample_action(mu)
+    state_after = gen.get_state()
+    assert torch.equal(state_before, state_after)
+
+
+def test_eval_binding_does_not_advance_exploration_schedule():
+    ac = make_ac(action_dim=2, img_size=8)
+    binding = DrQPolicyBinding(ac, env=None, noise_generator=torch.Generator().manual_seed(0), deterministic=True)
+    mu = torch.zeros(4, 2)
+
+    step_before = ac.exploration_state.schedule_step
+    binding.sample_action(mu)
+    binding.sample_action(mu)
+    assert ac.exploration_state.schedule_step == step_before
+
+
+def test_real_train_collection_binding_remains_stochastic():
+    ac = make_ac(action_dim=2, img_size=8)
+    gen = torch.Generator().manual_seed(0)
+    binding = ac.make_collector_binding(env=None, noise_generator=gen, deterministic=False)
+    mu = torch.zeros(4, 2)
+
+    action1, _ = binding.sample_action(mu)
+    action2, _ = binding.sample_action(mu)
+    assert not torch.equal(action1, action2)
+
+
+def test_make_collector_binding_defaults_to_stochastic():
+    ac = make_ac(action_dim=2, img_size=8)
+    binding = ac.make_collector_binding(env=None, noise_generator=torch.Generator().manual_seed(0))
+    assert binding.deterministic is False
+
+
+def test_imagined_training_rollout_remains_stochastic():
+    """End-to-end check that setup_training's own binding (imagined-rollout training) is NOT
+    deterministic: two collect_rollout() calls with fixed weights draw different actions."""
+    torch.manual_seed(0)
+    ac, _ = _make_ac_with_rollout()
+    ac.collect_rollout()
+    actions_1 = ac._cached_rollout["a_t"].clone()
+    ac.collect_rollout()
+    actions_2 = ac._cached_rollout["a_t"].clone()
+    assert not torch.equal(actions_1, actions_2)
+
+
+def test_eval_binding_override_reaches_deterministic_branch_of_underlying_model():
+    """A binding constructed deterministic=False but called with an explicit override still
+    reaches sample_action's deterministic branch (per-call override, not just per-binding)."""
+    ac = make_ac(action_dim=2, img_size=8)
+    binding = DrQPolicyBinding(ac, env=None, noise_generator=None, deterministic=False)
+    mu = torch.zeros(4, 2)
+    action1, aux1 = binding.sample_action(mu, deterministic=True)
+    action2, aux2 = binding.sample_action(mu, deterministic=True)
+    assert aux1 is None and torch.equal(action1, action2)
+
+
+# ---------------------------------------------------------------------------------------------
+# 16. Consistent environment-scale actions at every critic call site (asymmetric bounds).
+# ---------------------------------------------------------------------------------------------
+
+def make_cfg_with_bounds(action_low, action_high, img_size=16, frame_stack=3, encoder_channels=(8, 8), encoder_down=(1, 1), projection_dim=32):
+    action_dim = len(action_low)
+    tmp = DrQActorCriticConfig(
+        img_channels=3, img_size=img_size, frame_stack=frame_stack,
+        encoder_channels=list(encoder_channels), encoder_down=list(encoder_down), feature_dim=0,
+        projection_dim=projection_dim, actor_hidden_dim=16, critic_hidden_dim=16,
+        continuous_action_dim=action_dim, action_low=list(action_low), action_high=list(action_high),
+        noise_schedule=NoiseScheduleConfig(std_start=1.0, std_end=0.1, decay_steps=100, clip=0.3),
+    )
+    enc = DrQEncoder(tmp)
+    with torch.no_grad():
+        dummy = torch.zeros(1, frame_stack * 3, img_size, img_size)
+        tmp.feature_dim = enc(dummy).shape[1]
+    return tmp
+
+
+# Deliberately asymmetric AND not [-1, 1] in either dimension, so a canonical-scale action
+# leaking into the critic unrescaled would be trivially distinguishable from an
+# environment-scale one -- e.g. dim 0's true range [-2, 4] means any canonical [-1, 1] value
+# maps to environment-scale values mostly outside [-1, 1] too, so bounds checks below can
+# actually catch the bug rather than being satisfied by coincidence.
+ASYMMETRIC_LOW = [-2.0, -0.5]
+ASYMMETRIC_HIGH = [4.0, 1.5]
+
+
+def _make_asymmetric_ac_with_rollout(backup_every=8, n_step=2, num_envs=3, img_size=16, horizon=1000):
+    cfg = make_cfg_with_bounds(ASYMMETRIC_LOW, ASYMMETRIC_HIGH, img_size=img_size)
+    ac = DrQActorCritic(cfg)
+    ac.exploration_state.generator = torch.Generator().manual_seed(0)
+    env = _FakeWorldModelEnvWithBuffer(num_envs, ac.img_channels, img_size, action_dim=2, horizon=horizon)
+    ac.env_loop = make_env_loop(
+        env, DrQPolicyBinding(ac, env=env, noise_generator=ac.exploration_state.generator), hx_cx_state=ac.rollout_hx_cx_state
+    )
+    ac.loss_cfg = DrQLossConfig(backup_every=backup_every, n_step=n_step, gamma=0.99, target_tau=0.01, noise_clip=0.3)
+    return ac
+
+
+def test_critic_sees_environment_scale_actions_at_every_call_site():
+    torch.manual_seed(0)
+    ac = _make_asymmetric_ac_with_rollout()
+    opt_critic, opt_actor = _make_optimizers(ac)
+
+    critic_actions = []
+    target_critic_actions = []
+    ac.critic.register_forward_pre_hook(lambda module, args: critic_actions.append(args[1].detach().clone()))
+    ac.target_critic.register_forward_pre_hook(lambda module, args: target_critic_actions.append(args[1].detach().clone()))
+
+    ac.collect_rollout()
+    ac.critic_update(opt_critic)  # 1st self.critic(...) call (rollout actions) + the target_critic call
+    ac.actor_update(opt_actor)  # 2nd self.critic(...) call (actor-loss actions)
+
+    assert len(critic_actions) == 2
+    assert len(target_critic_actions) == 1
+
+    low_t = torch.tensor(ASYMMETRIC_LOW)
+    high_t = torch.tensor(ASYMMETRIC_HIGH)
+    all_actions = {"rollout": critic_actions[0], "target": target_critic_actions[0], "actor_loss": critic_actions[1]}
+    for name, a in all_actions.items():
+        assert torch.all(a >= low_t - 1e-4), f"{name} action below action_low: {a.min(dim=0).values}"
+        assert torch.all(a <= high_t + 1e-4), f"{name} action above action_high: {a.max(dim=0).values}"
+
+    # A canonical [-1, 1] action leaking through unrescaled would never exceed +-1 in dim 0 --
+    # confirm at least one captured action genuinely does (proving these are environment-scale,
+    # not a coincidental subset of both ranges).
+    any_outside_unit = any(
+        bool(((a[:, 0] > 1.0 + 1e-4) | (a[:, 0] < -1.0 - 1e-4)).any()) for a in all_actions.values()
+    )
+    assert any_outside_unit, "expected at least one captured action outside [-1, 1] in dim 0"
+
+
+def test_actor_gradient_flows_through_rescale_with_asymmetric_bounds():
+    torch.manual_seed(0)
+    ac = _make_asymmetric_ac_with_rollout()
+    opt_critic, opt_actor = _make_optimizers(ac)
+    ac.collect_rollout()
+    ac.critic_update(opt_critic)
+
+    for p in ac.actor.parameters():
+        p.grad = None
+    ac.actor_update(opt_actor)
+
+    actor_params = list(ac.actor.parameters())
+    assert all(p.grad is not None for p in actor_params)
+    assert any(p.grad.abs().sum().item() > 0 for p in actor_params)

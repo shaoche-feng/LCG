@@ -1,6 +1,7 @@
 import random
-from typing import Generator, Optional, Tuple, Union
+from typing import Generator, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -34,12 +35,41 @@ class RolloutHxCxState:
         self.initialized = state_dict["initialized"]
 
 
+class EnvResetSeedState:
+    """External, checkpointable source of deterministic env.reset() seeds -- mirrors
+    RolloutHxCxState's pattern (state lives OUTSIDE the coroutine so it can be read for
+    checkpointing and restored on resume). Without this, make_env_loop's env.reset(seed=...)
+    call below draws from Python's global `random` module, which is NOT reproducible across a
+    checkpoint/resume: a resumed process's next env.reset() draws an entirely different,
+    unrelated seed than an uninterrupted process's next call would have, silently diverging the
+    collected real-env data from that point on. `rng`, like data.batch_sampler.BatchSampler's
+    own `rng` parameter, is a numpy Generator the caller derives independently per component
+    (see utils.derive_component_seed) -- never Python's global random module, whose seed cannot
+    be captured/restored per-stream. See coroutines.collector.make_collector's
+    flush_before_reset mode, which relies on this for exact checkpoint/resume fidelity of
+    ongoing real-env collection.
+    """
+
+    def __init__(self, rng: np.random.Generator) -> None:
+        self._rng = rng
+
+    def next_seeds(self, num_envs: int) -> List[int]:
+        return [int(s) for s in self._rng.integers(0, 2**31 - 1, size=num_envs)]
+
+    def state_dict(self) -> dict:
+        return {"bit_generator_state": self._rng.bit_generator.state}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._rng.bit_generator.state = state_dict["bit_generator_state"]
+
+
 @coroutine
 def make_env_loop(
     env: Union[TorchEnv, WorldModelEnv],
     model: nn.Module,
     epsilon: float = 0.0,
     hx_cx_state: Optional[RolloutHxCxState] = None,
+    reset_seed_state: Optional[EnvResetSeedState] = None,
 ) -> Generator[Tuple[torch.Tensor, ...], int, None]:
     """hx_cx_state=None (every existing call site: real-env train/test collectors) preserves
     the exact prior behavior -- hx/cx always start at zero, env.reset() always runs. Only
@@ -50,6 +80,12 @@ def make_env_loop(
     coroutine's first real .send() on resume), hx/cx and the current observation are taken
     from that saved state instead of a fresh zero-init + env.reset() -- reset() would discard
     the just-restored WorldModelEnv buffers.
+
+    reset_seed_state=None (the default) preserves the exact prior behavior for env.reset()'s
+    seed too -- drawn from Python's global `random` module, not reproducible. Passing an
+    EnvResetSeedState makes this call's seed instead come from that checkpointable stream (see
+    its docstring) -- opt-in, so every call site that doesn't need reset-seed reproducibility
+    (kept generic here on purpose, per this module's design) is unaffected.
     """
     num_steps = yield
 
@@ -69,6 +105,8 @@ def make_env_loop(
 
     if resuming and hasattr(env, "obs_buffer"):
         obs = env.obs_buffer[:, -1]
+    elif reset_seed_state is not None:
+        obs, _ = env.reset(seed=reset_seed_state.next_seeds(env.num_envs))
     else:
         seed = random.randint(0, 2**31 - 1)
         obs, _ = env.reset(seed=[seed + i for i in range(env.num_envs)])
