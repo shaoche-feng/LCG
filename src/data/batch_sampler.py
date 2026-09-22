@@ -11,7 +11,18 @@ from .segment import SegmentId
 # salted per-process by default (PYTHONHASHSEED), so the SAME component name would derive a
 # DIFFERENT seed on every run, defeating the entire point of a reproducible, component-local
 # stream.
-COMPONENT_SEED_ID = {"denoiser": 0, "rew_end_model": 1, "actor_critic": 2}
+COMPONENT_SEED_ID = {
+    "denoiser": 0,
+    "rew_end_model": 1,
+    "actor_critic": 2,
+    # DrQActorCritic's own exploration-noise streams (models.drq_actor_critic) -- deliberately
+    # separate from each other so consuming noise in one loop (e.g. real-env collection) can
+    # never perturb another loop's (e.g. imagined-training's) future draws. See
+    # DrQActorCritic's module docstring, RNG-isolation section.
+    "drq_imagination_noise": 3,
+    "drq_real_collection_noise": 4,
+    "drq_eval_noise": 5,
+}
 
 
 class BatchSampler(torch.utils.data.Sampler):
