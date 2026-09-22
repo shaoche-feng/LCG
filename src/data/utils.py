@@ -37,7 +37,19 @@ def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = Tru
         pad(episode.trunc[start:stop]),
         mask_padding,
         info=episode.info,
-        id=SegmentId(segment_id.episode_id, start, stop),
+        # The ORIGINAL (possibly out-of-episode-range) segment_id, NOT the clamped start/stop
+        # used to slice `episode` above. This was previously SegmentId(episode_id, start, stop)
+        # -- the clamped values -- which silently discards how much padding this segment
+        # needed: re-fetching via Dataset.__getitem__(segment.id) later (e.g.
+        # WorldModelEnv.make_generator_init's preload-cycle checkpoint/resume replay, the only
+        # consumer of Segment.id/Batch.segment_ids in this codebase) would then request the
+        # ALREADY-CLAMPED range again, which needs zero padding, silently reproducing a SHORTER,
+        # unpadded segment instead of the original one -- found via a real end-to-end resume
+        # with a tiny dataset (where boundary-adjacent, padding-requiring segments are common
+        # enough to hit reliably; a large dataset makes this rare but not impossible). Passing
+        # the original segment_id back through Dataset.__getitem__ reproduces IDENTICAL padding
+        # every time, which is exactly what that function is already designed to accept.
+        id=segment_id,
     )
 
 

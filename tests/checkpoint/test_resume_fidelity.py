@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 from coroutines.env_loop import make_env_loop, RolloutHxCxState
 from data import BatchSampler, collate_segments_to_batch, Dataset, Episode
 from data.batch_sampler import COMPONENT_SEED_ID
+from data.segment import SegmentId
+from data.utils import make_segment
 from envs.world_model_env import WorldModelEnv, WorldModelEnvConfig
 from models.actor_critic import ActorCritic, ActorCriticConfig
 from models.diffusion import Denoiser, DenoiserConfig, DiffusionSamplerConfig
@@ -217,6 +219,97 @@ def test_preload_state_dict_none_before_any_use(tmp_path):
     rew_end_model = make_tiny_rew_end_model()
     env, _ = make_world_model_env(ds, rew_end_model, denoiser)
     assert env.rollout_state_dict() is None  # reset() never called yet
+
+
+# ---------------------------------------------------------------------------------------------
+# make_segment / Segment.id round-trip (isolated bug fix, unrelated to DrQ):
+#
+# make_segment previously stored the CLAMPED start/stop in the returned Segment.id
+# (SegmentId(episode_id, max(0, segment_id.start), min(len(episode), segment_id.stop))),
+# discarding how much padding the segment needed. Segment.id/Batch.segment_ids has exactly one
+# consumer in this codebase: WorldModelEnv.make_generator_init's preload-cycle resume replay
+# (self.dataset[sid] for sid in the SAVED segment_ids) -- which re-fetches each segment by its
+# OWN previously-returned id. Re-fetching a CLAMPED id needs zero padding, so a boundary-
+# adjacent segment (near an episode's start or end) silently came back SHORTER on replay than
+# it was when first drawn -- found via a live end-to-end Trainer resume with a small dataset
+# (boundary segments are common there; rare, not impossible, at production dataset sizes,
+# which is why the existing preload-resume tests above never happened to hit it). Fixed by
+# storing the ORIGINAL segment_id (whatever Dataset.__getitem__ was actually called with) in
+# Segment.id instead of the clamped slice bounds.
+# ---------------------------------------------------------------------------------------------
+
+def test_make_segment_id_round_trips_left_padding_boundary():
+    episode = Episode(
+        obs=torch.arange(10 * IMG_CHANNELS * IMG_SIZE * IMG_SIZE, dtype=torch.float32).reshape(
+            10, IMG_CHANNELS, IMG_SIZE, IMG_SIZE
+        ),
+        act=torch.randn(10, ACTION_DIM),
+        rew=torch.zeros(10),
+        end=torch.zeros(10, dtype=torch.uint8),
+        trunc=torch.zeros(10, dtype=torch.uint8),
+        info={},
+    )
+    original_sid = SegmentId(episode_id=0, start=-1, stop=3)  # needs 1 frame of left padding
+    seg1 = make_segment(episode, original_sid, should_pad=True)
+    assert seg1.obs.shape[0] == 4
+    assert seg1.id == original_sid  # NOT SegmentId(0, 0, 3), the old (buggy) clamped value
+
+    # Re-fetch via the returned id, exactly what make_generator_init's preload replay does.
+    seg2 = make_segment(episode, seg1.id, should_pad=True)
+    assert seg2.obs.shape[0] == 4
+    assert torch.equal(seg1.obs, seg2.obs)
+    assert torch.equal(seg1.mask_padding, seg2.mask_padding)
+
+
+def test_make_segment_id_round_trips_right_padding_boundary():
+    episode = Episode(
+        obs=torch.rand(10, IMG_CHANNELS, IMG_SIZE, IMG_SIZE),
+        act=torch.randn(10, ACTION_DIM),
+        rew=torch.zeros(10),
+        end=torch.zeros(10, dtype=torch.uint8),
+        trunc=torch.zeros(10, dtype=torch.uint8),
+        info={},
+    )
+    original_sid = SegmentId(episode_id=0, start=8, stop=12)  # needs 2 frames of right padding
+    seg1 = make_segment(episode, original_sid, should_pad=True)
+    assert seg1.obs.shape[0] == 4
+    assert seg1.id == original_sid
+
+    seg2 = make_segment(episode, seg1.id, should_pad=True)
+    assert seg2.obs.shape[0] == 4
+    assert torch.equal(seg1.obs, seg2.obs)
+    assert torch.equal(seg1.mask_padding, seg2.mask_padding)
+
+
+def test_preload_replay_reproduces_boundary_padded_segment_content(tmp_path):
+    """The exact uninterrupted-vs-resumed regression test for the preload path: a 1-step
+    episode with SEQ_LENGTH=2 forces EVERY sampled segment to need left-padding (start=-1),
+    guaranteeing the boundary case is exercised deterministically rather than relying on
+    BatchSampler's randomness happening to draw one (which is how this bug went unnoticed by
+    the existing preload-resume tests above)."""
+    ds = make_dataset(tmp_path, n_episodes=1, ep_len=1)
+    denoiser = make_tiny_denoiser()
+    rew_end_model = make_tiny_rew_end_model()
+
+    # "Uninterrupted" arm: env_a's very first reset() -- make_generator_init's FRESH-draw
+    # branch, through the real BatchSampler/DataLoader/collate_segments_to_batch path.
+    env_a, sampler_a = make_world_model_env(ds, rew_end_model, denoiser, base_seed=123)
+    env_a.reset()
+    assert env_a.obs_buffer.shape[1] == SEQ_LENGTH  # sanity: got the full conditioning window
+    fresh_cycle = env_a._preload_cycle
+
+    # "Resumed" arm: brand-new WorldModelEnv/dataset object, replaying the saved cycle via
+    # load_preload_state_dict -- Trainer's actual resume path (see ResumeFidelityState).
+    preload_sd = {"preload_cycle": fresh_cycle, "preload_cursor": 0}
+    env_b, sampler_b = make_world_model_env(ds, rew_end_model, denoiser, base_seed=999)
+    env_b.load_preload_state_dict(preload_sd)
+    env_b.reset()
+
+    assert env_b.obs_buffer.shape == env_a.obs_buffer.shape
+    assert torch.equal(env_b.obs_buffer, env_a.obs_buffer)
+    assert torch.equal(env_b.act_buffer, env_a.act_buffer)
+    assert torch.equal(env_b.hx_rew_end, env_a.hx_rew_end)
+    assert torch.equal(env_b.cx_rew_end, env_a.cx_rew_end)
 
 
 # ---------------------------------------------------------------------------------------------
