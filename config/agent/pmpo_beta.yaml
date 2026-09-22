@@ -1,0 +1,24 @@
+defaults:
+  - default
+  - _self_
+
+actor_critic:
+  _target_: models.pmpo_beta.PMPOBetaConfig
+  # lstm_dim inherited for schema compatibility; PMPO is feedforward.
+  actor_hidden_dims: [256, 256]
+  value_hidden_dims: [256, 256]
+  actor_lr: 1e-4
+  value_lr: 1e-4
+  # Retain DIAMOND's discount/trace defaults, rather than silently changing them.
+  gamma: 0.985
+  lambda_: 0.95
+  # Dreamer 4 Eq. 11; KL and log probabilities sum action dimensions, in nats.
+  alpha_pmpo: 0.5
+  beta_kl: 0.3
+  # Snapshot before updates 0,10,20,...; held fixed for ten fresh-rollout updates.
+  prior_refresh_interval: 10
+  concentration_min: 1.0
+  imagination_horizon: ${world_model_env.horizon}
+  max_grad_norm: 10.0
+  seed: ${oc.select:common.seed,0}
+  log_diagnostics: false

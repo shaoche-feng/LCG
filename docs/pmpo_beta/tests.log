@@ -1,0 +1,10 @@
+﻿........................................................................ [ 67%]
+...................................                                      [100%]
+============================== warnings summary ===============================
+..\..\miniconda3\envs\lcg\lib\site-packages\wandb\analytics\sentry.py:90
+  C:\Users\jerry\miniconda3\envs\lcg\lib\site-packages\wandb\analytics\sentry.py:90: SentryHubDeprecationWarning: `sentry_sdk.Hub` is deprecated and will be removed in a future major release. Please consult our 1.x to 2.x migration guide for details on how to migrate `Hub` usage to the new API: https://docs.sentry.io/platforms/python/migration/1.x-to-2.x
+    self.hub = sentry_sdk.Hub(client)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+107 passed, 1 warning in 16.33s
+

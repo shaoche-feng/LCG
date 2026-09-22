@@ -1,0 +1,216 @@
+wandb:
+  mode: disabled
+  project: null
+  entity: null
+  name: null
+  group: null
+  tags: null
+  notes: null
+initialization:
+  path_to_ckpt: null
+  load_denoiser: true
+  load_rew_end_model: true
+  load_actor_critic: true
+common:
+  devices: 0
+  seed: 7
+  resume: false
+checkpointing:
+  save_agent_every: 5
+  num_to_keep: 11
+collection:
+  train:
+    num_envs: 1
+    epsilon: 0.01
+    num_steps_total: 8
+    first_epoch:
+      min: 8
+      max: 8
+      threshold_rew: 10
+    steps_per_epoch: 4
+  test:
+    num_envs: 1
+    num_episodes: 1
+    epsilon: 0.0
+    num_final_episodes: 1
+static_dataset:
+  path: null
+  ignore_sample_weights: true
+training:
+  should: true
+  num_final_epochs: 1
+  cache_in_ram: true
+  num_workers_data_loaders: 0
+  model_free: false
+  compile_wm: false
+evaluation:
+  should: false
+  every: 10
+world_model_env:
+  _target_: envs.WorldModelEnvConfig
+  horizon: 3
+  num_batches_to_preload: 1
+  diffusion_sampler:
+    _target_: models.diffusion.DiffusionSamplerConfig
+    num_steps_denoising: 2
+    sigma_min: 0.002
+    sigma_max: 5.0
+    rho: 7
+    order: 1
+    s_churn: 0.0
+    s_tmin: 0.0
+    s_tmax: ${eval:'float("inf")'}
+    s_noise: 1.0
+denoiser:
+  training:
+    num_autoregressive_steps: 1
+    start_after_epochs: 0
+    steps_first_epoch: 1
+    steps_per_epoch: 1
+    sample_weights:
+    - 0.1
+    - 0.1
+    - 0.1
+    - 0.7
+    batch_size: 2
+    grad_acc_steps: 1
+    lr_warmup_steps: 0
+    max_grad_norm: 1.0
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0.01
+    eps: 1.0e-08
+  sigma_distribution:
+    _target_: models.diffusion.SigmaDistributionConfig
+    loc: -0.4
+    scale: 1.2
+    sigma_min: 0.002
+    sigma_max: 20
+rew_end_model:
+  training:
+    seq_length: ${eval:'${world_model_env.horizon} + ${agent.denoiser.inner_model.num_steps_conditioning}'}
+    start_after_epochs: 0
+    steps_first_epoch: 1
+    steps_per_epoch: 1
+    sample_weights: ${denoiser.training.sample_weights}
+    batch_size: 2
+    grad_acc_steps: 1
+    lr_warmup_steps: 0
+    max_grad_norm: 100.0
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0.01
+    eps: 1.0e-08
+actor_critic:
+  training:
+    sample_weights: ${denoiser.training.sample_weights}
+    batch_size: 2
+    grad_acc_steps: 1
+    start_after_epochs: 0
+    steps_first_epoch: 3
+    steps_per_epoch: 3
+    lr_warmup_steps: 0
+    max_grad_norm: 100.0
+  actor_critic_loss:
+    _target_: models.actor_critic.ActorCriticLossConfig
+    backup_every: 15
+    gamma: 0.985
+    lambda_: 0.95
+    weight_value_loss: 1.0
+    weight_entropy_loss: 0.001
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0
+    eps: 1.0e-08
+env:
+  train:
+    type: dm_control
+    domain_name: walker
+    task_name: walk
+    size: 16
+    camera_id: 0
+    action_repeat: 2
+    time_limit: 0.2
+  test:
+    type: ${..train.type}
+    domain_name: ${..train.domain_name}
+    task_name: ${..train.task_name}
+    size: ${..train.size}
+    camera_id: ${..train.camera_id}
+    action_repeat: ${..train.action_repeat}
+    time_limit: ${..train.time_limit}
+  keymap: empty
+agent:
+  _target_: agent.AgentConfig
+  denoiser:
+    _target_: models.diffusion.DenoiserConfig
+    sigma_data: 0.5
+    sigma_offset_noise: 0.3
+    inner_model:
+      _target_: models.diffusion.InnerModelConfig
+      img_channels: 3
+      num_steps_conditioning: 2
+      cond_channels: 16
+      depths:
+      - 1
+      channels:
+      - 8
+      attn_depths:
+      - 0
+  rew_end_model:
+    _target_: models.rew_end_model.RewEndModelConfig
+    lstm_dim: 16
+    img_channels: ${agent.denoiser.inner_model.img_channels}
+    img_size: ${env.train.size}
+    cond_channels: 16
+    depths:
+    - 1
+    channels:
+    - 8
+    attn_depths:
+    - 0
+  actor_critic:
+    _target_: models.pmpo_beta.PMPOBetaConfig
+    lstm_dim: 512
+    img_channels: ${agent.denoiser.inner_model.img_channels}
+    img_size: ${env.train.size}
+    channels:
+    - 8
+    down:
+    - 0
+    actor_hidden_dims:
+    - 32
+    value_hidden_dims:
+    - 32
+    actor_lr: 0.0001
+    value_lr: 0.0001
+    gamma: 0.985
+    lambda_: 0.95
+    alpha_pmpo: 0.5
+    beta_kl: 0.3
+    prior_refresh_interval: 10
+    concentration_min: 1.0
+    imagination_horizon: ${world_model_env.horizon}
+    max_grad_norm: 10.0
+    seed: ${oc.select:common.seed,0}
+    log_diagnostics: true
+intrinsic_reward:
+  _target_: lcg.LCGConfig
+  enabled: false
+  theta_s:
+    _target_: lcg.theta_s.ThetaSConfig
+    include:
+    - unet.u_blocks.3.*
+    - norm_out.*
+    - conv_out.*
+    exclude: []
+  precision_reference_size: 320
+  precision_num_mc: 3
+  damping: 0.0001
+  beta: 1.0
+  rms_enabled: true
+  rms_alpha: 1.0
+  rms_ema_decay: 0.99
+  rms_eps: 1.0e-08
+  candidate_num_mc: 12
+  candidate_chunk_size: 16

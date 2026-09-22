@@ -1,0 +1,30 @@
+{
+  "updates": 3,
+  "action_low": [
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0
+  ],
+  "action_high": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "fixed_observations": 6,
+  "fixed_policy_mean_state_std": [
+    0.0020185706671327353,
+    0.0005548327462747693,
+    0.0010252839419990778,
+    0.0007059075287543237,
+    0.0005699549801647663,
+    0.0006125793443061411
+  ],
+  "parameters_finite": true,
+  "checkpoint": "outputs/pmpo-smoke-1/checkpoints/agent_versions/agent_epoch_00001.pt"
+}

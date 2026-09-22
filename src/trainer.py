@@ -2,6 +2,7 @@ from functools import partial
 from pathlib import Path
 import shutil
 import time
+import json
 from typing import List, Optional, Tuple
 
 from hydra.utils import instantiate
@@ -18,6 +19,7 @@ from coroutines.collector import make_collector, NumToCollect
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
 from envs import make_atari_env, make_dm_control_env, WorldModelEnv
 from lcg import LCGConfig, LCGLifecycle
+from models.pmpo_beta import PMPOBeta, PMPOOptimizers
 from utils import (
     broadcast_if_needed,
     build_ddp_wrapper,
@@ -45,8 +47,14 @@ class Trainer(StateDictMixin):
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        # Pick a random seed
-        set_seed(torch.seed() % 10 ** 9)
+        # Preserve legacy initialization; PMPO honors an explicit experiment seed.
+        is_pmpo = cfg.agent.actor_critic._target_ == "models.pmpo_beta.PMPOBetaConfig"
+        if is_pmpo and (self._world_size != 1 or cfg.actor_critic.training.grad_acc_steps != 1):
+            raise ValueError("Minimal PMPO supports one device and grad_acc_steps=1")
+        seed = cfg.common.seed if is_pmpo and cfg.common.seed is not None else torch.seed() % 10 ** 9
+        set_seed(seed)
+        if is_pmpo:
+            torch.backends.cudnn.deterministic = True
 
         # Device
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu", self._rank)
@@ -137,9 +145,13 @@ class Trainer(StateDictMixin):
         # Optimizers and LR schedulers
 
         def build_opt(name: str) -> torch.optim.AdamW:
+            if name == "actor_critic" and isinstance(self.agent.actor_critic, PMPOBeta):
+                return PMPOOptimizers(self.agent.actor_critic, cfg.actor_critic.training.lr_warmup_steps)
             return configure_opt(getattr(self.agent, name), **getattr(cfg, name).optimizer)
 
         def build_lr_sched(name: str) -> torch.optim.lr_scheduler.LambdaLR:
+            if isinstance(self.opt.get(name), PMPOOptimizers):
+                return None  # both schedulers are owned/checkpointed by PMPOOptimizers
             return get_lr_sched(self.opt.get(name), getattr(cfg, name).training.lr_warmup_steps)
 
         self._model_names = ["denoiser", "rew_end_model", "actor_critic"]
@@ -423,6 +435,23 @@ class Trainer(StateDictMixin):
         opt = self.opt.get(name)
         lr_sched = self.lr_sched.get(name)
         data_loader = self._data_loader_train.get(name)
+
+        if isinstance(opt, PMPOOptimizers):
+            if cfg.grad_acc_steps != 1 or self._world_size != 1:
+                raise ValueError("Minimal PMPO supports one device and grad_acc_steps=1")
+            model.train()
+            logs = []
+            for _ in trange(steps, desc="Training actor_critic (PMPO)"):
+                opt.zero_grad()
+                loss, metrics = model()
+                loss.backward()
+                metrics.update(opt.step())
+                if self.agent.actor_critic.cfg.log_diagnostics:
+                    print("PMPO_DIAGNOSTICS " + json.dumps({k: float(v) for k, v in metrics.items()}), flush=True)
+                self.num_batch_train.actor_critic += 1
+                metrics["num_batch_train_actor_critic"] = self.num_batch_train.actor_critic
+                logs.append({f"actor_critic/train/{k}": v for k, v in metrics.items()})
+            return logs
 
         model.train()
         opt.zero_grad()

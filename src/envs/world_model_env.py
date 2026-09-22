@@ -52,7 +52,21 @@ class WorldModelEnv:
         self.return_denoising_trajectory = return_denoising_trajectory
         self.return_imagined_candidate = return_imagined_candidate
         self.num_envs = data_loader.batch_sampler.batch_size
+        self.data_loader = data_loader
+        self.num_batches_to_preload = cfg.num_batches_to_preload
         self.generator_init = self.make_generator_init(data_loader, cfg.num_batches_to_preload)
+
+    def restart_initial_conditions(self) -> None:
+        """Opt-in fresh prompt block used by the feedforward PMPO controller."""
+        self.generator_init.close()
+        # Explicit DataLoader generator prevents iterator creation from consuming
+        # the global CPU stream. Seed is drawn inside PMPO's checkpointed stream.
+        self.data_loader.generator = torch.Generator().manual_seed(
+            torch.randint(0, 2**31 - 1, ()).item()
+        )
+        # Do not preload hundreds of unused batches for a block that is discarded
+        # after one rollout. Subsequent resets draw more batches on demand.
+        self.generator_init = self.make_generator_init(self.data_loader, 1)
 
     @property
     def device(self) -> torch.device:

@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from envs import TorchEnv, WorldModelEnv
 from models.actor_critic import ActorCritic, ActorCriticConfig, ActorCriticLossConfig
+from models.pmpo_beta import PMPOBeta, PMPOBetaConfig
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
 from models.rew_end_model import RewEndModel, RewEndModelConfig
 from utils import extract_state_dict
@@ -73,7 +74,8 @@ class Agent(nn.Module):
         super().__init__()
         self.denoiser = Denoiser(cfg.denoiser)
         self.rew_end_model = RewEndModel(cfg.rew_end_model)
-        self.actor_critic = ActorCritic(cfg.actor_critic)
+        controller = PMPOBeta if isinstance(cfg.actor_critic, PMPOBetaConfig) else ActorCritic
+        self.actor_critic = controller(cfg.actor_critic)
 
     @property
     def device(self):
@@ -95,7 +97,8 @@ class Agent(nn.Module):
         load_rew_end_model: bool = True,
         load_actor_critic: bool = True,
     ) -> None:
-        sd = torch.load(Path(path_to_ckpt), map_location=self.device)
+        # Trusted local agent snapshots may include PMPO's numpy/Python RNG state.
+        sd = torch.load(Path(path_to_ckpt), map_location=self.device, weights_only=False)
         sd = {k: extract_state_dict(sd, k) for k in ("denoiser", "rew_end_model", "actor_critic")}
         if load_denoiser:
             self.denoiser.load_state_dict(sd["denoiser"])

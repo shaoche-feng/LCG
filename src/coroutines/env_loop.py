@@ -27,6 +27,9 @@ def make_env_loop(
         n = 0
 
         while n < num_steps:
+            # WorldModelEnv reset_dead() mutates its observation buffer in place.
+            # Retain the actual pre-action state for likelihood replay.
+            obs = obs.clone()
             logits_act, val, (hx, cx) = model.predict_act_value(obs, (hx, cx))
             act = model.sample_action(logits_act)
 
