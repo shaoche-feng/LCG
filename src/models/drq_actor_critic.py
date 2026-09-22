@@ -3,32 +3,69 @@ inside a DIAMOND WorldModelEnv (see envs.world_model_env.WorldModelEnv). Deliber
 "DrQ-v2-style", not "DrQ-v2": several choices deviate from the original paper to fit DIAMOND's
 imagined-rollout architecture without a rewrite of the surrounding pipeline --
 
-  - No persistent replay buffer (see DrQActorCritic.forward's docstring): each imagined rollout
-    IS the training minibatch, matching how DIAMOND already produces rollouts on-policy, one
-    `env_loop.send()` at a time.
+  - No persistent replay buffer: each imagined rollout (one env_loop.send() call) IS the
+    training minibatch for one collect_rollout() + critic_update() + actor_update() cycle.
   - No target encoder: only the twin Q-heads are soft-updated; the (online) encoder is shared,
-    trained by the critic loss, and used (no_grad) to featurize the n-step-ahead observation too.
-  - Exploration noise std is an externally scheduled scalar (NoiseSchedule below), not learned.
+    trained by the critic loss, and used (no_grad, at its POST-critic-update weights) to
+    featurize the bootstrap observation for the actor's own update too.
+  - Exploration noise std is an externally scheduled scalar (see NoiseScheduleConfig), not
+    learned, and the schedule advances exactly once per collect_rollout() call -- NOT inside
+    sample_action(), which is also called during real-env collection and evaluation, neither
+    of which should perturb subsequent training exploration (see sample_action's docstring).
 
-This module implements the SAME external interface `coroutines.env_loop.make_env_loop` expects
-of `model` (`predict_act_value(obs, hx_cx) -> (dist_params, val, (hx, cx))` and
-`sample_action(dist_params, deterministic) -> (action, aux)`), so `env_loop.py` and
-`coroutines/collector.py` need zero changes to drive either this or the original REINFORCE
-`ActorCritic` (see agent.py, which selects between them via Hydra `_target_`).
+Optimization is intentionally NOT a single `loss = critic_loss + actor_loss` exposed as one
+nn.Module.forward() for a single external optimizer -- the actor objective -Q(s, actor(s))
+produces gradients through the critic's own parameters unless explicitly guarded, and the
+target-critic soft update must happen strictly after the critic's OWN optimizer step (not
+before, which would silently make targets lag the online critic by one extra step). Call
+sequence: collect_rollout() once, then critic_update(opt_critic) (which also performs the
+target soft-update internally, after opt_critic.step()), then actor_update(opt_actor) (which
+explicitly freezes the critic's requires_grad for the duration of its own backward pass, so no
+stray gradient ever reaches critic parameters even though the actor loss reads through them).
+Trainer/Hydra integration (constructing opt_critic/opt_actor, calling this sequence from
+train_component, adding the freeze-world-model downstream-policy mode) is a separate,
+not-yet-implemented stage -- this module is usable and fully tested standalone first.
+
+Interface with coroutines.env_loop.make_env_loop: this module implements the same
+predict_act_value(obs, hx_cx) / sample_action(dist_params, deterministic) contract ActorCritic
+does, so env_loop.py's core loop needs no DrQ-specific changes. Two small, additive,
+backward-compatible extensions WERE made to env_loop.py to support this module correctly (see
+env_loop.py's own comments at each site) -- ActorCritic and coroutines.collector are
+unaffected:
+  1. An optional `model.initial_hx_cx(num_envs) -> (hx, cx)` hook, used instead of the
+     hardcoded `torch.zeros(...)` zero-init when the model defines it. DrQActorCritic uses this
+     to seed a NaN sentinel (see initial_hx_cx's docstring) rather than zeros, which
+     predict_act_value needs to reliably distinguish "this loop's state has never been
+     seeded" from a mid-rollout reset_gate zero-out (both of which would otherwise look like
+     plain zeros) -- see predict_act_value's docstring for why that distinction matters and
+     what breaks without it.
+  2. env_loop.py's yield tuple now additionally returns `all_hx`: the exact per-step model
+     state that produced each step's action (BEFORE any dead-env reset_gate/burn-in touches it
+     for the FOLLOWING step). Frame-stack loss-time reconstruction from `all_obs` alone cannot
+     correctly reproduce what a mid-rollout per-env reset actually did (the dead-env burn-in
+     loop consumes MULTIPLE context frames not individually present in `all_obs`), so
+     collect_rollout() below uses `all_hx` directly instead of re-deriving it.
 
 Frame stacking: WorldModelEnv/env_loop only ever hand the model a SINGLE most-recent frame per
 call (env.obs_buffer[:, -1]) -- the original ActorCritic's only source of temporal context is
-its own LSTM hx/cx, not any multi-frame buffer. A feedforward DrQ actor needs an explicit short
-frame stack, so this module repurposes env_loop's existing (hx, cx) threading: `hx` carries the
-flattened (num_envs, frame_stack * img_channels * img_size * img_size) stack, `cx` is an unused
-placeholder tensor. env_loop.py's hx/cx handling (.detach(), boolean indexing, multiplying by a
-reset_gate, zero-init via `model.lstm_dim`) is generic tensor manipulation with no LSTM-specific
-assumption, so this achieves the frame stack with ZERO changes to env_loop.py, and the stack
-inherits env_loop's existing cross-rollout-call persistence AND RolloutHxCxState's existing
-checkpoint/resume machinery for free (it round-trips as "hx" without any new checkpointed state).
-`self.lstm_dim` below is a real attribute (required by env_loop.py's zero-init line), kept under
-that name deliberately for zero env_loop.py diff even though this model has no LSTM -- see the
-docstring on that attribute.
+its own LSTM hx/cx, not any multi-frame buffer (traced directly, not assumed). A feedforward DrQ
+actor needs an explicit short frame stack, so this module repurposes env_loop's existing
+(hx, cx) threading: `hx` carries the flattened (num_envs, frame_stack * img_channels * img_size
+* img_size) stack, `cx` is an unused placeholder tensor. env_loop.py's hx/cx handling (.detach(),
+boolean indexing, multiplying by a reset_gate, the zero-init line) is generic tensor
+manipulation with no LSTM-specific assumption, so this achieves the frame stack with no other
+env_loop.py changes, and the stack inherits env_loop's existing cross-rollout-call persistence
+AND RolloutHxCxState's existing checkpoint/resume machinery for free (it round-trips as "hx"
+without any new checkpointed state).
+
+Per-loop isolation: a single DrQActorCritic instance's trainable parameters are shared across
+MULTIPLE independent env_loop instances -- the imagined-training loop, plus real-env train/test
+collectors that use this same actor to drive data collection (see the module's exploration-
+boundary requirement: the SAME learned policy explores in both imagination and reality, but
+real transitions never train it). Cold-start/frame-stack state must therefore never live on
+`self` (the shared model) -- see predict_act_value's `env` parameter and DrQPolicyBinding below,
+which give each loop its own env reference without any shared mutable per-loop state on the
+model itself.
 """
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -55,8 +92,8 @@ class NoiseScheduleConfig:
 def _noise_std_at(cfg: NoiseScheduleConfig, step: int) -> float:
     """Externally scheduled exploration std -- NOT a learned log_std (unlike the original
     REINFORCE ActorCritic). Linear decay from std_start to std_end over decay_steps, std_end
-    afterward. Pure function of `step`; the step counter itself lives on DrQExplorationState
-    (see its docstring for why), not here."""
+    afterward. Pure function of `step`; see DrQExplorationState for where the counter itself
+    lives, and DrQActorCritic.collect_rollout for the ONE place it advances."""
     frac = min(1.0, step / max(1, cfg.decay_steps))
     return cfg.std_start + frac * (cfg.std_end - cfg.std_start)
 
@@ -104,7 +141,8 @@ class DrQActorCriticConfig:
     frame_stack: int  # number of most-recent frames stacked along the channel dim, e.g. 3
     encoder_channels: List[int]
     encoder_down: List[int]
-    feature_dim: int  # flattened conv-encoder output size (computed by caller, asserted here)
+    feature_dim: int  # flattened conv-encoder output size (asserted against the real encoder)
+    projection_dim: int  # DrQ-v2-style trunk output size (Linear -> LayerNorm -> Tanh), see point 9
     actor_hidden_dim: int
     critic_hidden_dim: int
     continuous_action_dim: int
@@ -127,9 +165,13 @@ class DrQLossConfig:
 class RandomShiftsAug(nn.Module):
     """DrQ-v2's random-shift augmentation: reflect-pad by `pad` then take a random pad-sized
     crop back to the original size, one independent shift per batch element. Applied to the
-    frame-stacked observation before the encoder. Kept enabled by default -- augmenting
-    world-model-imagined frames the same way DrQ-v2 augments real camera frames is the
-    intended initial design; disabling it is a later ablation, not a default."""
+    frame-stacked observation before the encoder -- since all frame_stack*img_channels channels
+    of one batch element go through ONE grid_sample call with ONE shift, every stacked frame
+    receives the IDENTICAL spatial shift (grid_sample's sampling grid is per-batch-element, not
+    per-channel) -- never independently shifted per frame, which would fabricate motion. Kept
+    enabled by default -- augmenting world-model-imagined frames the same way DrQ-v2 augments
+    real camera frames is the intended initial design; disabling it is a later ablation, not a
+    default."""
 
     def __init__(self, pad: int) -> None:
         super().__init__()
@@ -151,8 +193,12 @@ class RandomShiftsAug(nn.Module):
 
 
 class DrQEncoder(nn.Module):
-    """Same building blocks as ActorCriticEncoder (blocks.Conv3x3/SmallResBlock/MaxPool2d), just
-    with `frame_stack * img_channels` input channels instead of `img_channels`."""
+    """Conv stack (same building blocks as ActorCriticEncoder: Conv3x3/SmallResBlock/
+    MaxPool2d), with `frame_stack * img_channels` input channels instead of `img_channels`,
+    followed by the DrQ-v2-style projection trunk (Linear -> LayerNorm -> Tanh, point 9 of the
+    reviewed plan): bounds the feature magnitude into the actor/critic MLPs regardless of raw
+    conv-feature scale, matching the known-stable DrQ-v2 design rather than feeding raw
+    (unnormalized) flattened conv features directly into the heads."""
 
     def __init__(self, cfg: DrQActorCriticConfig) -> None:
         super().__init__()
@@ -163,17 +209,26 @@ class DrQEncoder(nn.Module):
             layers.append(SmallResBlock(cfg.encoder_channels[max(0, i - 1)], cfg.encoder_channels[i]))
             if cfg.encoder_down[i]:
                 layers.append(nn.MaxPool2d(2))
-        self.encoder = nn.Sequential(*layers)
+        self.conv = nn.Sequential(*layers)
+        self.trunk = nn.Sequential(
+            nn.Linear(cfg.feature_dim, cfg.projection_dim),
+            nn.LayerNorm(cfg.projection_dim),
+            nn.Tanh(),
+        )
+
+    def conv_output_dim(self, x: Tensor) -> int:
+        return self.conv(x).flatten(start_dim=1).shape[1]
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.encoder(x).flatten(start_dim=1)
+        x = self.conv(x).flatten(start_dim=1)
+        return self.trunk(x)
 
 
 class DrQActor(nn.Module):
     def __init__(self, cfg: DrQActorCriticConfig) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(cfg.feature_dim, cfg.actor_hidden_dim),
+            nn.Linear(cfg.projection_dim, cfg.actor_hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(cfg.actor_hidden_dim, cfg.actor_hidden_dim),
             nn.ReLU(inplace=True),
@@ -181,10 +236,10 @@ class DrQActor(nn.Module):
         )
 
     def forward(self, features: Tensor) -> Tensor:
-        """Returns `mu`, already bounded to [-1, 1] via tanh -- see module docstring point 2:
-        the actor produces an already-bounded mean, exploration noise is added AROUND it by the
-        caller (sample_action / the target-policy-smoothing step in forward()), not baked in
-        here."""
+        """Returns `mu`, already bounded to [-1, 1] via tanh -- see the module docstring point
+        2: the actor produces an already-bounded mean, exploration noise is added AROUND it by
+        the caller (sample_action / the target-policy-smoothing step in critic_update), not
+        baked in here."""
         return torch.tanh(self.net(features))
 
 
@@ -192,7 +247,7 @@ class DrQQHead(nn.Module):
     def __init__(self, cfg: DrQActorCriticConfig) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(cfg.feature_dim + cfg.continuous_action_dim, cfg.critic_hidden_dim),
+            nn.Linear(cfg.projection_dim + cfg.continuous_action_dim, cfg.critic_hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(cfg.critic_hidden_dim, cfg.critic_hidden_dim),
             nn.ReLU(inplace=True),
@@ -206,7 +261,7 @@ class DrQQHead(nn.Module):
 class DrQCritic(nn.Module):
     """Twin Q-functions, Q1 and Q2, each its own DrQQHead -- no shared parameters between the
     two, matching DrQ-v2/TD3's overestimation-bias mitigation (conservative target estimation
-    via min(Q1, Q2), see DrQActorCritic.forward)."""
+    via min(Q1, Q2))."""
 
     def __init__(self, cfg: DrQActorCriticConfig) -> None:
         super().__init__()
@@ -223,6 +278,40 @@ def _soft_update(target: nn.Module, online: nn.Module, tau: float) -> None:
             p_target.lerp_(p_online, tau)
 
 
+class DrQPolicyBinding:
+    """Binds a shared DrQActorCritic to ONE specific env for ONE specific env_loop instance,
+    so cold-start seeding (which needs env.obs_buffer when available) is correctly scoped per
+    loop instead of living on the shared actor -- see the module docstring's "per-loop
+    isolation" section. Exposes exactly the surface coroutines.env_loop.make_env_loop /
+    coroutines.collector.make_collector need (predict_act_value, sample_action, initial_hx_cx,
+    lstm_dim, device), delegating all actual computation (and all trainable parameters) to the
+    wrapped model -- multiple bindings over the SAME DrQActorCritic share every weight, but
+    never share env references or cold-start state, because that state doesn't live on either
+    the binding or the model: predict_act_value derives it fresh from its own (obs, hx_cx, env)
+    arguments every call (see predict_act_value's docstring)."""
+
+    def __init__(self, model: "DrQActorCritic", env: Optional[Union[TorchEnv, WorldModelEnv]] = None) -> None:
+        self.model = model
+        self.env = env
+
+    @property
+    def lstm_dim(self) -> int:
+        return self.model.lstm_dim
+
+    @property
+    def device(self) -> torch.device:
+        return self.model.device
+
+    def initial_hx_cx(self, num_envs: int) -> Tuple[Tensor, Tensor]:
+        return self.model.initial_hx_cx(num_envs)
+
+    def predict_act_value(self, obs: Tensor, hx_cx: Tuple[Tensor, Tensor]):
+        return self.model.predict_act_value(obs, hx_cx, env=self.env)
+
+    def sample_action(self, dist_params: Tensor, deterministic: bool = False) -> Tuple[Tensor, Optional[Tensor]]:
+        return self.model.sample_action(dist_params, deterministic=deterministic)
+
+
 class DrQActorCritic(nn.Module):
     def __init__(self, cfg: DrQActorCriticConfig) -> None:
         super().__init__()
@@ -232,21 +321,22 @@ class DrQActorCritic(nn.Module):
         self.img_size = cfg.img_size
 
         # Required by env_loop.py's zero-init line (`torch.zeros(env.num_envs, model.lstm_dim,
-        # ...)`) -- see module docstring on why this repurposes the hx/cx slot for a frame stack
-        # instead of touching env_loop.py. Kept under this exact name for that reason alone.
+        # ...)`, only reached when initial_hx_cx is absent -- ActorCritic's own case) and by
+        # OUR OWN initial_hx_cx below. Kept under this name deliberately for zero env_loop.py
+        # diff on that specific line even though this model has no LSTM.
         self.lstm_dim = cfg.frame_stack * cfg.img_channels * cfg.img_size * cfg.img_size
 
         self.encoder = DrQEncoder(cfg)
         with torch.no_grad():
             dummy = torch.zeros(1, cfg.frame_stack * cfg.img_channels, cfg.img_size, cfg.img_size)
-            actual_feature_dim = self.encoder(dummy).shape[1]
+            actual_feature_dim = self.encoder.conv_output_dim(dummy)
         assert actual_feature_dim == cfg.feature_dim, (
             f"DrQActorCriticConfig.feature_dim={cfg.feature_dim} does not match the encoder's "
-            f"actual flattened output size {actual_feature_dim} for frame_stack={cfg.frame_stack}, "
-            f"img_channels={cfg.img_channels}, img_size={cfg.img_size}, "
+            f"actual flattened conv output size {actual_feature_dim} for frame_stack="
+            f"{cfg.frame_stack}, img_channels={cfg.img_channels}, img_size={cfg.img_size}, "
             f"encoder_channels={cfg.encoder_channels}, encoder_down={cfg.encoder_down} -- fix "
             f"feature_dim in config rather than letting a shape mismatch surface later inside "
-            f"DrQActor/DrQQHead's first Linear layer."
+            f"the trunk's first Linear layer."
         )
 
         self.actor = DrQActor(cfg)
@@ -265,30 +355,40 @@ class DrQActorCritic(nn.Module):
         # docstring for why this is checkpointed externally (by Trainer's ResumeFidelityState)
         # rather than through nn.Module's own state_dict. The generator itself is
         # component-isolated (utils.derive_torch_generator with a dedicated component id, see
-        # data.batch_sampler.COMPONENT_SEED_ID), set once setup_training runs -- never drawing
-        # from torch's shared global CPU/CUDA generator.
+        # data.batch_sampler.COMPONENT_SEED_ID) and MUST be constructed on the SAME device type
+        # actions are sampled on (torch.randn(..., device="cuda", generator=g) requires g to be
+        # a CUDA generator -- a CPU generator raises there) -- see
+        # utils.derive_torch_generator's `device` parameter, and setup_training below, which
+        # receives an already-correctly-constructed generator rather than building one itself
+        # (this module doesn't know its own eventual device until .to(device) has run).
         self.exploration_state = DrQExplorationState()
 
         self.env_loop = None
         self.rollout_hx_cx_state = RolloutHxCxState()
         self.loss_cfg = None
         self.intrinsic_reward_fn = None
-        self._rl_env = None
-
-        # One-shot gate for cold-start stack seeding -- see predict_act_value and
-        # _seed_cold_stack. Consumed (set False) by the very first predict_act_value call in
-        # this process, REGARDLESS of which call that happens to be, so it can never
-        # accidentally re-fire later and disturb the (already self-correcting, see
-        # _seed_cold_stack's docstring) dead-env burn-in mechanism.
-        self._cold_start_pending = True
-        # Cache of the cold-seeded t=0 stack, for forward()'s _reconstruct_stacks to reuse
-        # exactly rather than re-deriving it from obs_buffer (which has moved on by the time
-        # forward() runs) -- see _reconstruct_stacks' docstring.
-        self._cold_seeded_stack_flat: Optional[Tensor] = None
+        self._cached_rollout: Optional[Dict[str, Any]] = None
 
     @property
     def device(self) -> torch.device:
         return self.action_low.device
+
+    def initial_hx_cx(self, num_envs: int) -> Tuple[Tensor, Tensor]:
+        """NaN sentinel for "this loop's frame stack has never been seeded" -- deliberately NOT
+        zeros, which env_loop.py's dead-env reset_gate ALSO produces mid-rollout
+        (`hx = hx * reset_gate`). Using the same value for both would make predict_act_value
+        unable to tell "truly cold, needs real seeding from history" apart from "mid-rollout
+        reset, already being correctly rebuilt by the burn-in loop" -- see
+        predict_act_value's docstring for exactly why conflating them corrupts the burn-in
+        loop's own progressive state. NaN survives the zero-init/reset_gate distinction cleanly
+        because reset_gate only ever multiplies an ALREADY-real (non-NaN) hx -- by the time any
+        env can die, predict_act_value has already replaced its NaN with a real seeded value in
+        that same step (predict_act_value always runs before env.step() can trigger a death,
+        see env_loop.py's loop order), so NaN never has a chance to propagate through
+        `NaN * 0 = NaN`."""
+        hx = torch.full((num_envs, self.lstm_dim), float("nan"), device=self.device)
+        cx = torch.zeros(num_envs, 1, device=self.device)
+        return hx, cx
 
     def setup_training(
         self,
@@ -301,21 +401,24 @@ class DrQActorCritic(nn.Module):
             "DrQActorCritic must only ever be trained against a WorldModelEnv (imagined "
             "rollouts) -- see the module docstring and the project's exploration-boundary "
             "requirement: real transitions may drive real-env DATA COLLECTION via a separate "
-            "env_loop (see coroutines.collector.make_collector), but must never reach this "
-            "training env_loop."
+            "env_loop/DrQPolicyBinding (see coroutines.collector.make_collector and "
+            "make_collector_binding below), but must never reach this training env_loop."
         )
-        # DrQActorCritic requires frame_stack <= the world model's num_steps_conditioning: the
-        # dead-env burn-in mechanism in env_loop.py feeds exactly (num_steps_conditioning - 1)
-        # real context frames before normal stepping resumes, which is what makes the dead-env
-        # case self-correct to the right K-frame window without any special-casing (see
-        # _seed_cold_stack's docstring for the full trace) -- this is a config-level invariant
-        # (agent/drq.yaml's frame_stack vs agent/default.yaml's
-        # denoiser.inner_model.num_steps_conditioning), not something checkable here without
-        # WorldModelEnv exposing that value directly.
-        self._rl_env = rl_env
-        self.env_loop = make_env_loop(rl_env, self, hx_cx_state=self.rollout_hx_cx_state)
+        self.env_loop = make_env_loop(
+            rl_env, DrQPolicyBinding(self, env=rl_env), hx_cx_state=self.rollout_hx_cx_state
+        )
         self.loss_cfg = loss_cfg
         self.exploration_state.generator = noise_generator
+
+    def make_collector_binding(self, env: Optional[Union[TorchEnv, WorldModelEnv]] = None) -> DrQPolicyBinding:
+        """Constructs an INDEPENDENT DrQPolicyBinding for a real-env collector (train or test),
+        so its cold-start/frame-stack state is scoped to that collector's own env_loop instance
+        -- never shared with the imagined-training loop or with another collector (a separate
+        call for the train collector and the test collector each gets its own binding, hence
+        its own frame-stack initialization). `env` is typically a real TorchEnv (no obs_buffer),
+        so cold-start there falls back to repeating the current observation -- see
+        _seed_cold_stack's docstring."""
+        return DrQPolicyBinding(self, env=env)
 
     def set_intrinsic_reward_fn(self, fn) -> None:
         """Same hook/contract as ActorCritic.set_intrinsic_reward_fn -- substitutes the reward
@@ -329,8 +432,7 @@ class DrQActorCritic(nn.Module):
     def _shift_and_append(self, hx_flat: Tensor, obs: Tensor) -> Tensor:
         """hx_flat: (num_envs, frame_stack * C * H * W) flattened stack. obs: (num_envs, C, H,
         W) the single newest frame. Returns the new flattened stack with the oldest frame
-        dropped and `obs` appended as the newest -- the shared implementation used both during
-        rollout collection (predict_act_value) and loss-time reconstruction (forward)."""
+        dropped and `obs` appended as the newest."""
         n = hx_flat.size(0)
         stack = hx_flat.view(n, self.frame_stack, self.img_channels, self.img_size, self.img_size)
         stack = torch.cat([stack[:, 1:], obs.unsqueeze(1)], dim=1)
@@ -340,61 +442,63 @@ class DrQActorCritic(nn.Module):
         n = stack_flat.size(0)
         return stack_flat.view(n, self.frame_stack * self.img_channels, self.img_size, self.img_size)
 
-    def _seed_cold_stack(self, obs: Tensor) -> Tensor:
-        """Builds an initial K-frame stack from real history instead of zero-padding, for the
-        ONE case that genuinely has no other source of context: env_loop.py's very first
-        predict_act_value call in a truly fresh (non-resumed) process, made right after
-        env.reset() with hx still exactly zero-init. Prefers self._rl_env.obs_buffer's own
+    def _seed_cold_stack(self, obs: Tensor, env: Optional[Union[TorchEnv, WorldModelEnv]]) -> Tensor:
+        """Builds an initial K-frame stack from real history instead of zero-padding, for a
+        row detected as cold (see predict_act_value). Prefers `env.obs_buffer`'s own
         conditioning window (WorldModelEnv always maintains num_steps_conditioning >= K real
-        frames there, populated by generator_init's initial-condition draw, by the time
-        reset() returns) -- falling back to repeating `obs` K times only if obs_buffer isn't
-        available (e.g. this model were ever used with a plain TorchEnv real-env collector,
-        which is architecturally intended -- see the module/setup_training docstrings -- but
-        has no multi-frame buffer of its own).
-
-        This is NOT used for the dead-env mid-rollout reset case (env_loop.py's `dead.any()`
-        branch): that case is already self-correcting WITHOUT any special seeding. Trace: (1)
-        WorldModelEnv.step() calls self.reset_dead(dead) -- which fully updates obs_buffer for
-        those rows to the NEW episode's initial condition -- strictly BEFORE returning, so
-        info["burnin_obs"] already reflects the new episode only, zero old-episode leakage; (2)
-        env_loop.py's reset_gate zeroes hx (this model's stack) for dead rows; (3) the burn-in
-        loop feeds exactly (num_steps_conditioning - 1) real frames via ordinary
-        _shift_and_append calls; (4) the immediately-following normal step feeds one more (the
-        row's obs_buffer[:, -1]) -- num_steps_conditioning frames fed in total, so as long as
-        frame_stack <= num_steps_conditioning (see setup_training's docstring), the stack has
-        converged to exactly obs_buffer[dead, -frame_stack:] by the time normal action
-        selection resumes for those rows. No row's action is ever read mid-burn-in (env_loop.py
-        discards predict_act_value's mu/val there, keeping only the updated hx/cx), so the
-        transiently-incomplete intermediate stack never affects behavior. Special-casing this
-        path too, on top of the above, risks the opposite bug: overwriting the burn-in
-        loop's OWN progressive state mid-sequence and corrupting it."""
-        rl_env = self._rl_env
-        if rl_env is not None and hasattr(rl_env, "obs_buffer") and rl_env.obs_buffer.size(1) >= self.frame_stack:
-            return rl_env.obs_buffer[:, -self.frame_stack :].clone()
+        frames there by the time reset()/step() return) when `env` exposes one, falling back to
+        repeating `obs` K times otherwise (e.g. a plain TorchEnv real-env collector, which has
+        no multi-frame buffer of its own -- `[o0, o0, o0]` for K=3, per the reviewed plan)."""
+        if env is not None and hasattr(env, "obs_buffer") and env.obs_buffer.size(1) >= self.frame_stack:
+            return env.obs_buffer[:, -self.frame_stack :].clone()
         return obs.unsqueeze(1).repeat(1, self.frame_stack, 1, 1, 1)
 
     @torch.no_grad()
-    def predict_act_value(self, obs: Tensor, hx_cx: Tuple[Tensor, Tensor]):
-        """See env_loop.py's calling convention. `val` is an unused placeholder (DrQ bootstraps
-        exclusively from the target critics in forward(), never from this or val_bootstrap --
-        see module docstring). Always no_grad, regardless of ambient autograd context: this
-        call exists purely to pick an action and advance the frame stack during rollout
-        collection; forward() recomputes actor/critic outputs WITH gradient from the stored
-        (s, a, r, s') sequence separately, so building a graph here would be pure waste."""
+    def predict_act_value(
+        self, obs: Tensor, hx_cx: Tuple[Tensor, Tensor], env: Optional[Union[TorchEnv, WorldModelEnv]] = None
+    ):
+        """See env_loop.py's calling convention (via DrQPolicyBinding, which supplies `env`).
+        `val` is an unused placeholder (DrQ bootstraps exclusively from the target critics in
+        critic_update, never from this or val_bootstrap -- see module docstring). Always
+        no_grad, regardless of ambient autograd context: this call exists purely to pick an
+        action and advance the frame stack during rollout collection; critic_update/
+        actor_update recompute actor/critic outputs WITH gradient from the cached rollout
+        separately, so building a graph here would be pure waste.
+
+        Cold-start detection is PER-ROW and driven entirely by `hx` itself (via the NaN sentinel
+        from initial_hx_cx), never by any state stored on `self` -- this is what makes the
+        method safe to share across multiple independent loops (imagined training, real train
+        collection, real test collection) via DrQPolicyBinding: each loop's own `hx` variable
+        lives in that loop's own generator closure, so there is no cross-loop interference
+        possible even though they all call this same method on the same shared model.
+
+        A row is cold (needs _seed_cold_stack instead of ordinary shift-and-append) exactly
+        when `hx` for that row contains NaN. This happens in exactly one place: env_loop.py's
+        outer zero-init, via initial_hx_cx, before this loop's very first call ever (a true
+        fresh start, not a resume -- resumed hx comes from a checkpoint and is always real
+        floats). It does NOT happen during a mid-rollout dead-env reset: env_loop.py's
+        reset_gate zeroes hx with ordinary 0.0 (`hx = hx * reset_gate`), which is NOT NaN, so
+        this method correctly takes the ordinary shift-and-append path there and lets the
+        existing dead-env burn-in loop progressively rebuild the stack across
+        (num_steps_conditioning - 1) real context frames -- exactly reproducing
+        obs_buffer[dead, -frame_stack:] by the time normal stepping resumes, PROVIDED
+        frame_stack <= num_steps_conditioning (a config-level invariant, see setup_training's
+        docstring). Treating a reset_gate zero-out as "cold" here (an earlier, now-fixed
+        version of this method did, via a same-actor-wide one-shot flag) would short-circuit
+        that progressive rebuild with an immediately-correct answer that the REMAINING burn-in
+        iterations then corrupt by continuing to feed already-incorporated frames on top of it
+        -- traced in detail, not assumed; this is why NaN (never produced by reset_gate) is
+        used instead of a zero-valued heuristic."""
         hx, cx = hx_cx
-        if self._cold_start_pending:
-            self._cold_start_pending = False
-            if not self.rollout_hx_cx_state.initialized:
-                # Truly fresh process (not a resume with a valid restored stack, which would
-                # have rollout_hx_cx_state.initialized=True and hx already correct) -- see
-                # _seed_cold_stack's docstring.
-                seeded = self._seed_cold_stack(obs)
-                stack_flat = seeded.reshape(seeded.size(0), -1)
-                self._cold_seeded_stack_flat = stack_flat.clone()
-            else:
-                stack_flat = self._shift_and_append(hx, obs)
+        cold_mask = torch.isnan(hx).any(dim=1)
+        hx_clean = torch.nan_to_num(hx, nan=0.0)
+        shifted = self._shift_and_append(hx_clean, obs)
+        if cold_mask.any():
+            seeded = self._seed_cold_stack(obs, env)
+            seeded_flat = seeded.reshape(seeded.size(0), -1)
+            stack_flat = torch.where(cold_mask.unsqueeze(1), seeded_flat, shifted)
         else:
-            stack_flat = self._shift_and_append(hx, obs)
+            stack_flat = shifted
         features = self.encoder(self._flat_to_chw(stack_flat))
         mu = self.actor(features)  # already tanh-bounded, see DrQActor.forward
         val = torch.zeros(obs.size(0), device=obs.device)
@@ -409,12 +513,18 @@ class DrQActorCritic(nn.Module):
         return eps.clamp(-clip, clip)
 
     def sample_action(self, dist_params: Tensor, deterministic: bool = False) -> Tuple[Tensor, Optional[Tensor]]:
-        """dist_params here is `mu` (already tanh-bounded, from predict_act_value). Deterministic
-        eval returns `mu` rescaled with no noise (module docstring point 2). Training-time
-        sampling adds truncated-Gaussian exploration noise around mu in the bounded [-1, 1]
-        space, clamps back into [-1, 1], THEN rescales -- not the unbounded
-        `tanh(mean + std*eps)` DrQ-v2 explicitly avoids. `aux` (the `z` slot in the original
-        ActorCritic interface) is unused by DrQ's loss and returned as None."""
+        """dist_params here is `mu` (already tanh-bounded, from predict_act_value).
+        Deterministic eval returns `mu` rescaled with no noise. Training-time sampling adds
+        truncated-Gaussian exploration noise around mu in the bounded [-1, 1] space, clamps
+        back into [-1, 1], THEN rescales -- not the unbounded `tanh(mean + std*eps)` form.
+
+        Reads the current exploration std but NEVER advances the schedule counter (unlike an
+        earlier version of this method) -- this method is called from every env_loop that uses
+        this actor: imagined-rollout training collection, real-env train collection, real-env
+        test collection, AND deterministic evaluation. If it advanced schedule_step itself,
+        evaluation or real collection cadence would silently perturb subsequent TRAINING
+        exploration. The schedule advances exactly once per collect_rollout() call instead --
+        see that method's docstring."""
         mu = dist_params
         if deterministic:
             canonical = mu
@@ -422,135 +532,241 @@ class DrQActorCritic(nn.Module):
             std = _noise_std_at(self.cfg.noise_schedule, self.exploration_state.schedule_step)
             eps = self._sample_noise(mu.shape, std, self.cfg.noise_schedule.clip, mu.device)
             canonical = (mu + eps).clamp(-1.0, 1.0)
-            self.exploration_state.schedule_step += 1
         action = self._rescale(canonical).detach()
         return action, None
 
-    def _reconstruct_stacks(self, pre_stack_flat: Optional[Tensor], all_obs: Tensor) -> Tensor:
-        """all_obs: (num_envs, T, C, H, W), the single-frame-per-step sequence env_loop.py
-        returns. Rebuilds the EXACT K-frame stack predict_act_value saw at each step t, so the
-        critic loss pairs each action with the observation that actually produced it.
+    def _dense_final_obs(self, infos: List[dict], end: Tensor, trunc: Tensor, all_obs: Tensor) -> Tensor:
+        """(num_envs, T, C, H, W): the TRUE final observation at each dead step, scattered into
+        the dead rows only (live rows hold a harmless placeholder -- that step's ordinary
+        all_obs -- never read for live rows, since the bootstrap-source selection in
+        _compute_bootstrap_info only consults this at rows/steps it has already identified as
+        dead)."""
+        dense = all_obs.clone()
+        T = end.size(1)
+        for k in range(T):
+            dead_k = torch.logical_or(end[:, k].bool(), trunc[:, k].bool())
+            if dead_k.any() and "final_observation" in infos[k]:
+                dense[dead_k, k] = infos[k]["final_observation"]
+        return dense
 
-        Normal case (pre_stack_flat is not None, i.e. rollout_hx_cx_state was already
-        initialized going into this env_loop.send() call): shift-and-append all_obs onto
-        pre_stack_flat, step by step -- exactly what predict_act_value did.
-
-        Cold-start case (pre_stack_flat is None, the very first rollout call in this process):
-        predict_act_value's t=0 call did NOT shift-and-append -- it called _seed_cold_stack,
-        reading self._rl_env.obs_buffer directly. That buffer has since moved on (mutated by
-        every env.step() call during THIS rollout), so it can't be re-read here to recover
-        what it held at t=0 -- instead this reuses self._cold_seeded_stack_flat, the exact
-        value predict_act_value cached at the time. t=1 onward then proceeds by ordinary
-        shift-and-append from that cached starting point, same as the normal case."""
-        n, t, c, h, w = all_obs.shape
-        if pre_stack_flat is not None:
-            stack = pre_stack_flat.view(n, self.frame_stack, c, h, w)
-            stacks = []
-            for step in range(t):
-                stack = torch.cat([stack[:, 1:], all_obs[:, step].unsqueeze(1)], dim=1)
-                stacks.append(stack)
-            return torch.stack(stacks, dim=1)  # (n, t, frame_stack, c, h, w)
-
-        assert self._cold_seeded_stack_flat is not None, (
-            "forward() has no pre_stack_flat (rollout_hx_cx_state was never initialized) but "
-            "also no cached cold-seeded stack -- predict_act_value must run, via "
-            "env_loop.send(), before _reconstruct_stacks is called"
-        )
-        stack = self._cold_seeded_stack_flat.view(n, self.frame_stack, c, h, w)
-        stacks = [stack.clone()]
-        for step in range(1, t):
-            stack = torch.cat([stack[:, 1:], all_obs[:, step].unsqueeze(1)], dim=1)
-            stacks.append(stack)
-        return torch.stack(stacks, dim=1)
-
-    def _n_step_returns(
-        self, rew: Tensor, end: Tensor, trunc: Tensor, gamma: float, n: int, usable: int
-    ) -> Tuple[Tensor, Tensor]:
-        """rew/end/trunc: (num_envs, T). Returns (n_step_return, not_done_mask), both (num_envs,
-        usable) -- not_done_mask is 0 wherever the episode ended/truncated at or before t+n-1
-        (so the target critic's bootstrap term at s_(t+n) is zeroed out for those rows), 1
-        otherwise. Pure reward accumulation with early stopping on end/trunc, no dependence on
-        any value head."""
+    def _accumulate_rewards(self, rew: Tensor, end: Tensor, trunc: Tensor, gamma: float, n: int, usable: int) -> Tensor:
+        """Reward accumulation does NOT need the end-vs-trunc distinction (module point 2,
+        Q&A): the reward AT a dead step (whichever kind) is a real reward and always counts;
+        rewards strictly AFTER a dead step never count, since that row's subsequent frames
+        belong to a different (reset) episode regardless of why the reset happened. Only the
+        BOOTTRAP source/validity (_compute_bootstrap_info) depends on end vs trunc."""
         num_envs = rew.size(0)
         returns = torch.zeros(num_envs, usable, device=rew.device, dtype=rew.dtype)
-        not_done = torch.ones(num_envs, usable, device=rew.device, dtype=rew.dtype)
-        alive = torch.ones(num_envs, usable, device=rew.device, dtype=torch.bool)
+        alive = torch.ones(num_envs, usable, dtype=torch.bool, device=rew.device)
         for k in range(n):
             returns = returns + alive.to(rew.dtype) * (gamma ** k) * rew[:, k : k + usable]
             dead_this_step = torch.logical_or(end[:, k : k + usable].bool(), trunc[:, k : k + usable].bool())
             alive = alive & (~dead_this_step)
-        not_done = alive.to(rew.dtype)
-        return returns, not_done
+        return returns
 
-    def forward(self) -> LossAndLogs:
-        """Trains exclusively on the imagined rollout `self.env_loop.send()` just produced --
-        NOT a persistent replay buffer (see module docstring: direct fresh imagined batches are
-        the approved initial design). Every observation/action/reward here originates from
-        WorldModelEnv.step() (see setup_training's assertion); real environment transitions
-        never reach this method -- they only ever pass through coroutines.collector's SEPARATE
-        env_loop instance, which trains nothing.
+    def _compute_bootstrap_info(
+        self,
+        all_hx: Tensor,
+        all_obs: Tensor,
+        end: Tensor,
+        trunc: Tensor,
+        infos: List[dict],
+        n: int,
+        usable: int,
+    ) -> Tuple[Tensor, Tensor]:
+        """For each starting index t in [0, usable), walks k=0..n-1 to find the FIRST dead event
+        (end or trunc) within [t, t+n-1], if any, producing:
+
+          - `not_done`: (num_envs, usable) -- 0 wherever a TRUE termination (end=True) occurred
+            at or before t+n-1 (matching this codebase's existing compute_lambda_returns
+            convention in the original ActorCritic: end[i]=1 means bootstrapping from the state
+            AFTER step i is invalid); 1 otherwise -- INCLUDING when the only dead event in the
+            window was a truncation. Truncation-only windows still bootstrap (module point 2):
+            reaching WorldModelEnv's imagined-rollout horizon is not a true terminal env state.
+
+          - `bootstrap_stack_flat`: (num_envs, usable, hx_dim) -- the K-frame stack to evaluate
+            the target critic at. Three cases per row/t:
+              * window survives fully (no end/trunc in [t, t+n-1]): all_hx[:, t+n] -- the exact
+                state n steps ahead, the same state action-time computation used there.
+              * window's only dead event is a truncation at t+k (k<n): the stack AT THE POINT
+                OF TRUNCATION, built from all_hx[:, t+k] (the pre-truncation stack that produced
+                the action taken at t+k) shifted with the TRUE final observation
+                (_dense_final_obs[:, t+k]) -- NOT all_hx[:, t+n], which after WorldModelEnv's
+                reset_dead() reflects an unrelated, freshly-reset episode's early frames.
+              * window contains a true termination: this value is masked to 0 by not_done and
+                is never read, so it's left at whatever partial/placeholder value the loop
+                produced (harmless).
+
+        End takes priority over trunc if a row's `end` and `trunc` are ever simultaneously true
+        at the same step (shouldn't normally happen, but resolved deterministically either way).
         """
-        c = self.loss_cfg
-        pre_stack_flat = self.rollout_hx_cx_state.hx.clone() if self.rollout_hx_cx_state.initialized else None
+        num_envs = all_hx.size(0)
+        hx_dim = all_hx.size(-1)
+        dense_final_obs = self._dense_final_obs(infos, end, trunc, all_obs)
 
-        all_obs, act, rew, end, trunc, _dist_params, _val, _val_bootstrap, _z, infos = self.env_loop.send(c.backup_every)
+        not_done = torch.ones(num_envs, usable, dtype=all_hx.dtype, device=all_hx.device)
+        bootstrap_stack_flat = torch.zeros(num_envs, usable, hx_dim, dtype=all_hx.dtype, device=all_hx.device)
+
+        for t in range(usable):
+            resolved = torch.zeros(num_envs, dtype=torch.bool, device=all_hx.device)
+            for k in range(n):
+                step = t + k
+                end_k = end[:, step].bool()
+                trunc_k = trunc[:, step].bool()
+                newly_end = end_k & ~resolved
+                newly_trunc = trunc_k & ~end_k & ~resolved
+
+                if newly_end.any():
+                    not_done[newly_end, t] = 0.0
+                    resolved = resolved | newly_end
+
+                if newly_trunc.any():
+                    trunc_stack = self._shift_and_append(all_hx[:, step], dense_final_obs[:, step])
+                    bootstrap_stack_flat[newly_trunc, t] = trunc_stack[newly_trunc]
+                    resolved = resolved | newly_trunc
+
+            still_alive = ~resolved
+            if still_alive.any():
+                bootstrap_stack_flat[still_alive, t] = all_hx[still_alive, t + n]
+
+        return not_done, bootstrap_stack_flat
+
+    def collect_rollout(self) -> None:
+        """Runs ONE env_loop.send() -- a fresh imagined rollout, always from a WorldModelEnv
+        (see setup_training's assertion) -- and caches everything critic_update/actor_update
+        need. Every observation/action/reward here originates from WorldModelEnv.step(); real
+        environment transitions never reach this method (they only ever pass through
+        coroutines.collector's SEPARATE env_loop/DrQPolicyBinding, which trains nothing -- see
+        make_collector_binding).
+
+        Also advances the exploration-noise schedule exactly once per call -- see
+        DrQExplorationState/sample_action's docstrings for why this, not sample_action itself,
+        is the training cadence hook."""
+        c = self.loss_cfg
+        all_obs, act, rew, end, trunc, _dist_params, _val, _val_bootstrap, _z, all_hx, infos = self.env_loop.send(
+            c.backup_every
+        )
 
         if self.intrinsic_reward_fn is not None:
             rew = self.intrinsic_reward_fn(infos, rew)
 
-        stacks = self._reconstruct_stacks(pre_stack_flat, all_obs)  # (n, T, K, C, H, W)
-        num_envs, T = all_obs.size(0), all_obs.size(1)
         n = c.n_step
+        T = all_obs.size(1)
         usable = T - n
         assert usable > 0, f"n_step={n} must be < backup_every={T} so s_(t+n) is available within the rollout"
 
-        def chw(x):  # (n, K, C, H, W) -> (n, K*C, H, W)
-            return x.reshape(x.size(0), -1, self.img_size, self.img_size)
+        num_envs = all_obs.size(0)
 
-        s_t = torch.stack([chw(stacks[:, t]) for t in range(usable)], dim=1)  # (n, usable, K*C,H,W)
-        s_tpn = torch.stack([chw(stacks[:, t + n]) for t in range(usable)], dim=1)
+        def chw(stack_flat: Tensor) -> Tensor:
+            return stack_flat.view(-1, self.frame_stack * self.img_channels, self.img_size, self.img_size)
+
+        s_t = torch.stack([chw(all_hx[:, t]) for t in range(usable)], dim=1)  # (n, usable, K*C, H, W)
         a_t = act[:, :usable]
 
-        returns, not_done = self._n_step_returns(rew, end, trunc, c.gamma, n, usable)
+        returns = self._accumulate_rewards(rew, end, trunc, c.gamma, n, usable)
+        not_done, bootstrap_stack_flat = self._compute_bootstrap_info(all_hx, all_obs, end, trunc, infos, n, usable)
 
-        s_t_flat = s_t.reshape(num_envs * usable, *s_t.shape[2:])
-        s_tpn_flat = s_tpn.reshape(num_envs * usable, *s_tpn.shape[2:])
-        a_t_flat = a_t.reshape(num_envs * usable, -1)
+        self._cached_rollout = {
+            "s_t": s_t,
+            "a_t": a_t,
+            "returns": returns,
+            "not_done": not_done,
+            "bootstrap_stack_flat": bootstrap_stack_flat,
+            "gamma_n": c.gamma ** n,
+            "num_envs": num_envs,
+            "usable": usable,
+        }
+        self.exploration_state.schedule_step += 1
+
+    def _set_critic_requires_grad(self, flag: bool) -> None:
+        for p in self.critic.parameters():
+            p.requires_grad_(flag)
+
+    def critic_update(self, opt_critic: torch.optim.Optimizer) -> Dict[str, Any]:
+        """Critic + encoder optimization step, using the rollout collect_rollout() most
+        recently cached: encode s_t (grad-tracked -- this is what trains the encoder), compute
+        the TD target under no_grad from the target critics ONLY (never val/val_bootstrap, see
+        module docstring), Bellman loss, backward, step. Target-critic soft update happens
+        AFTER opt_critic.step() (not before) -- moving targets before the online critic's own
+        update would make them lag the CURRENT step's update by an extra full step, silently
+        tracking one step stale forever."""
+        assert self._cached_rollout is not None, "call collect_rollout() before critic_update()"
+        r = self._cached_rollout
+        num_envs, usable = r["num_envs"], r["usable"]
+
+        s_t_flat = r["s_t"].reshape(num_envs * usable, *r["s_t"].shape[2:])
+        a_t_flat = r["a_t"].reshape(num_envs * usable, -1)
+        bootstrap_flat = r["bootstrap_stack_flat"].reshape(num_envs * usable, -1)
+        not_done_flat = r["not_done"].reshape(-1)
+        returns_flat = r["returns"].reshape(-1)
+        gamma_n = r["gamma_n"]
 
         s_t_aug = self.aug(s_t_flat)
-        s_tpn_aug = self.aug(s_tpn_flat)
+        bootstrap_aug = self.aug(self._flat_to_chw(bootstrap_flat))
 
-        features_t = self.encoder(s_t_aug)  # grad-tracked -- this is what trains the encoder
+        features_t = self.encoder(s_t_aug)
         q1, q2 = self.critic(features_t, a_t_flat)
 
         with torch.no_grad():
-            features_tpn = self.encoder(s_tpn_aug)
-            mu_tpn = self.actor(features_tpn)
+            features_boot = self.encoder(bootstrap_aug)
+            mu_boot = self.actor(features_boot)
             noise_std = _noise_std_at(self.cfg.noise_schedule, self.exploration_state.schedule_step)
-            eps = self._sample_noise(mu_tpn.shape, noise_std, c.noise_clip, mu_tpn.device)
-            a_tpn = (mu_tpn + eps).clamp(-1.0, 1.0)
-            tq1, tq2 = self.target_critic(features_tpn, a_tpn)
+            eps = self._sample_noise(mu_boot.shape, noise_std, self.loss_cfg.noise_clip, mu_boot.device)
+            a_boot = (mu_boot + eps).clamp(-1.0, 1.0)
+            tq1, tq2 = self.target_critic(features_boot, a_boot)
             target_q = torch.min(tq1, tq2)
-            td_target = returns.reshape(-1) + (c.gamma ** n) * not_done.reshape(-1) * target_q
+            td_target = returns_flat + gamma_n * not_done_flat * target_q
 
         loss_critic = F.mse_loss(q1, td_target) + F.mse_loss(q2, td_target)
 
-        features_t_detached = features_t.detach()  # actor never trains the encoder, see module docstring
-        mu_online = self.actor(features_t_detached)
-        q1_pi, q2_pi = self.critic(features_t_detached, mu_online)
-        loss_actor = -torch.min(q1_pi, q2_pi).mean()
+        opt_critic.zero_grad()
+        loss_critic.backward()
+        opt_critic.step()
 
-        loss = loss_critic + loss_actor
+        _soft_update(self.target_critic, self.critic, self.loss_cfg.target_tau)
 
-        _soft_update(self.target_critic, self.critic, c.target_tau)
+        # Stash the raw (un-augmented) s_t for actor_update's own, independent augmentation +
+        # fresh encoder forward pass (at the just-updated encoder weights) -- see
+        # actor_update's docstring for why it recomputes rather than reusing features_t as-is.
+        self._cached_rollout["s_t_flat_for_actor"] = s_t_flat
 
-        metrics = {
+        return {
             "loss_critic": loss_critic.detach(),
-            "loss_actor": loss_actor.detach(),
-            "loss_total": loss.detach(),
             "q1_mean": q1.detach().mean(),
             "q2_mean": q2.detach().mean(),
             "target_q_mean": target_q.detach().mean(),
-            "noise_std": torch.tensor(noise_std),
         }
-        return loss, metrics
+
+    def actor_update(self, opt_actor: torch.optim.Optimizer) -> Dict[str, Any]:
+        """Actor optimization step: fresh encoder forward (at the encoder's POST-critic-update
+        weights -- critic_update's own opt_critic.step() already ran), features detached before
+        the actor even sees them (so no gradient from this step can reach the encoder), and the
+        critic's OWN parameters are explicitly frozen (requires_grad_(False)) for the duration
+        of this step's backward pass -- not merely relying on opt_actor containing only actor
+        parameters, but actively preventing any gradient computation into critic parameters at
+        all, so `loss_actor.backward()` cannot populate a stray `.grad` on them under any
+        circumstance. Consumes (clears) the cached rollout afterward, so a stale rollout can
+        never accidentally be reused by a subsequent call without an intervening
+        collect_rollout()."""
+        assert self._cached_rollout is not None and "s_t_flat_for_actor" in self._cached_rollout, (
+            "call collect_rollout() then critic_update() before actor_update()"
+        )
+        s_t_flat = self._cached_rollout["s_t_flat_for_actor"]
+        s_t_aug = self.aug(s_t_flat)
+
+        features = self.encoder(s_t_aug).detach()
+        mu = self.actor(features)
+
+        self._set_critic_requires_grad(False)
+        try:
+            q1_pi, q2_pi = self.critic(features, mu)
+            loss_actor = -torch.min(q1_pi, q2_pi).mean()
+
+            opt_actor.zero_grad()
+            loss_actor.backward()
+            opt_actor.step()
+        finally:
+            self._set_critic_requires_grad(True)
+
+        self._cached_rollout = None
+        return {"loss_actor": loss_actor.detach()}

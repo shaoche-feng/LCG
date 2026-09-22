@@ -56,6 +56,13 @@ def make_env_loop(
     resuming = hx_cx_state is not None and hx_cx_state.initialized
     if resuming:
         hx, cx = hx_cx_state.hx, hx_cx_state.cx
+    elif hasattr(model, "initial_hx_cx"):
+        # Optional model-provided override of the zero-init below -- e.g. DrQActorCritic uses
+        # this to seed a NaN sentinel instead of zeros, so predict_act_value can reliably tell
+        # "never touched, needs real seeding" apart from a mid-rollout reset_gate zero-out
+        # (see DrQActorCritic.initial_hx_cx's docstring). Absent for every other model
+        # (ActorCritic doesn't define this), so this branch changes nothing for them.
+        hx, cx = model.initial_hx_cx(env.num_envs)
     else:
         hx = torch.zeros(env.num_envs, model.lstm_dim, device=model.device)
         cx = torch.zeros(env.num_envs, model.lstm_dim, device=model.device)
@@ -74,6 +81,14 @@ def make_env_loop(
 
         while n < num_steps:
             logits_act, val, (hx, cx) = model.predict_act_value(obs, (hx, cx))
+            # Captured HERE, immediately after the call that actually produced logits_act/act
+            # for THIS step -- NOT the `hx` variable read later when building this step's row
+            # (all_.append below), which by then may have been overwritten by the dead-env
+            # reset_gate/burn-in handling for the NEXT step. Recording the wrong one would make
+            # a caller reconstructing "the state that produced each action" (see
+            # models.drq_actor_critic's collect_rollout) see the state AFTER a mid-rollout
+            # reset instead of the state that was actually used.
+            action_time_hx = hx
             act, z = model.sample_action(logits_act)
 
             if random.random() < epsilon:
@@ -106,7 +121,7 @@ def make_env_loop(
                     for i in range(burnin_obs.size(1)):
                         _, _, (hx[dead], cx[dead]) = model.predict_act_value(burnin_obs[:, i], (hx[dead], cx[dead]))
 
-            all_.append([obs, act, rew, end, trunc, logits_act, val, z, None])
+            all_.append([obs, act, rew, end, trunc, logits_act, val, z, action_time_hx, None])
             infos.append(info)
 
             obs = next_obs
@@ -135,6 +150,17 @@ def make_env_loop(
             # action space is discrete -- sample_action() only returns it for continuous_action.
             return None if x[0] is None else torch.stack(x, dim=1)
 
-        all_obs, act, rew, end, trunc, logits_act, val, z, val_bootstrap = (_maybe_stack(x) for x in zip(*all_))
+        all_obs, act, rew, end, trunc, logits_act, val, z, all_hx, val_bootstrap = (
+            _maybe_stack(x) for x in zip(*all_)
+        )
 
-        num_steps = yield all_obs, act, rew, end, trunc, logits_act, val, val_bootstrap, z, infos
+        # all_hx: (num_envs, num_steps, *hx_shape) -- the exact per-step model state (hx, BEFORE
+        # any dead-env reset_gate/burn-in touches it for the FOLLOWING step) that produced each
+        # step's action. Added so a caller that needs to reproduce action-time state exactly at
+        # loss-computation time (e.g. DrQActorCritic's frame stack across mid-rollout resets)
+        # doesn't have to re-derive it from obs alone -- see models.drq_actor_critic's forward()
+        # docstring. Positioned before `infos` (not appended after it) so existing callers using
+        # `*_, [infos] = env_loop.send(...)` (coroutines.collector.make_collector) are
+        # unaffected; callers unpacking every field individually (ActorCritic.forward) need one
+        # extra placeholder added for it.
+        num_steps = yield all_obs, act, rew, end, trunc, logits_act, val, val_bootstrap, z, all_hx, infos

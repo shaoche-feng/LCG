@@ -270,7 +270,10 @@ class ActorCritic(nn.Module):
 
     def forward(self) -> LossAndLogs:
         c = self.loss_cfg
-        _, act, rew, end, trunc, logits_act, val, val_bootstrap, z, infos = self.env_loop.send(c.backup_every)
+        # `_all_hx` (introduced for models.drq_actor_critic's exact-mid-rollout-reset
+        # reconstruction, see env_loop.py's yield docstring) is unused here -- ActorCritic's
+        # own hx/cx aren't needed after the rollout, only during it.
+        _, act, rew, end, trunc, logits_act, val, val_bootstrap, z, _all_hx, infos = self.env_loop.send(c.backup_every)
 
         if self.intrinsic_reward_fn is not None:
             rew = self.intrinsic_reward_fn(infos, rew)

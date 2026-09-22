@@ -345,8 +345,11 @@ def derive_component_seed(base_seed: int, component_id: int) -> np.random.SeedSe
     return np.random.SeedSequence([base_seed, component_id])
 
 
-def derive_torch_generator(base_seed: int, component_id: int) -> torch.Generator:
-    """Deterministic, component-isolated torch.Generator for a DataLoader's own `generator=`
+def derive_torch_generator(
+    base_seed: int, component_id: int, device: Optional[Union[str, "torch.device"]] = None
+) -> torch.Generator:
+    """Deterministic, component-isolated torch.Generator. `device=None` (default) gives a CPU
+    generator -- this is what every existing caller needs: a DataLoader's own `generator=`
     argument -- NOT the BatchSampler's own RNG (that already uses derive_component_seed via a
     separate numpy Generator). Without an explicit generator, torch.utils.data.DataLoader
     (even with num_workers=0 and a custom batch_sampler) still draws one CPU-RNG value on
@@ -361,10 +364,15 @@ def derive_torch_generator(base_seed: int, component_id: int) -> torch.Generator
     to the continuing run from that point on, with no relation to correctness of any restored
     state. Seeding this generator deterministically from the same component-seed derivation
     used elsewhere makes `_base_seed` reproducible AND independent of the global stream,
-    eliminating the interference entirely rather than working around its timing."""
+    eliminating the interference entirely rather than working around its timing.
+
+    `device` matters for a DIFFERENT use (models.drq_actor_critic's exploration-noise
+    generator): `torch.randn(..., device="cuda", generator=g)` requires `g` to itself be a CUDA
+    generator -- a CPU torch.Generator raises a device-mismatch error there. Passing
+    `device="cuda"` (or a specific CUDA device) here returns a generator usable for that."""
     seed_seq = derive_component_seed(base_seed, component_id)
     seed_int = int(seed_seq.generate_state(1, dtype=np.uint64)[0])
-    generator = torch.Generator()
+    generator = torch.Generator(device=device) if device is not None else torch.Generator()
     generator.manual_seed(seed_int)
     return generator
 
