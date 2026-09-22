@@ -194,10 +194,16 @@ class DrQActorCriticConfig:
     projection_dim: int  # EACH of actor's/critic's own trunk output size, see module docstring
     actor_hidden_dim: int
     critic_hidden_dim: int
-    continuous_action_dim: int
-    action_low: List[float]
-    action_high: List[float]
     noise_schedule: NoiseScheduleConfig
+    # Left unset (None) in config/agent/drq.yaml and patched onto an already-constructed
+    # DrQActorCriticConfig instance by AgentConfig.__post_init__ (agent.py), exactly mirroring
+    # ActorCriticConfig's own continuous_action_dim/action_low/action_high fields -- see that
+    # class's docstring note for why this has to happen post-hoc rather than in a
+    # __post_init__ here (hydra's bottom-up instantiate() builds this dataclass, action-space
+    # kwargs included, before AgentConfig.__post_init__ runs).
+    continuous_action_dim: Optional[int] = None
+    action_low: Optional[List[float]] = None
+    action_high: Optional[List[float]] = None
     use_augmentation: bool = True
     augmentation_pad: int = 4
 

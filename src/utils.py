@@ -95,6 +95,30 @@ class CommonTools(StateDictMixin):
         return setattr(self, name, value)
 
 
+class CheckpointableGroup:
+    """Wraps several independently-checkpointable objects (e.g. DrQActorCritic's separate
+    opt_critic/opt_actor optimizers, which have no single combined torch.optim.Optimizer) as
+    ONE object exposing state_dict()/load_state_dict(), so a single-slot-per-component
+    checkpoint container (e.g. Trainer's self.opt = CommonTools(...), whose "actor_critic"
+    field holds either a plain AdamW for ActorCritic or one of these for DrQActorCritic) can
+    checkpoint it transparently via StateDictMixin's ordinary has_sd auto-discovery, without
+    that container needing to know how many underlying optimizers the component actually has.
+    Access the wrapped objects by the same names used to construct it, e.g.
+    CheckpointableGroup(critic=opt_critic, actor=opt_actor).critic."""
+
+    def __init__(self, **items: Any) -> None:
+        self._items = items
+        for k, v in items.items():
+            setattr(self, k, v)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {k: v.state_dict() for k, v in self._items.items()}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        for k, v in self._items.items():
+            v.load_state_dict(state_dict[k])
+
+
 def broadcast_if_needed(*args):
     objects = list(args)
     if dist.is_initialized():

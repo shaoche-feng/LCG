@@ -8,6 +8,7 @@ import torch.nn as nn
 from envs import TorchEnv, WorldModelEnv
 from models.actor_critic import ActorCritic, ActorCriticConfig, ActorCriticLossConfig
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
+from models.drq_actor_critic import DrQActorCritic, DrQActorCriticConfig, DrQLossConfig
 from models.rew_end_model import RewEndModel, RewEndModelConfig
 from utils import extract_state_dict
 
@@ -16,7 +17,10 @@ from utils import extract_state_dict
 class AgentConfig:
     denoiser: DenoiserConfig
     rew_end_model: RewEndModelConfig
-    actor_critic: ActorCriticConfig
+    # Which class this resolves to (ActorCriticConfig vs DrQActorCriticConfig) is driven by the
+    # `_target_` in config/agent/*.yaml's actor_critic section -- see Agent.__init__'s dispatch
+    # on the resolved type.
+    actor_critic: Union[ActorCriticConfig, DrQActorCriticConfig]
     num_actions: Optional[int] = None  # discrete action count, e.g. Atari
     continuous_action_dim: Optional[int] = None  # continuous action dimension, e.g. DM Control
     action_low: Optional[List[float]] = None  # required iff continuous_action_dim is set
@@ -36,11 +40,16 @@ class AgentConfig:
         self.rew_end_model.continuous_action_dim = self.continuous_action_dim
         self.rew_end_model.continuous_reward = self.continuous_reward
 
-        self.actor_critic.num_actions = self.num_actions
         self.actor_critic.continuous_action_dim = self.continuous_action_dim
         self.actor_critic.action_low = self.action_low
         self.actor_critic.action_high = self.action_high
-        self.actor_critic.continuous_reward = self.continuous_reward
+        if isinstance(self.actor_critic, ActorCriticConfig):
+            # DrQActorCriticConfig has no num_actions/continuous_reward fields: DrQ is
+            # continuous-action-only (see models.drq_actor_critic's module docstring) and its
+            # TD target always uses raw rewards directly (no discrete reward-sign-clipping
+            # branch), so neither has a DrQ equivalent to populate.
+            self.actor_critic.num_actions = self.num_actions
+            self.actor_critic.continuous_reward = self.continuous_reward
 
 
 def get_action_space_kwargs(env: TorchEnv) -> Dict[str, Any]:
@@ -73,7 +82,16 @@ class Agent(nn.Module):
         super().__init__()
         self.denoiser = Denoiser(cfg.denoiser)
         self.rew_end_model = RewEndModel(cfg.rew_end_model)
-        self.actor_critic = ActorCritic(cfg.actor_critic)
+        # Dispatches on the resolved config TYPE (set by config/agent/*.yaml's actor_critic
+        # `_target_`), not an explicit flag -- cfg.actor_critic is already a fully-instantiated
+        # ActorCriticConfig or DrQActorCriticConfig by the time Agent.__init__ runs (Hydra's
+        # instantiate() resolves nested _target_s bottom-up before AgentConfig.__post_init__
+        # even runs), so this is a plain, ordinary isinstance check, not polymorphic Hydra
+        # instantiation of the model itself.
+        if isinstance(cfg.actor_critic, DrQActorCriticConfig):
+            self.actor_critic = DrQActorCritic(cfg.actor_critic)
+        else:
+            self.actor_critic = ActorCritic(cfg.actor_critic)
 
     @property
     def device(self):
@@ -82,11 +100,20 @@ class Agent(nn.Module):
     def setup_training(
         self,
         sigma_distribution_cfg: SigmaDistributionConfig,
-        actor_critic_loss_cfg: ActorCriticLossConfig,
+        actor_critic_loss_cfg: Union[ActorCriticLossConfig, DrQLossConfig],
         rl_env: Union[TorchEnv, WorldModelEnv],
+        actor_critic_noise_generator: Optional[torch.Generator] = None,
     ) -> None:
         self.denoiser.setup_training(sigma_distribution_cfg)
-        self.actor_critic.setup_training(rl_env, actor_critic_loss_cfg)
+        if isinstance(self.actor_critic, DrQActorCritic):
+            assert actor_critic_noise_generator is not None, (
+                "DrQActorCritic.setup_training requires an explicit noise_generator for the "
+                "imagined-training loop's own exploration stream -- see "
+                "data.batch_sampler.COMPONENT_SEED_ID's drq_imagination_noise id."
+            )
+            self.actor_critic.setup_training(rl_env, actor_critic_loss_cfg, actor_critic_noise_generator)
+        else:
+            self.actor_critic.setup_training(rl_env, actor_critic_loss_cfg)
 
     def load(
         self,

@@ -1,0 +1,53 @@
+_target_: agent.AgentConfig
+
+# Identical to config/agent/default.yaml's denoiser/rew_end_model sections -- DrQ only replaces
+# actor_critic (see agent.Agent.__init__'s dispatch on actor_critic's resolved config type).
+denoiser:
+  _target_: models.diffusion.DenoiserConfig
+  sigma_data: 0.5
+  sigma_offset_noise: 0.3
+  inner_model:
+    _target_: models.diffusion.InnerModelConfig
+    img_channels: 3
+    num_steps_conditioning: 4
+    cond_channels: 256
+    depths: [2,2,2,2]
+    channels: [64,64,64,64]
+    attn_depths: [0,0,0,0]
+
+rew_end_model:
+  _target_: models.rew_end_model.RewEndModelConfig
+  lstm_dim: 512
+  img_channels: ${agent.denoiser.inner_model.img_channels}
+  img_size: ${env.train.size}
+  cond_channels: 128
+  depths: [2,2,2,2]
+  channels: [32,32,32,32]
+  attn_depths: [0,0,0,0]
+
+actor_critic:
+  _target_: models.drq_actor_critic.DrQActorCriticConfig
+  img_channels: ${agent.denoiser.inner_model.img_channels}
+  img_size: ${env.train.size}
+  frame_stack: 3
+  # Same conv-encoder shape as config/agent/default.yaml's actor_critic.channels/down, for a
+  # roughly comparable encoder size -- feature_dim below is this encoder's ACTUAL flattened
+  # output for img_size=64 (env.train.size's project default), verified against
+  # DrQEncoder directly (64x64 -> 4 MaxPool2d(2) downsamples -> 4x4 spatial, 64 final
+  # channels -> 64*4*4). DrQActorCritic.__init__ asserts this matches the real encoder output
+  # at construction time, so a mismatch here (e.g. from changing img_size or channels/down
+  # without updating this) fails loudly rather than silently.
+  encoder_channels: [32,32,64,64]
+  encoder_down: [1,1,1,1]
+  feature_dim: 1024
+  projection_dim: 128
+  actor_hidden_dim: 256
+  critic_hidden_dim: 256
+  noise_schedule:
+    _target_: models.drq_actor_critic.NoiseScheduleConfig
+    std_start: 1.0
+    std_end: 0.1
+    decay_steps: 100000
+    clip: 0.3
+  use_augmentation: True
+  augmentation_pad: 4

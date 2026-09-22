@@ -9,6 +9,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 import wandb
@@ -20,9 +21,11 @@ from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraver
 from data.batch_sampler import COMPONENT_SEED_ID
 from envs import make_atari_env, make_dm_control_env, WorldModelEnv
 from lcg import LCGConfig, LCGLifecycle
+from models.drq_actor_critic import DrQActorCritic
 from utils import (
     broadcast_if_needed,
     build_ddp_wrapper,
+    CheckpointableGroup,
     CommonTools,
     configure_opt,
     count_parameters,
@@ -58,13 +61,19 @@ class ResumeFidelityState:
       - WorldModelEnv's live rollout buffers (obs_buffer/act_buffer/hx_rew_end/cx_rew_end/
         ep_len) -- absent (None) until the first real use.
       - The actor-critic's own rollout LSTM hx/cx (coroutines.env_loop.RolloutHxCxState).
+      - For DrQActorCritic specifically: its three independent exploration-noise RNG streams
+        (imagined-training/real-collection/eval, see DrQExplorationState/DrQGeneratorState's
+        docstrings) -- checkpointed explicitly here for the exact same reason rollout_hx_cx_state
+        is: nn.Module.load_state_dict()'s recursion would silently never invoke an override on
+        a nested module (see DrQExplorationState's docstring for the full explanation).
 
     Auto-discovered and checkpointed by Trainer's StateDictMixin machinery exactly like
     self.opt/self.lr_sched/self.rng_state already are, via a single
     `self.resume_fidelity_state = ResumeFidelityState(...)` attribute (see Trainer.__init__).
     Every piece is optional/gracefully-absent (model_free runs have no WorldModelEnv; a
-    checkpoint saved before actor_critic ever trained has no rollout buffers yet), so a
-    checkpoint taken at ANY point round-trips without special-casing by the caller.
+    checkpoint saved before actor_critic ever trained has no rollout buffers yet; a non-DrQ run
+    has no drq_exploration_states), so a checkpoint taken at ANY point round-trips without
+    special-casing by the caller.
     """
 
     def __init__(
@@ -72,10 +81,14 @@ class ResumeFidelityState:
         batch_samplers: Dict[str, BatchSampler],
         world_model_env: Optional[WorldModelEnv],
         rollout_hx_cx_state: Optional[RolloutHxCxState],
+        drq_exploration_states: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.batch_samplers = batch_samplers
         self.world_model_env = world_model_env
         self.rollout_hx_cx_state = rollout_hx_cx_state
+        # name -> object exposing state_dict()/load_state_dict() (DrQExplorationState or
+        # DrQGeneratorState); None for a non-DrQ actor-critic. See Trainer.__init__.
+        self.drq_exploration_states = drq_exploration_states
 
     def state_dict(self) -> Dict[str, Any]:
         sd: Dict[str, Any] = {"batch_samplers": {name: bs.state_dict() for name, bs in self.batch_samplers.items()}}
@@ -84,6 +97,8 @@ class ResumeFidelityState:
             sd["world_model_env_rollout"] = self.world_model_env.rollout_state_dict()
         if self.rollout_hx_cx_state is not None:
             sd["rollout_hx_cx"] = self.rollout_hx_cx_state.state_dict()
+        if self.drq_exploration_states is not None:
+            sd["drq_exploration_states"] = {k: v.state_dict() for k, v in self.drq_exploration_states.items()}
         return sd
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
@@ -101,6 +116,10 @@ class ResumeFidelityState:
                 self.world_model_env.load_rollout_state_dict(rollout_sd)
         if self.rollout_hx_cx_state is not None and "rollout_hx_cx" in state_dict:
             self.rollout_hx_cx_state.load_state_dict(state_dict["rollout_hx_cx"])
+        if self.drq_exploration_states is not None and "drq_exploration_states" in state_dict:
+            for k, v in self.drq_exploration_states.items():
+                if k in state_dict["drq_exploration_states"]:
+                    v.load_state_dict(state_dict["drq_exploration_states"][k])
 
 
 class Trainer(StateDictMixin):
@@ -215,13 +234,55 @@ class Trainer(StateDictMixin):
         if cfg.initialization.path_to_ckpt is not None:
             self.agent.load(**cfg.initialization)
 
+        # Whether this run's actor-critic is the DrQ-v2-style continuous-action module (selected
+        # via config/agent/*.yaml's actor_critic._target_) rather than the original ActorCritic
+        # -- read once here and reused everywhere below that needs a different code path (its
+        # own optimizer pair, its own collector bindings/RNG streams, its own train_agent()
+        # call sequence) instead of a single shared one.
+        self._is_drq = isinstance(self.agent.actor_critic, DrQActorCritic)
+
+        if self._is_drq:
+            # Three independent RNG streams for DrQ's exploration noise (see
+            # data.batch_sampler.COMPONENT_SEED_ID and models.drq_actor_critic's module
+            # docstring, RNG-isolation section): imagined-training, real-env train collection,
+            # and eval/test collection each get their OWN generator and must never perturb one
+            # another. Constructed on self._device (not CPU) since DrQActorCritic's
+            # sample_action draws noise via torch.randn(..., device=..., generator=...) at
+            # wherever the model itself lives. Assigned onto the actor-critic's own state
+            # objects (not kept as local variables) so a later cfg.common.resume load_state_dict
+            # call (which mutates these generators IN PLACE via generator.set_state(...), see
+            # DrQExplorationState/DrQGeneratorState) transparently updates every reference that
+            # was handed out below (collector bindings, setup_training) too.
+            self.agent.actor_critic.real_collection_exploration_state.generator = derive_torch_generator(
+                self._resolved_seed, COMPONENT_SEED_ID["drq_real_collection_noise"], device=self._device
+            )
+            self.agent.actor_critic.eval_exploration_state.generator = derive_torch_generator(
+                self._resolved_seed, COMPONENT_SEED_ID["drq_eval_noise"], device=self._device
+            )
+
         # Collectors
         if not self._is_static_dataset and self._rank == 0:
+            if self._is_drq:
+                # Bound to this specific env AND this specific noise stream (see
+                # DrQActorCritic.make_collector_binding's docstring) -- the train and test
+                # collectors get their own independent cold-start/frame-stack state and their
+                # own independent RNG stream, never shared with each other or with the
+                # imagined-training loop below, even though all three drive the SAME learned
+                # weights.
+                train_model = self.agent.actor_critic.make_collector_binding(
+                    env=train_env, noise_generator=self.agent.actor_critic.real_collection_exploration_state.generator
+                )
+                test_model = self.agent.actor_critic.make_collector_binding(
+                    env=test_env, noise_generator=self.agent.actor_critic.eval_exploration_state.generator
+                )
+            else:
+                train_model = self.agent.actor_critic
+                test_model = self.agent.actor_critic
             self._train_collector = make_collector(
-                train_env, self.agent.actor_critic, self.train_dataset, cfg.collection.train.epsilon
+                train_env, train_model, self.train_dataset, cfg.collection.train.epsilon
             )
             self._test_collector = make_collector(
-                test_env, self.agent.actor_critic, self.test_dataset, cfg.collection.test.epsilon, reset_every_collect=True
+                test_env, test_model, self.test_dataset, cfg.collection.test.epsilon, reset_every_collect=True
             )
 
         ######################################################
@@ -231,12 +292,44 @@ class Trainer(StateDictMixin):
         def build_opt(name: str) -> torch.optim.AdamW:
             return configure_opt(getattr(self.agent, name), **getattr(cfg, name).optimizer)
 
-        def build_lr_sched(name: str) -> torch.optim.lr_scheduler.LambdaLR:
-            return get_lr_sched(self.opt.get(name), getattr(cfg, name).training.lr_warmup_steps)
+        def build_lr_sched(opt: torch.optim.Optimizer, num_warmup_steps: int) -> torch.optim.lr_scheduler.LambdaLR:
+            return get_lr_sched(opt, num_warmup_steps)
 
         self._model_names = ["denoiser", "rew_end_model", "actor_critic"]
-        self.opt = CommonTools(*map(build_opt, self._model_names))
-        self.lr_sched = CommonTools(*map(build_lr_sched, self._model_names))
+
+        opt_denoiser = build_opt("denoiser")
+        opt_rew_end_model = build_opt("rew_end_model")
+
+        if self._is_drq:
+            # DrQActorCritic trains via two disjoint-parameter optimizers (opt_critic: encoder +
+            # critic's own trunk + Q1/Q2; opt_actor: actor's own trunk + MLP -- see
+            # DrQActorCritic.critic_update/actor_update's docstrings), not the single-optimizer
+            # pattern the rest of Trainer uses -- wrapped in one CheckpointableGroup so
+            # self.opt.actor_critic still checkpoints/round-trips transparently through
+            # CommonTools/StateDictMixin exactly like a plain AdamW does for the other
+            # components and for the original ActorCritic.
+            ac = self.agent.actor_critic
+            opt_critic_ac = configure_opt(nn.ModuleList([ac.encoder, ac.critic]), **cfg.drq.critic_optimizer)
+            opt_actor_ac = configure_opt(ac.actor, **cfg.drq.actor_optimizer)
+            opt_actor_critic = CheckpointableGroup(critic=opt_critic_ac, actor=opt_actor_ac)
+            # Single shared warmup step count (cfg.actor_critic.training.lr_warmup_steps, the
+            # same training-cadence config both actor-critic implementations read their
+            # steps_per_epoch/batch_size/etc from) applied independently to each optimizer --
+            # DrQ has no single combined optimizer for get_lr_sched to wrap.
+            warmup_steps = cfg.actor_critic.training.lr_warmup_steps
+            lr_sched_actor_critic = CheckpointableGroup(
+                critic=build_lr_sched(opt_critic_ac, warmup_steps), actor=build_lr_sched(opt_actor_ac, warmup_steps)
+            )
+        else:
+            opt_actor_critic = build_opt("actor_critic")
+            lr_sched_actor_critic = build_lr_sched(opt_actor_critic, cfg.actor_critic.training.lr_warmup_steps)
+
+        self.opt = CommonTools(opt_denoiser, opt_rew_end_model, opt_actor_critic)
+        self.lr_sched = CommonTools(
+            build_lr_sched(opt_denoiser, cfg.denoiser.training.lr_warmup_steps),
+            build_lr_sched(opt_rew_end_model, cfg.rew_end_model.training.lr_warmup_steps),
+            lr_sched_actor_critic,
+        )
 
         # Data loaders
 
@@ -314,8 +407,17 @@ class Trainer(StateDictMixin):
 
         # Setup training
         sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
-        actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
-        self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
+        if self._is_drq:
+            actor_critic_loss_cfg = instantiate(cfg.drq.loss)
+            imagination_noise_generator = derive_torch_generator(
+                self._resolved_seed, COMPONENT_SEED_ID["drq_imagination_noise"], device=self._device
+            )
+            self.agent.setup_training(
+                sigma_distribution_cfg, actor_critic_loss_cfg, rl_env, imagination_noise_generator
+            )
+        else:
+            actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
+            self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
 
         # See ResumeFidelityState's docstring: everything needed for the actor-critic's
         # imagined-rollout machinery to resume exactly, grouped into one StateDictMixin-
@@ -324,10 +426,18 @@ class Trainer(StateDictMixin):
         batch_samplers = {"denoiser": bs_denoiser, "rew_end_model": bs_rew_end_model}
         if bs_actor_critic is not None:
             batch_samplers["actor_critic"] = bs_actor_critic
+        drq_exploration_states = None
+        if self._is_drq:
+            drq_exploration_states = {
+                "exploration_state": self.agent.actor_critic.exploration_state,
+                "real_collection_exploration_state": self.agent.actor_critic.real_collection_exploration_state,
+                "eval_exploration_state": self.agent.actor_critic.eval_exploration_state,
+            }
         self.resume_fidelity_state = ResumeFidelityState(
             batch_samplers=batch_samplers,
             world_model_env=rl_env if not self._is_model_free else None,
             rollout_hx_cx_state=self.agent.actor_critic.rollout_hx_cx_state,
+            drq_exploration_states=drq_exploration_states,
         )
 
         # LCG intrinsic-reward lifecycle -- disabled unless
@@ -518,9 +628,18 @@ class Trainer(StateDictMixin):
                     self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
                     self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
                 steps = cfg.steps_first_epoch if self.epoch == 1 else cfg.steps_per_epoch
+                # DrQActorCritic uses its own collect_rollout()/critic_update()/actor_update()
+                # call sequence (two disjoint-parameter optimizers, no single external loss) --
+                # see train_drq_actor_critic's docstring -- instead of train_component's
+                # generic single-model()-call/single-optimizer pattern.
+                train_this_component = (
+                    (lambda: self.train_drq_actor_critic(steps))
+                    if name == "actor_critic" and self._is_drq
+                    else (lambda: self.train_component(name, steps))
+                )
                 if self._lcg_lifecycle is not None:
                     t0 = time.time()
-                    to_log += self.train_component(name, steps)
+                    to_log += train_this_component()
                     # NOTE: self._lcg_lifecycle.round_id is only authoritative for `name ==
                     # "actor_critic"` (refresh() has just run this epoch); for
                     # denoiser/rew_end_model it would still show the *previous* round's id,
@@ -529,7 +648,7 @@ class Trainer(StateDictMixin):
                     print(f"[LCG-TIMING] round={round_label} component={name} "
                           f"time={time.time() - t0:.2f}s", flush=True)
                 else:
-                    to_log += self.train_component(name, steps)
+                    to_log += train_this_component()
         return to_log
 
     @torch.no_grad()
@@ -600,6 +719,43 @@ class Trainer(StateDictMixin):
 
         process_confusion_matrices_if_any_and_compute_classification_metrics(to_log)
         to_log = [{f"{name}/train/{k}": v for k, v in d.items()} for d in to_log]
+        return to_log
+
+    def train_drq_actor_critic(self, steps: int) -> Logs:
+        """DrQActorCritic's own training call sequence, used by train_agent() in place of
+        train_component("actor_critic", steps) whenever self._is_drq: one fresh imagined
+        rollout (model.collect_rollout(), drawn from the WorldModelEnv-backed env_loop set up
+        in setup_training) then a critic update then an actor update, per step -- NOT
+        train_component's single-model()-call/single-optimizer/grad_acc_steps pattern, which
+        assumes one combined loss and one optimizer (see DrQActorCritic's module docstring for
+        why critic_update/actor_update are two separate methods with two separate optimizers
+        and an explicit critic-then-actor staging instead). cfg.actor_critic.training's
+        grad_acc_steps and max_grad_norm fields are therefore NOT read here -- DrQ has no
+        gradient-accumulation loop (one step is one full rollout+critic+actor cycle already),
+        and its own gradient clipping is configured independently via cfg.drq.loss's
+        critic_max_grad_norm/actor_max_grad_norm (see critic_update/actor_update)."""
+        model = self.agent.actor_critic
+        opt_pair = self.opt.actor_critic
+        lr_sched_pair = self.lr_sched.actor_critic
+        model.train()
+        to_log = []
+
+        for i in trange(steps, desc="Training actor_critic (DrQ)", disable=self._rank > 0):
+            model.collect_rollout()
+            metrics = {**model.critic_update(opt_pair.critic), **model.actor_update(opt_pair.actor)}
+
+            metrics["lr_critic"] = lr_sched_pair.critic.get_last_lr()[0]
+            metrics["lr_actor"] = lr_sched_pair.actor.get_last_lr()[0]
+            lr_sched_pair.critic.step()
+            lr_sched_pair.actor.step()
+
+            num_batch = self.num_batch_train.get("actor_critic")
+            metrics["num_batch_train_actor_critic"] = num_batch
+            self.num_batch_train.set("actor_critic", num_batch + 1)
+
+            to_log.append(metrics)
+
+        to_log = [{f"actor_critic/train/{k}": v for k, v in d.items()} for d in to_log]
         return to_log
 
     @torch.no_grad()

@@ -153,6 +153,34 @@ actor_critic:
     weight_decay: 0
     eps: 1e-8
 
+# DrQActorCritic-specific training config, read instead of the actor_critic.actor_critic_loss/
+# optimizer sections above whenever agent.actor_critic resolves to a DrQActorCriticConfig (see
+# config/agent/drq.yaml and Trainer.__init__'s self._is_drq branch). actor_critic.training
+# above (steps_per_epoch/batch_size/sample_weights/start_after_epochs/lr_warmup_steps/...) is
+# still shared by both -- it drives the WorldModelEnv imagined-rollout batch construction and
+# training cadence, which doesn't depend on which actor-critic consumes it (grad_acc_steps and
+# max_grad_norm specifically are NOT read for DrQ -- see train_drq_actor_critic's docstring).
+drq:
+  loss:
+    _target_: models.drq_actor_critic.DrQLossConfig
+    backup_every: 8  # rollout length per env_loop.send() call, i.e. per collect_rollout()
+    n_step: 3
+    gamma: 0.985  # matches actor_critic.actor_critic_loss.gamma above
+    target_tau: 0.01
+    noise_clip: 0.3
+    critic_max_grad_norm: 100.0
+    actor_max_grad_norm: 100.0
+
+  critic_optimizer:
+    lr: 1e-4
+    weight_decay: 0
+    eps: 1e-8
+
+  actor_optimizer:
+    lr: 1e-4
+    weight_decay: 0
+    eps: 1e-8
+
 # LCG intrinsic-reward lifecycle config now lives in config/intrinsic_reward/lcg.yaml
 # (a Hydra config group, selected above via `defaults: - intrinsic_reward: lcg`), so a
 # future baseline (RND, ICM, ...) can be added as a sibling file and swapped in the same
