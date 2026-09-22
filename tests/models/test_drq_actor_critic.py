@@ -1058,3 +1058,88 @@ def test_predict_act_value_never_builds_grad_graph():
     obs = torch.rand(num_envs, 3, 8, 8)
     mu, val, (hx2, cx2) = ac.predict_act_value(obs, (hx, cx))
     assert not mu.requires_grad
+
+
+# ---------------------------------------------------------------------------------------------
+# 14. Optional, independently configurable gradient clipping (critic_update/actor_update).
+# ---------------------------------------------------------------------------------------------
+
+def test_grad_clip_fields_default_to_none():
+    loss_cfg = DrQLossConfig(backup_every=8, n_step=2, gamma=0.99, target_tau=0.01, noise_clip=0.3)
+    assert loss_cfg.critic_max_grad_norm is None
+    assert loss_cfg.actor_max_grad_norm is None
+
+
+def test_critic_grad_norm_always_reported_even_when_clipping_disabled():
+    torch.manual_seed(0)
+    ac, _ = _make_ac_with_rollout()
+    ac.loss_cfg.critic_max_grad_norm = None
+    opt_critic, _ = _make_optimizers(ac)
+    ac.collect_rollout()
+    metrics = ac.critic_update(opt_critic)
+    assert "critic_grad_norm_before_clip" in metrics
+    assert torch.isfinite(metrics["critic_grad_norm_before_clip"])
+    assert metrics["critic_grad_clipped"].item() == 0.0
+
+
+def test_actor_grad_norm_always_reported_even_when_clipping_disabled():
+    torch.manual_seed(0)
+    ac, _ = _make_ac_with_rollout()
+    ac.loss_cfg.actor_max_grad_norm = None
+    opt_critic, opt_actor = _make_optimizers(ac)
+    ac.collect_rollout()
+    ac.critic_update(opt_critic)
+    metrics = ac.actor_update(opt_actor)
+    assert "actor_grad_norm_before_clip" in metrics
+    assert torch.isfinite(metrics["actor_grad_norm_before_clip"])
+    assert metrics["actor_grad_clipped"].item() == 0.0
+
+
+def test_critic_grad_clipping_actually_bounds_the_post_clip_norm():
+    torch.manual_seed(0)
+    ac, _ = _make_ac_with_rollout()
+    ac.loss_cfg.critic_max_grad_norm = 1e-6
+    opt_critic, _ = _make_optimizers(ac)
+    ac.collect_rollout()
+    metrics = ac.critic_update(opt_critic)
+    assert metrics["critic_grad_norm_before_clip"].item() > 1e-6
+    assert metrics["critic_grad_clipped"].item() == 1.0
+    params = list(ac.encoder.parameters()) + list(ac.critic.parameters())
+    post_clip_norm = torch.norm(torch.stack([p.grad.norm() for p in params if p.grad is not None]))
+    assert post_clip_norm.item() <= 1e-6 + 1e-8
+
+
+def test_actor_grad_clipping_actually_bounds_the_post_clip_norm():
+    torch.manual_seed(0)
+    ac, _ = _make_ac_with_rollout()
+    ac.loss_cfg.actor_max_grad_norm = 1e-6
+    opt_critic, opt_actor = _make_optimizers(ac)
+    ac.collect_rollout()
+    ac.critic_update(opt_critic)
+    metrics = ac.actor_update(opt_actor)
+    assert metrics["actor_grad_norm_before_clip"].item() > 1e-6
+    assert metrics["actor_grad_clipped"].item() == 1.0
+    post_clip_norm = torch.norm(torch.stack([p.grad.norm() for p in ac.actor.parameters() if p.grad is not None]))
+    assert post_clip_norm.item() <= 1e-6 + 1e-8
+
+
+def test_actor_grad_clipping_never_touches_critic_or_encoder_grad():
+    """actor_update's clip_grad_norm_ call is restricted to ac.actor.parameters() only (issue
+    requirement: never include critic or encoder parameters in actor gradient clipping). Since
+    critic requires_grad is False for the duration of actor_update's backward and the encoder's
+    features are detached before the actor sees them, critic/encoder .grad should be completely
+    untouched by actor_update -- still exactly whatever critic_update's own backward left there."""
+    torch.manual_seed(0)
+    ac, _ = _make_ac_with_rollout()
+    ac.loss_cfg.actor_max_grad_norm = 1e-6
+    opt_critic, opt_actor = _make_optimizers(ac)
+    ac.collect_rollout()
+    ac.critic_update(opt_critic)
+    critic_encoder_params = list(ac.encoder.parameters()) + list(ac.critic.parameters())
+    grads_before = [None if p.grad is None else p.grad.clone() for p in critic_encoder_params]
+    ac.actor_update(opt_actor)
+    for p, g_before in zip(critic_encoder_params, grads_before):
+        if g_before is None:
+            assert p.grad is None
+        else:
+            assert torch.equal(p.grad, g_before)

@@ -209,6 +209,15 @@ class DrQLossConfig:
     gamma: float
     target_tau: float  # soft target-critic update rate
     noise_clip: float  # target-policy-smoothing clip, may differ from the exploration clip
+    # Optional, independently configurable gradient clipping, following the repository's
+    # existing max_grad_norm convention (see Trainer.train_component's
+    # torch.nn.utils.clip_grad_norm_ usage) -- None disables clipping for that optimizer. Kept
+    # as two separate fields (rather than one shared value) because critic_update and
+    # actor_update clip disjoint parameter sets (encoder+critic vs actor only, see their
+    # docstrings) and may need different limits: the critic's loss landscape (Bellman TD error)
+    # and the actor's (-Q(s, actor(s))) are not comparable in scale.
+    critic_max_grad_norm: Optional[float] = None
+    actor_max_grad_norm: Optional[float] = None
 
 
 class RandomShiftsAug(nn.Module):
@@ -853,6 +862,22 @@ class DrQActorCritic(nn.Module):
 
         opt_critic.zero_grad()
         loss_critic.backward()
+
+        # Clip norm is always COMPUTED (max_norm=inf when critic_max_grad_norm is unset makes
+        # clip_grad_norm_ a pure norm read with no scaling side effect -- clip_coef = inf /
+        # (norm + eps) is always >= 1 so it clamps to 1.0), so the pre-clip norm is visible in
+        # diagnostics regardless of whether clipping is actually enabled -- a constantly-large
+        # norm should be observable even before anyone sets a limit, not hidden until they do.
+        # Only encoder + critic parameters are included -- exactly opt_critic's own parameter
+        # set (see Trainer's optimizer construction), never target_critic (frozen, receives no
+        # gradient) and never the actor (untouched by this backward pass).
+        critic_grad_params = list(self.encoder.parameters()) + list(self.critic.parameters())
+        critic_max_norm = self.loss_cfg.critic_max_grad_norm
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            critic_grad_params, critic_max_norm if critic_max_norm is not None else float("inf")
+        )
+        critic_grad_clipped = critic_max_norm is not None and critic_grad_norm.item() > critic_max_norm
+
         opt_critic.step()
 
         _soft_update(self.target_critic, self.critic, self.loss_cfg.target_tau)
@@ -867,6 +892,8 @@ class DrQActorCritic(nn.Module):
             "q1_mean": q1.detach().mean(),
             "q2_mean": q2.detach().mean(),
             "target_q_mean": target_q.detach().mean(),
+            "critic_grad_norm_before_clip": critic_grad_norm.detach(),
+            "critic_grad_clipped": torch.tensor(float(critic_grad_clipped)),
         }
 
     def actor_update(self, opt_actor: torch.optim.Optimizer) -> Dict[str, Any]:
@@ -898,9 +925,27 @@ class DrQActorCritic(nn.Module):
 
             opt_actor.zero_grad()
             loss_actor.backward()
+
+            # Same always-computed-norm convention as critic_update (see its comment). Clipped
+            # to self.actor.parameters() ONLY -- critic parameters have requires_grad=False for
+            # the duration of this backward pass (see _set_critic_requires_grad above) so they
+            # never accumulate a .grad here regardless, and the encoder's features were
+            # .detach()'d before the actor even saw them, so no encoder .grad exists either;
+            # restricting the clip call itself to self.actor.parameters() keeps that guarantee
+            # explicit rather than relying solely on the requires_grad side effect.
+            actor_max_norm = self.loss_cfg.actor_max_grad_norm
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor.parameters(), actor_max_norm if actor_max_norm is not None else float("inf")
+            )
+            actor_grad_clipped = actor_max_norm is not None and actor_grad_norm.item() > actor_max_norm
+
             opt_actor.step()
         finally:
             self._set_critic_requires_grad(True)
 
         self._cached_rollout = None
-        return {"loss_actor": loss_actor.detach()}
+        return {
+            "loss_actor": loss_actor.detach(),
+            "actor_grad_norm_before_clip": actor_grad_norm.detach(),
+            "actor_grad_clipped": torch.tensor(float(actor_grad_clipped)),
+        }
