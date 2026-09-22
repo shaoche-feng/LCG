@@ -1,5 +1,9 @@
 # DIAMOND PMPO Beta controller prototype
 
+This page preserves the initial single-frame report, committed as `f6148d2`.
+See [the K=4 implementation and diagnostic protocol](k4_implementation.md) for
+the subsequent temporal-context change; historical metrics below remain K=1.
+
 ## Git isolation
 
 - Base branch: `lcg-undersampling-diagnostic`

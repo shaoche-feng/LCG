@@ -1,6 +1,6 @@
 """Sign-only PMPO on fresh DIAMOND experience; no differentiable imagination."""
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import contextmanager
 import random
 
@@ -17,6 +17,7 @@ from envs import WorldModelEnv
 
 @dataclass
 class PMPOBetaConfig(ActorCriticConfig):
+    frame_stack: int = 4
     actor_hidden_dims: tuple = (256, 256)
     value_hidden_dims: tuple = (256, 256)
     actor_lr: float = 1e-4
@@ -37,6 +38,14 @@ def require_finite(**tensors):
     for name, tensor in tensors.items():
         if not torch.isfinite(tensor).all():
             raise FloatingPointError(f"Non-finite PMPO {name}")
+
+
+def summary_statistics(values, prefix):
+    values = values.detach().flatten()
+    quantiles = torch.quantile(values, values.new_tensor([0.1, 0.5, 0.9]))
+    return {f"{prefix}_{name}": value for name, value in
+            zip(("mean", "std", "min", "max", "p10", "median", "p90"),
+                (values.mean(), values.std(unbiased=False), values.min(), values.max(), *quantiles))}
 
 
 def pmpo_loss(log_prob, advantage, alpha=0.5):
@@ -78,6 +87,9 @@ class PMPOBeta(nn.Module):
     def __init__(self, cfg: PMPOBetaConfig):
         super().__init__()
         self.cfg = cfg
+        if cfg.frame_stack != 4:
+            raise ValueError("This PMPO experiment requires exactly four frames")
+        self.frame_stack = cfg.frame_stack
         seed = cfg.seed if cfg.seed is not None else 0
         if cfg.continuous_action_dim is None or cfg.num_actions is not None:
             raise ValueError("PMPOBeta requires an environment-derived continuous action space")
@@ -97,8 +109,9 @@ class PMPOBeta(nn.Module):
         self.register_buffer("action_low", low.float())
         self.register_buffer("action_high", high.float())
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
-        self.actor = VisualHead(cfg, cfg.actor_hidden_dims, 2 * cfg.continuous_action_dim)
-        self.value = VisualHead(cfg, cfg.value_hidden_dims, 1)
+        stacked_cfg = replace(cfg, img_channels=cfg.img_channels * cfg.frame_stack)
+        self.actor = VisualHead(stacked_cfg, cfg.actor_hidden_dims, 2 * cfg.continuous_action_dim)
+        self.value = VisualHead(stacked_cfg, cfg.value_hidden_dims, 1)
         self.prior_actor = deepcopy(self.actor).requires_grad_(False).eval()
         self.continuous_action = True
         self.continuous_reward = True
@@ -174,6 +187,8 @@ class PMPOBeta(nn.Module):
         return logp, entropy
 
     def predict_act_value(self, obs, hx_cx):
+        if obs.ndim != 4 or obs.shape[1] != self.cfg.img_channels * self.frame_stack:
+            raise ValueError("PMPO requires the exact channel-concatenated four-frame state")
         return ActorCriticOutput(self.actor(obs), self.value(obs).squeeze(-1), hx_cx)
 
     def setup_training(self, rl_env, loss_cfg=None):
@@ -194,7 +209,7 @@ class PMPOBeta(nn.Module):
         # state survives checkpoint boundaries. Real prompts are conditioning only.
         with self.imagination_rng():
             self.rl_env.restart_initial_conditions()
-            loop = make_env_loop(self.rl_env, self)
+            loop = make_env_loop(self.rl_env, self, store_policy_observations=True)
             try:
                 return loop.send(self.cfg.imagination_horizon)
             finally:
@@ -228,11 +243,34 @@ class PMPOBeta(nn.Module):
                        positive_fraction=(advantage >= 0).float().mean(), negative_fraction=(advantage < 0).float().mean(),
                        rollout_length=float(obs.shape[1]), all_finite=1.0)
         with torch.no_grad():
+            metrics.update(summary_statistics(advantage, "advantage"))
+            pos = advantage.flatten() >= 0
+            pos_logp = logp.detach().masked_fill(~pos, 0).sum() / pos.sum().clamp_min(1)
+            neg_logp = logp.detach().masked_fill(pos, 0).sum() / (~pos).sum().clamp_min(1)
+            centered_value = values.detach() - values.detach().mean()
+            centered_target = targets.flatten() - targets.mean()
+            correlation = (centered_value * centered_target).mean() / (
+                centered_value.square().mean() * centered_target.square().mean()).sqrt().clamp_min(1e-12)
+            metrics.update(positive_log_probability=pos_logp, negative_log_probability=neg_logp,
+                           loss_positive=-c.alpha_pmpo * pos_logp,
+                           loss_negative=(1 - c.alpha_pmpo) * neg_logp,
+                           loss_kl=c.beta_kl * kl.mean().detach(),
+                           advantage_zero_fraction=(advantage == 0).float().mean(),
+                           advantage_near_zero_fraction=(advantage.abs() <= 1e-6).float().mean(),
+                           value_target_correlation=correlation,
+                           value_bias=(values.detach() - targets.flatten()).mean(),
+                           value_abs_max=values.detach().abs().max(), return_abs_max=targets.abs().max())
+            frames = flat_obs.reshape(-1, self.frame_stack, self.cfg.img_channels, self.cfg.img_size, self.cfg.img_size)
+            difference = (frames[:, 1:] - frames[:, :-1]).abs().flatten(1).mean(1)
+            metrics.update(stack_temporal_difference_mean=difference.mean(),
+                           stack_temporal_variation_fraction=(difference > 0).float().mean())
+        with torch.no_grad():
             if self._fixed_obs is None:
                 self._fixed_obs = flat_obs[:32].clone()
             fixed_mean = self.sample_action(self.actor(self._fixed_obs.to(self.device)), deterministic=True)
             for d, std in enumerate(fixed_mean.std(0, unbiased=False)):
                 metrics[f"fixed_policy_mean_state_std_{d}"] = std
+            metrics.update(self.temporal_diagnostics(self._fixed_obs.to(self.device), "fixed"))
             require_finite(**{k: torch.as_tensor(v) for k, v in metrics.items()})
         # Disjoint graphs: each optimizer owns exactly one encoder and head.
         return actor_loss + value_loss, metrics
@@ -243,19 +281,37 @@ class PMPOBeta(nn.Module):
         unit = (actions - self.action_low) / (self.action_high - self.action_low)
         metrics = {}
         for name, param in (("alpha", dist.concentration1), ("beta", dist.concentration0)):
-            metrics.update({f"{name}_{stat}": fn(param) for stat, fn in
-                            (("mean", torch.mean), ("median", torch.median), ("min", torch.min), ("max", torch.max))})
+            metrics.update(summary_statistics(param, name))
+            metrics[f"{name}_near_floor_fraction"] = (param < self.cfg.concentration_min + 0.01).float().mean()
         means = self.to_environment(dist.mean)
         for d in range(actions.shape[-1]):
             metrics[f"action_mean_{d}"] = actions[:, d].mean()
             metrics[f"action_std_{d}"] = actions[:, d].std(unbiased=False)
             metrics[f"policy_mean_{d}"] = means[:, d].mean()
             metrics[f"policy_mean_state_std_{d}"] = means[:, d].std(unbiased=False)
+            metrics[f"policy_mean_min_{d}"] = means[:, d].min()
+            metrics[f"policy_mean_max_{d}"] = means[:, d].max()
         metrics.update(near_lower_fraction=(unit < 0.01).float().mean(),
                        near_upper_fraction=(unit > 0.99).float().mean())
         if logp is not None:
-            metrics.update(log_probability=logp.mean(), policy_entropy=entropy.mean())
+            metrics.update(log_probability=logp.mean(), policy_entropy=entropy.mean(),
+                           policy_entropy_std=entropy.std(unbiased=False))
         return metrics
+
+    @torch.no_grad()
+    def temporal_diagnostics(self, states, prefix="fixed"):
+        frames = states.reshape(-1, self.frame_stack, self.cfg.img_channels, self.cfg.img_size, self.cfg.img_size)
+        ordered = self.sample_action(self.actor(states), deterministic=True)
+        repeated = self.sample_action(self.actor(frames[:, -1].repeat(1, self.frame_stack, 1, 1)), deterministic=True)
+        reversed_ = self.sample_action(self.actor(frames.flip(1).flatten(1, 2)), deterministic=True)
+        difference = (frames[:, 1:] - frames[:, :-1]).abs().flatten(1).mean(1)
+        result = {f"{prefix}_temporal_difference_mean": difference.mean(),
+                  f"{prefix}_temporal_variation_fraction": (difference > 0).float().mean(),
+                  f"{prefix}_ordered_repeated_action_difference": (ordered - repeated).abs().mean(),
+                  f"{prefix}_ordered_reversed_action_difference": (ordered - reversed_).abs().mean()}
+        for d in range(ordered.shape[1]):
+            result[f"{prefix}_policy_mean_state_std_{d}"] = ordered[:, d].std(unbiased=False)
+        return result
 
 
 class PMPOOptimizers:

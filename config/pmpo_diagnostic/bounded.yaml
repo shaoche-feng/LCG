@@ -1,0 +1,5 @@
+# Opt-in diagnostics and a hard epoch cap; no learning hyperparameter overrides.
+enabled: true
+max_epochs: 20
+evaluation_seeds: [1001, 1002, 1003, 1004]
+output_dir: pmpo_diagnostic

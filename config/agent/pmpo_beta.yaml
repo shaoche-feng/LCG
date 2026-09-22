@@ -4,6 +4,7 @@ defaults:
 
 actor_critic:
   _target_: models.pmpo_beta.PMPOBetaConfig
+  frame_stack: 4
   # lstm_dim inherited for schema compatibility; PMPO is feedforward.
   actor_hidden_dims: [256, 256]
   value_hidden_dims: [256, 256]

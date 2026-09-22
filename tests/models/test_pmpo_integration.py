@@ -108,4 +108,5 @@ def test_env_loop_preserves_pre_reset_observation():
     with torch.no_grad():
         rollout = make_env_loop(InPlaceEnv(), model).send(1)
     torch.testing.assert_close(rollout[0], torch.ones(1, 1, 3, 8, 8))
-    torch.testing.assert_close(rollout[7][:, 0], model.value(torch.ones(1, 3, 8, 8) * 2).squeeze(-1))
+    final_stack = torch.cat([torch.ones(1, 9, 8, 8), torch.ones(1, 3, 8, 8) * 2], 1)
+    torch.testing.assert_close(rollout[7][:, 0], model.value(final_stack).squeeze(-1))

@@ -20,6 +20,7 @@ from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraver
 from envs import make_atari_env, make_dm_control_env, WorldModelEnv
 from lcg import LCGConfig, LCGLifecycle
 from models.pmpo_beta import PMPOBeta, PMPOOptimizers
+from pmpo_diagnostic import PMPORunDiagnostic
 from utils import (
     broadcast_if_needed,
     build_ddp_wrapper,
@@ -215,6 +216,14 @@ class Trainer(StateDictMixin):
         sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
         actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
         self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
+        diagnostic_cfg = cfg.get("pmpo_diagnostic")
+        self._pmpo_diagnostic = None
+        if diagnostic_cfg is not None and diagnostic_cfg.enabled:
+            if not isinstance(self.agent.actor_critic, PMPOBeta):
+                raise ValueError("PMPO diagnostic requires the PMPO controller")
+            if not 1 <= diagnostic_cfg.max_epochs <= 20:
+                raise ValueError("PMPO diagnostic epoch bound must be in [1, 20]")
+            self._pmpo_diagnostic = PMPORunDiagnostic(diagnostic_cfg, self.agent.actor_critic, cfg.env.test)
 
         # LCG intrinsic-reward lifecycle -- disabled unless
         # cfg.intrinsic_reward.enabled is True (default False, see
@@ -251,6 +260,17 @@ class Trainer(StateDictMixin):
             print(self.test_dataset)
 
     def run(self) -> None:
+        try:
+            self._run()
+        except Exception as error:
+            if self._pmpo_diagnostic is not None:
+                # Do not replace the last healthy checkpoint with failed state.
+                self._path_ckpt_dir.mkdir(exist_ok=True)
+                torch.save(self.agent.state_dict(), self._path_ckpt_dir / "agent_failed.pt")
+                (self._pmpo_diagnostic.path / "failure.txt").write_text(repr(error), encoding="utf-8")
+            raise
+
+    def _run(self) -> None:
         to_log = []
 
         if self.epoch == 0:
@@ -264,6 +284,8 @@ class Trainer(StateDictMixin):
                 self.train_dataset.load_state_dict(sd_train_dataset)
 
         num_epochs = self.num_epochs_collect + self._cfg.training.num_final_epochs
+        if self._pmpo_diagnostic is not None:
+            num_epochs = min(num_epochs, self._pmpo_diagnostic.cfg.max_epochs)
 
         while self.epoch < num_epochs:
             self.epoch += 1
@@ -283,6 +305,9 @@ class Trainer(StateDictMixin):
             
             if self._cfg.training.should:
                 to_log += self.train_agent()
+
+            if self._pmpo_diagnostic is not None:
+                self._pmpo_diagnostic.finish_epoch(self.epoch, to_log, self.train_dataset.num_steps)
 
             # Evaluation
             should_test = self._rank == 0 and self._cfg.evaluation.should and (self.epoch % self._cfg.evaluation.every == 0)
@@ -307,7 +332,7 @@ class Trainer(StateDictMixin):
                 dist.barrier()
 
         # Last collect
-        if self._rank == 0 and not self._is_static_dataset:
+        if self._rank == 0 and not self._is_static_dataset and self._pmpo_diagnostic is None:
             wandb_log(self.collect_test(final=True), self.epoch)
 
     def collect_initial_dataset(self) -> Tuple[int, Logs]:
@@ -446,6 +471,8 @@ class Trainer(StateDictMixin):
                 loss, metrics = model()
                 loss.backward()
                 metrics.update(opt.step())
+                if self._pmpo_diagnostic is not None:
+                    self._pmpo_diagnostic.check_update(metrics, self.epoch, self.num_batch_train.actor_critic)
                 if self.agent.actor_critic.cfg.log_diagnostics:
                     print("PMPO_DIAGNOSTICS " + json.dumps({k: float(v) for k, v in metrics.items()}), flush=True)
                 self.num_batch_train.actor_critic += 1
@@ -472,6 +499,8 @@ class Trainer(StateDictMixin):
             if lcg_timing:
                 t0 = time.time()
             loss, metrics = model(batch) if batch is not None else model()
+            if self._pmpo_diagnostic is not None and not torch.isfinite(loss).all():
+                raise FloatingPointError(f"Non-finite {name} loss")
             if lcg_timing:
                 t_forward_total += time.time() - t0
                 t0 = time.time()
@@ -483,7 +512,8 @@ class Trainer(StateDictMixin):
 
             if (i + 1) % cfg.grad_acc_steps == 0:
                 if cfg.max_grad_norm is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm,
+                                                              error_if_nonfinite=self._pmpo_diagnostic is not None)
                     metrics["grad_norm_before_clip"] = grad_norm
 
                 opt.step()

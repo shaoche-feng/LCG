@@ -17,7 +17,7 @@ def make_controller(**kwargs):
 def test_beta_actions_density_entropy_and_gradients():
     torch.manual_seed(3)
     model = make_controller()
-    obs = torch.randn(32, 3, 8, 8)
+    obs = torch.randn(32, 12, 8, 8)
     raw = model.actor(obs)
     dist = model.distribution(raw)
     assert torch.isfinite(dist.concentration1).all() and (dist.concentration1 > 0).all()
@@ -68,7 +68,7 @@ def test_pmpo_groups(advantages):
 
 def test_beta_kl_and_frozen_prior():
     model = make_controller()
-    obs = torch.randn(4, 3, 8, 8)
+    obs = torch.randn(4, 12, 8, 8)
     prior = model.distribution(model.prior_actor(obs))
     same = kl_divergence(model.distribution(model.actor(obs)), prior).sum(-1)
     torch.testing.assert_close(same, torch.zeros_like(same), atol=1e-6, rtol=0)
@@ -113,7 +113,7 @@ def test_optimizer_ownership_and_value_gradient_isolation():
     prior_ids = {id(p) for p in model.prior_actor.parameters()}
     assert not actor_ids & value_ids and not (actor_ids | value_ids) & prior_ids
     assert actor_ids | value_ids == {id(p) for p in model.parameters() if p.requires_grad}
-    model.value(torch.randn(2, 3, 8, 8)).square().mean().backward()
+    model.value(torch.randn(2, 12, 8, 8)).square().mean().backward()
     assert all(p.grad is None for p in model.actor.parameters())
     assert all(p.grad is None for p in model.prior_actor.parameters())
     assert model.value.encoder.encoder[0].weight.grad.abs().sum() > 0
