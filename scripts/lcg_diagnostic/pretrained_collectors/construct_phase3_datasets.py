@@ -13,6 +13,8 @@ Run from the LCG/ project root:
 """
 from __future__ import annotations
 
+from hopper_naming import cond_dir, slot_dir
+
 import json
 import shutil
 import sys
@@ -35,7 +37,7 @@ EVAL_ROOT = PROBE_ROOT / "eval"
 MIXTURE_ROOT = PROBE_ROOT / "mixtures"
 
 DOMAINS = ["walker", "quadruped"]
-ACTION_DIM = {"walker": 6, "quadruped": 12}
+ACTION_DIM = {"walker": 6, "quadruped": 12, "hopper": 4}
 
 # Held-out selection: deterministic, final 2 episodes of each 12-episode task pool.
 HELD_OUT_IDS = [10, 11]
@@ -62,7 +64,7 @@ TASK_FRACTIONS = {
 
 
 def _load_source_dataset(domain: str, source: str) -> Dataset:
-    ds = Dataset(SOURCE_ROOT / domain / source / "dataset", name=f"src_{domain}_{source}", cache_in_ram=True)
+    ds = Dataset(SOURCE_ROOT / domain / slot_dir(domain, source) / "dataset", name=f"src_{domain}_{source}", cache_in_ram=True)
     ds.load_from_default_path()
     return ds
 
@@ -87,7 +89,7 @@ def build_eval_sets(domain: str) -> dict:
     manifests = {}
     for source in ("walk", "run"):
         src_ds = _load_source_dataset(domain, source)
-        out_dir = EVAL_ROOT / domain / source
+        out_dir = EVAL_ROOT / domain / slot_dir(domain, source)
         if out_dir.exists():
             shutil.rmtree(out_dir)
         dataset_dir = out_dir / "dataset"
@@ -105,7 +107,7 @@ def build_eval_sets(domain: str) -> dict:
             "observation_shape_chw": [3, 64, 64],
             "action_shape": [ACTION_DIM[domain]],
             "episode_length": 500,
-            "source_pool_path": str((SOURCE_ROOT / domain / source).relative_to(_PROJECT_ROOT)),
+            "source_pool_path": str((SOURCE_ROOT / domain / slot_dir(domain, source)).relative_to(_PROJECT_ROOT)),
             "dataset_path": str(dataset_dir.relative_to(_PROJECT_ROOT)),
             "collection_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
@@ -121,7 +123,7 @@ def build_mixture(domain: str, condition: str) -> dict:
     print(f"\n=== {domain}/{condition} ===")
     src = {s: _load_source_dataset(domain, s) for s in ("random", "walk", "run")}
 
-    out_dir = MIXTURE_ROOT / domain / condition
+    out_dir = MIXTURE_ROOT / domain / cond_dir(domain, condition)
     if out_dir.exists():
         shutil.rmtree(out_dir)
     dataset_dir = out_dir / "dataset"
@@ -171,7 +173,7 @@ def build_mixture(domain: str, condition: str) -> dict:
         "observation_shape": [3, 64, 64],
         "action_shape": [ACTION_DIM[domain]],
         "action_repeat": 2,
-        "source_pool_paths": {s: str((SOURCE_ROOT / domain / s).relative_to(_PROJECT_ROOT)) for s in ("random", "walk", "run")},
+        "source_pool_paths": {s: str((SOURCE_ROOT / domain / slot_dir(domain, s)).relative_to(_PROJECT_ROOT)) for s in ("random", "walk", "run")},
         **TASK_FRACTIONS[condition],
         "dataset_path": str(dataset_dir.relative_to(_PROJECT_ROOT)),
         "collection_timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -265,12 +267,12 @@ def main() -> None:
     for domain in DOMAINS:
         for source in ("walk", "run"):
             key = f"eval/{domain}/{source}"
-            r = validate_dataset(EVAL_ROOT / domain / source / "dataset", 2, 1000, ACTION_DIM[domain])
+            r = validate_dataset(EVAL_ROOT / domain / slot_dir(domain, source) / "dataset", 2, 1000, ACTION_DIM[domain])
             validation_results[key] = r
             print(f"  [{('PASS' if r['roundtrip_passed'] else 'FAIL')}] {key}: {r}")
         for condition in MIXTURES:
             key = f"mixture/{domain}/{condition}"
-            r = validate_dataset(MIXTURE_ROOT / domain / condition / "dataset", 10, 5000, ACTION_DIM[domain])
+            r = validate_dataset(MIXTURE_ROOT / domain / cond_dir(domain, condition) / "dataset", 10, 5000, ACTION_DIM[domain])
             validation_results[key] = r
             expected = EXPECTED_COUNTS[condition]
             m = all_mixture_manifests[domain][condition]

@@ -11,6 +11,8 @@ Run from the LCG/ project root:
 """
 from __future__ import annotations
 
+from hopper_naming import cond_dir, slot_dir
+
 import json
 from pathlib import Path
 
@@ -25,7 +27,7 @@ _PROJECT_ROOT = _THIS_DIR.parent.parent.parent.parent
 ENS_ROOT = _PROJECT_ROOT / "docs" / "lcg_undersample_diagnostic" / "phase6_full_ensemble"
 LCG_ROOT = _PROJECT_ROOT / "docs" / "lcg_undersample_diagnostic" / "phase5_lcg_scoring"
 
-DOMAINS = ["walker", "quadruped"]
+DOMAINS = ["walker", "quadruped", "hopper"]
 CONDITIONS = ["run_scarce", "balanced", "walk_scarce"]
 NUM_SAMPLES = 5
 
@@ -74,7 +76,7 @@ NUM_BOOTSTRAP = 10_000
 
 
 def analyze_domain_condition(domain: str, condition: str) -> dict:
-    data = json.loads((ENS_ROOT / domain / condition / "ens_summary.json").read_text())
+    data = json.loads((ENS_ROOT / domain / cond_dir(domain, condition) / "ens_summary.json").read_text())
     rows = data["per_candidate"]
     behavior = np.array([r["behavior"] for r in rows])
     episode_id = np.array([r["episode_id"] for r in rows])
@@ -233,7 +235,7 @@ def main() -> None:
             print(f"  model {label}: walk_err={e['walk']:.6f}  run_err={e['run']:.6f}")
 
     # === figure: Delta_LCG vs Delta_ENS5 across conditions, per domain ===
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(12, 5))
     x = np.arange(3)
     width = 0.35
     for ax, domain in zip(axes, DOMAINS):

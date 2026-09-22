@@ -21,6 +21,8 @@ Run from the LCG/ project root:
 """
 from __future__ import annotations
 
+from hopper_naming import cond_dir, slot_dir
+
 import json
 import sys
 from itertools import combinations
@@ -79,8 +81,11 @@ BOOTSTRAP_SEED = 999
 NUM_BOOTSTRAP = 10_000
 
 
-def load_agent(domain: str, checkpoint_path: Path):
-    probe = DMControlEnv(domain_name=domain, task_name="walk", size=64, camera_id=0, action_repeat=2)
+def load_agent(domain: str, checkpoint_path: Path, probe_task: str = "walk"):
+    """probe_task only selects which dm_control task to instantiate for reading the domain's
+    action-space bounds (identical across every task in a domain) -- default "walk" is
+    unchanged for walker/quadruped; hopper (no "walk" task) passes probe_task="stand"."""
+    probe = DMControlEnv(domain_name=domain, task_name=probe_task, size=64, camera_id=0, action_repeat=2)
     fake_env = SimpleNamespace(
         is_discrete=False, action_dim=probe.action_dim,
         action_low=torch.as_tensor(probe.action_low), action_high=torch.as_tensor(probe.action_high),
@@ -188,19 +193,23 @@ def exact_permutation_test(walk_ep_means: np.ndarray, run_ep_means: np.ndarray) 
     }
 
 
-def process_domain(domain: str, condition: str, checkpoint_path: Path = None, out_dir: Path = None) -> dict:
+def process_domain(domain: str, condition: str, checkpoint_path: Path = None, out_dir: Path = None,
+                    probe_task: str = "walk") -> dict:
     """checkpoint_path/out_dir default to Seed A's exact original paths when not passed, so
     existing call sites (and Seed A's saved results) are unaffected. Multi-seed callers pass
     an explicit seed-specific checkpoint_path and out_dir; the training dataset path
     (MIXTURES/domain/condition/dataset) is NOT parametrized by seed -- mixture composition
-    is identical across all model-training seeds by design, only the checkpoint differs."""
+    is identical across all model-training seeds by design, only the checkpoint differs.
+    probe_task only selects which dm_control task load_agent() instantiates to read the
+    domain's action-space bounds -- default "walk" is unchanged for walker/quadruped;
+    hopper (no "walk" task) passes probe_task="stand"."""
     print(f"\n{'=' * 70}\n{domain}/{condition}\n{'=' * 70}")
     checkpoint_path = checkpoint_path if checkpoint_path is not None else (
-        MODELS_ROOT / domain / condition / "checkpoints" / "agent_versions" / "agent_epoch_00001.pt"
+        MODELS_ROOT / domain / cond_dir(domain, condition) / "checkpoints" / "agent_versions" / "agent_epoch_00001.pt"
     )
     assert checkpoint_path.exists(), f"missing checkpoint: {checkpoint_path}"
 
-    agent, sigma_cfg, action_dim = load_agent(domain, checkpoint_path)
+    agent, sigma_cfg, action_dim = load_agent(domain, checkpoint_path, probe_task=probe_task)
     denoiser = agent.denoiser
     device = denoiser.device
     num_steps_conditioning = denoiser.cfg.inner_model.num_steps_conditioning
@@ -211,7 +220,7 @@ def process_domain(domain: str, condition: str, checkpoint_path: Path = None, ou
     print(f"theta_S: {len(theta_s_named)} tensors, d_S={d_S}")
 
     # --- h_D from this model's own 5000-transition training mixture ---
-    train_dataset = Dataset(MIXTURES / domain / condition / "dataset", name=f"{domain}_{condition}_train", cache_in_ram=True)
+    train_dataset = Dataset(MIXTURES / domain / cond_dir(domain, condition) / "dataset", name=f"{domain}_{condition}_train", cache_in_ram=True)
     train_dataset.load_from_default_path()
     assert train_dataset.num_steps == 5000, f"expected 5000 training transitions, got {train_dataset.num_steps}"
 
@@ -232,9 +241,9 @@ def process_domain(domain: str, condition: str, checkpoint_path: Path = None, ou
 
     # --- held-out candidates: episodes {7,8,9,10,11} from the source pools, 100 evenly-spaced transitions each ---
     indices = evenly_spaced_indices(EPISODE_LEN, N_TRANS_PER_EPISODE)
-    walk_pool = Dataset(SOURCE_POOLS / domain / "walk" / "dataset", name=f"{domain}_walk_pool", cache_in_ram=True)
+    walk_pool = Dataset(SOURCE_POOLS / domain / slot_dir(domain, "walk") / "dataset", name=f"{domain}_walk_pool", cache_in_ram=True)
     walk_pool.load_from_default_path()
-    run_pool = Dataset(SOURCE_POOLS / domain / "run" / "dataset", name=f"{domain}_run_pool", cache_in_ram=True)
+    run_pool = Dataset(SOURCE_POOLS / domain / slot_dir(domain, "run") / "dataset", name=f"{domain}_run_pool", cache_in_ram=True)
     run_pool.load_from_default_path()
 
     walk_candidates, walk_meta = build_candidates(walk_pool, HELD_OUT_EPISODE_IDS, indices, num_steps_conditioning, device)
@@ -244,7 +253,7 @@ def process_domain(domain: str, condition: str, checkpoint_path: Path = None, ou
     assert len(set(m["episode_id"] for m in run_meta)) == 5
 
     # leakage re-check: held-out episode ids/seeds vs training episode ids/seeds (per manifest)
-    mix_manifest = json.loads((MIXTURES / domain / condition / "manifest.json").read_text())
+    mix_manifest = json.loads((MIXTURES / domain / cond_dir(domain, condition) / "manifest.json").read_text())
     train_walk_ids = set(mix_manifest["walk"]["episode_ids"])
     train_run_ids = set(mix_manifest["run"]["episode_ids"])
     train_seeds = set(mix_manifest["walk"]["env_seeds"]) | set(mix_manifest["run"]["env_seeds"]) | set(mix_manifest["random"]["env_seeds"])
@@ -302,7 +311,7 @@ def process_domain(domain: str, condition: str, checkpoint_path: Path = None, ou
     print(f"run episode means:  {run_ep_means.tolist()}")
     print(f"walk denoising loss mean={walk_losses.mean():.6f}  run denoising loss mean={run_losses.mean():.6f}")
 
-    domain_dir = out_dir if out_dir is not None else (OUT_ROOT / domain / condition)
+    domain_dir = out_dir if out_dir is not None else (OUT_ROOT / domain / cond_dir(domain, condition))
     domain_dir.mkdir(parents=True, exist_ok=True)
     import csv
     with open(domain_dir / "per_transition_scores.csv", "w", newline="") as f:

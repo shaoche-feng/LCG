@@ -15,6 +15,8 @@ Run from the LCG/ project root:
 """
 from __future__ import annotations
 
+from hopper_naming import cond_dir, slot_dir
+
 import itertools
 import json
 from pathlib import Path
@@ -35,7 +37,7 @@ BOOTSTRAP_SEED = 999  # same seed convention as Phase 5's own bootstrap
 
 
 def load_episode_means(domain: str, condition: str) -> dict:
-    summary = json.loads((SCORING_ROOT / domain / condition / "summary.json").read_text())
+    summary = json.loads((SCORING_ROOT / domain / cond_dir(domain, condition) / "summary.json").read_text())
     walk_means = {int(eid): v["mean"] for eid, v in summary["walk_episode_stats"].items()}
     run_means = {int(eid): v["mean"] for eid, v in summary["run_episode_stats"].items()}
     return {
@@ -132,10 +134,10 @@ def analyze_domain(domain: str) -> dict:
     return result
 
 
-def make_figure(results: dict, out_path: Path) -> None:
+def make_figure(results: dict, out_path: Path, run_label: str = "run", walk_label: str = "walk") -> None:
     fig, ax = plt.subplots(figsize=(6, 5))
     x = [0, 1]
-    labels = ["run_scarce", "walk_scarce"]
+    labels = [f"{run_label}_scarce", f"{walk_label}_scarce"]
     colors = {"walker": "#2E86AB", "quadruped": "#C73E1D"}
     for domain, r in results.items():
         y = [r["delta_run_scarce"], r["delta_walk_scarce"]]
@@ -146,7 +148,7 @@ def make_figure(results: dict, out_path: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_xlim(-0.3, 1.3)
-    ax.set_ylabel(r"$\Delta$ = mean LCG(run) $-$ mean LCG(walk)")
+    ax.set_ylabel(rf"$\Delta$ = mean LCG({run_label}) $-$ mean LCG({walk_label})")
     ax.set_title("LCG sign reversal under reversed scarcity")
     ax.legend()
     ax.grid(alpha=0.3)

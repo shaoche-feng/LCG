@@ -32,6 +32,8 @@ Run from the LCG/ project root:
 """
 from __future__ import annotations
 
+from hopper_naming import cond_dir, slot_dir
+
 import json
 import sys
 import time
@@ -122,9 +124,9 @@ def build_domain_candidates(domain: str, num_steps_conditioning: int, device):
     held-out episodes/indices, same walk-then-run concatenation order, same flattened
     obs/act/y format for JVP scoring)."""
     indices = evenly_spaced_indices(EPISODE_LEN, N_TRANS_PER_EPISODE)
-    walk_pool = Dataset(SOURCE_POOLS / domain / "walk" / "dataset", name=f"{domain}_walk_pool", cache_in_ram=True)
+    walk_pool = Dataset(SOURCE_POOLS / domain / slot_dir(domain, "walk") / "dataset", name=f"{domain}_walk_pool", cache_in_ram=True)
     walk_pool.load_from_default_path()
-    run_pool = Dataset(SOURCE_POOLS / domain / "run" / "dataset", name=f"{domain}_run_pool", cache_in_ram=True)
+    run_pool = Dataset(SOURCE_POOLS / domain / slot_dir(domain, "run") / "dataset", name=f"{domain}_run_pool", cache_in_ram=True)
     run_pool.load_from_default_path()
 
     walk_candidates, walk_meta = build_candidates(walk_pool, HELD_OUT_EPISODE_IDS, indices, num_steps_conditioning, device)
@@ -139,10 +141,10 @@ def load_lcg_reference(domain: str, seed_label: str, condition: str) -> dict:
     """Loads Seed A/B/C's already-saved per-candidate LCG scores (full theta_S, M=12,
     production score_one_jvp_bank) for the reproduction gate."""
     if seed_label == "A":
-        path = LCG_ROOT / domain / condition / "per_transition_scores.csv"
+        path = LCG_ROOT / domain / cond_dir(domain, condition) / "per_transition_scores.csv"
     else:
         seed_num = {"B": 43, "C": 44}[seed_label]
-        path = LCG_ROOT / "multiseed" / f"seed{seed_num}" / domain / condition / "per_transition_scores.csv"
+        path = LCG_ROOT / "multiseed" / f"seed{seed_num}" / domain / cond_dir(domain, condition) / "per_transition_scores.csv"
     import csv
     out = {}
     with open(path, newline="") as f:
@@ -189,7 +191,7 @@ def main() -> None:
         print(f"[{domain}] built {len(banks)} theta_S banks (M_max={M_MAX}, seed={BANK_SEED})", flush=True)
 
         for condition in CONDITIONS:
-            train_dataset = Dataset(MIXTURES / domain / condition / "dataset",
+            train_dataset = Dataset(MIXTURES / domain / cond_dir(domain, condition) / "dataset",
                                      name=f"{domain}_{condition}_train", cache_in_ram=True)
             train_dataset.load_from_default_path()
             assert train_dataset.num_steps == 5000
@@ -202,7 +204,7 @@ def main() -> None:
                 lcg_ref = None  # lazily loaded only if/when theta_name == "full"
 
                 for theta_name in THETA_S_ORDER:
-                    out_dir = OUT_ROOT / domain / seed_label / condition / theta_name
+                    out_dir = OUT_ROOT / domain / seed_label / cond_dir(domain, condition) / theta_name
                     q_path = out_dir / "q_values.npy"
                     meta_path = out_dir / "metadata.json"
                     if q_path.exists() and meta_path.exists():

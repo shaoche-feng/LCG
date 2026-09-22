@@ -33,6 +33,8 @@ Run from the LCG/ project root:
 """
 from __future__ import annotations
 
+from hopper_naming import cond_dir, slot_dir
+
 import hashlib
 import json
 import os
@@ -81,8 +83,8 @@ def fingerprint(state_dict) -> str:
 def make_static_dataset_dir(domain: str, condition: str) -> Path:
     """Create <mixture>/for_denoiser_training/train/ as hardlinks to the real
     dataset files (no duplication). Idempotent: rebuilt fresh each call."""
-    src_dir = MIXTURE_ROOT / domain / condition / "dataset"
-    wrapper_dir = MIXTURE_ROOT / domain / condition / "for_denoiser_training"
+    src_dir = MIXTURE_ROOT / domain / cond_dir(domain, condition) / "dataset"
+    wrapper_dir = MIXTURE_ROOT / domain / cond_dir(domain, condition) / "for_denoiser_training"
     train_dir = wrapper_dir / "train"
     if wrapper_dir.exists():
         shutil.rmtree(wrapper_dir)
@@ -99,16 +101,20 @@ def make_static_dataset_dir(domain: str, condition: str) -> Path:
     return wrapper_dir
 
 
-def validate_checkpoint(domain: str, checkpoint_path: Path, expected_fingerprint: str, expected_action_dim: int) -> dict:
+def validate_checkpoint(domain: str, checkpoint_path: Path, expected_fingerprint: str, expected_action_dim: int,
+                         probe_task: str = "walk") -> dict:
     """Reload the final checkpoint into a FRESH Agent instance (fresh process
     state, not the trained Trainer object) and verify it end to end: shapes,
     finiteness, a real forward pass, action-conditioning dim, and that the
-    reloaded parameters reproduce the exact fingerprint recorded at save time."""
+    reloaded parameters reproduce the exact fingerprint recorded at save time.
+    probe_task only selects which dm_control task to instantiate for reading the domain's
+    action-space bounds (identical across every task in a domain) -- default "walk" is
+    unchanged for walker/quadruped; hopper (no "walk" task) passes probe_task="stand"."""
     from agent import Agent, get_action_space_kwargs
     sys.path.insert(0, str(_LCG_ROOT / "src" / "envs"))
     from dm_control_env import DMControlEnv
 
-    probe = DMControlEnv(domain_name=domain, task_name="walk", size=64, camera_id=0, action_repeat=2)
+    probe = DMControlEnv(domain_name=domain, task_name=probe_task, size=64, camera_id=0, action_repeat=2)
     fake_env = SimpleNamespace(
         is_discrete=False, action_dim=probe.action_dim,
         action_low=torch.as_tensor(probe.action_low), action_high=torch.as_tensor(probe.action_high),
@@ -155,16 +161,20 @@ def validate_checkpoint(domain: str, checkpoint_path: Path, expected_fingerprint
     return result
 
 
-def train_one(domain: str, condition: str, seed: int = TRAINING_SEED, theta0_path: Path = None, run_dir: Path = None) -> dict:
+def train_one(domain: str, condition: str, seed: int = TRAINING_SEED, theta0_path: Path = None, run_dir: Path = None,
+              probe_task: str = "walk") -> dict:
     """seed/theta0_path/run_dir default to Seed A's exact original values/paths when not
     passed, so existing call sites (and Seed A reproducibility) are unaffected. Multi-seed
     callers pass an explicit seed (used for BOTH which theta_0 to load AND the training RNG
     -- one unified per-realization seed, matching the paired-seed experimental design) and
-    seed-suffixed theta0_path/run_dir."""
+    seed-suffixed theta0_path/run_dir. probe_task only affects the config's nominal
+    env.train.task_name field (never resolved into a live env under static_dataset training)
+    and validate_checkpoint's action-space probe -- default "walk" unchanged for
+    walker/quadruped; hopper (no "walk" task) passes probe_task="stand"."""
     print(f"\n{'=' * 60}\n{domain}/{condition} (seed={seed})\n{'=' * 60}")
     static_dataset_dir = make_static_dataset_dir(domain, condition)
     theta0_path = theta0_path if theta0_path is not None else (MODELS_ROOT / f"theta_0_{domain}.pt")
-    run_dir = run_dir if run_dir is not None else (MODELS_ROOT / domain / condition)
+    run_dir = run_dir if run_dir is not None else (MODELS_ROOT / domain / cond_dir(domain, condition))
     if run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True)
@@ -172,7 +182,7 @@ def train_one(domain: str, condition: str, seed: int = TRAINING_SEED, theta0_pat
     overrides = [
         "env=dm_control",
         f"env.train.domain_name={domain}",
-        "env.train.task_name=walk",  # nominal only: static_dataset skips all live collection
+        f"env.train.task_name={probe_task}",  # nominal only: static_dataset skips all live collection
         "common.devices=0",
         "intrinsic_reward.enabled=false",
         "training.model_free=false",
@@ -249,7 +259,7 @@ def train_one(domain: str, condition: str, seed: int = TRAINING_SEED, theta0_pat
 
     (run_dir / "training_loss_history.json").write_text(json.dumps(losses))
 
-    checkpoint_validation = validate_checkpoint(domain, final_ckpt, final_denoiser_fp_in_memory, action_dim)
+    checkpoint_validation = validate_checkpoint(domain, final_ckpt, final_denoiser_fp_in_memory, action_dim, probe_task)
 
     result = {
         "checkpoint_validation": checkpoint_validation,

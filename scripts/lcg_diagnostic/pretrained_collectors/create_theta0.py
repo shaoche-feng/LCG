@@ -46,11 +46,14 @@ def fingerprint(state_dict) -> str:
     return h.hexdigest()
 
 
-def build_theta0(domain: str, seed: int = THETA0_SEED, out_path: Path = None) -> dict:
+def build_theta0(domain: str, seed: int = THETA0_SEED, out_path: Path = None, probe_task: str = "walk") -> dict:
     """seed/out_path default to Seed A's exact original values/filename when not passed,
     so existing call sites (and Seed A reproducibility) are unaffected. Multi-seed callers
-    pass an explicit seed and a seed-suffixed out_path (e.g. theta_0_walker_seed43.pt)."""
-    probe = DMControlEnv(domain_name=domain, task_name="walk", size=64, camera_id=0, action_repeat=2)
+    pass an explicit seed and a seed-suffixed out_path (e.g. theta_0_walker_seed43.pt).
+    probe_task only selects which dm_control task to instantiate for reading the domain's
+    action-space bounds (identical across every task in a domain) -- default "walk" is
+    unchanged for walker/quadruped; hopper (no "walk" task) passes probe_task="stand"."""
+    probe = DMControlEnv(domain_name=domain, task_name=probe_task, size=64, camera_id=0, action_repeat=2)
     fake_env = SimpleNamespace(
         is_discrete=False,
         action_dim=probe.action_dim,

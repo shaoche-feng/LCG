@@ -34,6 +34,8 @@ Run from the LCG/ project root:
 """
 from __future__ import annotations
 
+from hopper_naming import cond_dir, slot_dir
+
 import csv
 import json
 import sys
@@ -72,11 +74,11 @@ LCG_ROOT = _PROJECT_ROOT / "docs" / "lcg_undersample_diagnostic" / "phase5_lcg_s
 def checkpoint_path(domain: str, condition: str, seed_label: str) -> Path:
     sub = SEED_SUBDIRS[seed_label]
     base = MODELS_ROOT if sub is None else (MODELS_ROOT / "multiseed" / sub)
-    return base / domain / condition / "checkpoints" / "agent_versions" / "agent_epoch_00001.pt"
+    return base / domain / cond_dir(domain, condition) / "checkpoints" / "agent_versions" / "agent_epoch_00001.pt"
 
 
 def load_lcg_scores(domain: str, condition: str) -> dict:
-    path = LCG_ROOT / domain / condition / "per_transition_scores.csv"
+    path = LCG_ROOT / domain / cond_dir(domain, condition) / "per_transition_scores.csv"
     out = {}
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
@@ -87,9 +89,9 @@ def load_lcg_scores(domain: str, condition: str) -> dict:
 
 def build_domain_candidates(domain: str, n_cond: int, device) -> list:
     indices = evenly_spaced_indices(EPISODE_LEN, N_TRANS_PER_EPISODE)
-    walk_pool = Dataset(SOURCE_POOLS / domain / "walk" / "dataset", name=f"{domain}_walk_pool", cache_in_ram=True)
+    walk_pool = Dataset(SOURCE_POOLS / domain / slot_dir(domain, "walk") / "dataset", name=f"{domain}_walk_pool", cache_in_ram=True)
     walk_pool.load_from_default_path()
-    run_pool = Dataset(SOURCE_POOLS / domain / "run" / "dataset", name=f"{domain}_run_pool", cache_in_ram=True)
+    run_pool = Dataset(SOURCE_POOLS / domain / slot_dir(domain, "run") / "dataset", name=f"{domain}_run_pool", cache_in_ram=True)
     run_pool.load_from_default_path()
     pools = {"walk": walk_pool, "run": run_pool}
 
@@ -148,13 +150,13 @@ def save_representative_figure(out_path: Path, tag: str, c: dict, y_hat: dict, m
 
 
 def process_domain_condition(domain: str, condition: str, candidates: list, noises: list, lcg_scores: dict,
-                              out_dir: Path) -> dict:
+                              out_dir: Path, probe_task: str = "walk") -> dict:
     print(f"\n{'=' * 70}\n{domain}/{condition}\n{'=' * 70}", flush=True)
     agents = {}
     for label in ("A", "B", "C"):
         ckpt = checkpoint_path(domain, condition, label)
         assert ckpt.exists(), f"missing checkpoint: {ckpt}"
-        agent, _, _ = load_agent(domain, ckpt)
+        agent, _, _ = load_agent(domain, ckpt, probe_task=probe_task)
         agents[label] = agent
 
     device = agents["A"].denoiser.device
@@ -297,7 +299,7 @@ def main() -> None:
 
         for condition in CONDITIONS:
             lcg_scores = load_lcg_scores(domain, condition)
-            out_dir = OUT_ROOT / domain / condition
+            out_dir = OUT_ROOT / domain / cond_dir(domain, condition)
             r = process_domain_condition(domain, condition, candidates, noises, lcg_scores, out_dir)
             runtime_log[f"{domain}/{condition}"] = r
 

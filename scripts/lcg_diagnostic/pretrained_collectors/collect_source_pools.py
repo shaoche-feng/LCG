@@ -12,6 +12,8 @@ Run from the LCG/ project root:
 """
 from __future__ import annotations
 
+from hopper_naming import cond_dir, slot_dir
+
 import json
 import shutil
 import sys
@@ -48,6 +50,21 @@ SOURCES = {
 }
 DOMAINS = ["walker", "quadruped"]
 
+# Maps our internal pool/behavior slot ("walk"=calmer/abundant-by-default, "run"=more
+# dynamic) to the ACTUAL dm_control task name for that domain. walker/quadruped really do
+# have "walk"/"run" tasks, so this is the identity. hopper has no walk/run tasks at all
+# (dm_control.suite.ALL_TASKS only exposes "stand"/"hop" for hopper) -- "stand" is aliased
+# into our "walk" slot and "hop" into our "run" slot purely so every downstream script
+# (Phase 5 onward: CSV "behavior" column, CONDITIONS naming, plotting scripts) keeps working
+# completely unmodified. This alias is ONLY used here, for picking the right dm_control task
+# / TD-MPC2 checkpoint file -- pool directories, manifests, and every later diagnostic still
+# say "walk"/"run" throughout.
+DOMAIN_BEHAVIOR_TASK = {
+    "walker": {"walk": "walk", "run": "run"},
+    "quadruped": {"walk": "walk", "run": "run"},
+    "hopper": {"walk": "stand", "run": "hop"},
+}
+
 
 class RandomActionCollector:
     """Uniform-random-native-action policy. Not a checkpoint -- documented
@@ -71,6 +88,10 @@ def _forward_velocity(domain: str, dm_env: DMControlEnv) -> float:
     physics = dm_env._dm_env.physics
     if domain == "walker":
         return float(physics.horizontal_velocity())
+    if domain == "hopper":
+        # hopper's Physics exposes neither horizontal_velocity() nor torso_velocity() --
+        # generic named-data lookup, matching the same "root body's x-velocity" idea.
+        return float(physics.named.data.subtree_linvel["torso"][0])
     return float(physics.torso_velocity()[0])
 
 
@@ -125,7 +146,7 @@ def collect_episode(domain: str, task: str, collector, env_seed: int):
 
 def collect_pool(domain: str, source_name: str) -> dict:
     cfg = SOURCES[source_name]
-    env_task = cfg["env_task_for_instantiation"]
+    env_task = DOMAIN_BEHAVIOR_TASK[domain][cfg["env_task_for_instantiation"]]
     print(f"\n=== {domain}/{source_name} (target {cfg['target_transitions']} transitions) ===")
 
     probe_env = DMControlEnv(domain_name=domain, task_name=env_task, size=IMG_SIZE, camera_id=CAMERA_ID,
@@ -138,11 +159,12 @@ def collect_pool(domain: str, source_name: str) -> dict:
         collector = RandomActionCollector(native_min, native_max, dtype=np.float32)
         collector_task_label = None
     else:
-        collector = load_pretrained_collector(source="tdmpc2", domain=domain, task=source_name, seed=COLLECTOR_SEED)
-        checkpoint_name = f"{domain}-{source_name}-{COLLECTOR_SEED}.pt"
+        checkpoint_task = DOMAIN_BEHAVIOR_TASK[domain][source_name]
+        collector = load_pretrained_collector(source="tdmpc2", domain=domain, task=checkpoint_task, seed=COLLECTOR_SEED)
+        checkpoint_name = f"{domain}-{checkpoint_task}-{COLLECTOR_SEED}.pt"
         collector_task_label = source_name
 
-    pool_dir = OUT_ROOT / domain / source_name
+    pool_dir = OUT_ROOT / domain / slot_dir(domain, source_name)
     if pool_dir.exists():
         shutil.rmtree(pool_dir)
     dataset_dir = pool_dir / "dataset"
