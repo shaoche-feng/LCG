@@ -28,8 +28,8 @@ class DiagnosticStop(RuntimeError):
 
 
 class PMPORunDiagnostic:
-    def __init__(self, cfg, model, env_cfg):
-        self.cfg, self.model, self.env_cfg = cfg, model, env_cfg
+    def __init__(self, cfg, model, env_cfg, optimizers=None):
+        self.cfg, self.model, self.env_cfg, self.optimizers = cfg, model, env_cfg, optimizers
         self.path = Path(cfg.output_dir)
         self.path.mkdir(parents=True, exist_ok=True)
         self.fixed_real = None
@@ -41,20 +41,27 @@ class PMPORunDiagnostic:
         with (self.path / name).open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, allow_nan=False) + "\n")
 
-    def save_diagnostic_checkpoint(self, update):
-        # Observation only: a plain torch.save of the CURRENT weights, taken between
-        # optimizer steps (never mid-backward), so it never perturbs training state or
-        # semantics. Actor/value/prior only -- no optimizer/scheduler state, since this
-        # snapshot exists purely so a stopped bounded diagnostic still has *some* real
-        # weights to evaluate/inspect, not so the run can be resumed exactly.
-        torch.save({"actor": self.model.actor.state_dict(), "value": self.model.value.state_dict(),
-                    "prior_actor": self.model.prior_actor.state_dict(), "update": update},
-                   self.path / f"checkpoint_update_{update:05d}.pt")
+    def save_diagnostic_checkpoint(self, update, tag=None):
+        # Observation only: a plain torch.save taken between optimizer steps (never
+        # mid-backward), so it never perturbs training state or semantics. model_state
+        # is the FULL PMPOBeta state_dict (actor/value/prior_actor/updates-counter/
+        # action bounds, exactly what checkpoint/resume already relies on); optimizers
+        # (if provided) is PMPOOptimizers.state_dict() (actor+value Adam + both LR
+        # schedulers); rng is the model's own imagination-RNG snapshot dict (the only
+        # RNG state this branch tracks -- there is no separate global torch/numpy/python
+        # RNG checkpoint here, unlike the richer DrQ branch); config is the model's own
+        # PMPOBetaConfig (picklable dataclass) for exact hyperparameter provenance.
+        payload = {"model_state": self.model.state_dict(),
+                   "optimizers": self.optimizers.state_dict() if self.optimizers is not None else None,
+                   "rng": self.model._rng, "config": self.model.cfg, "update": update}
+        name = f"checkpoint_update_{update:05d}" + (f"_{tag}" if tag else "")
+        torch.save(payload, self.path / f"{name}.pt")
 
     def check_update(self, metrics, epoch, update):
         row = {k: float(v) for k, v in metrics.items()}
         row.update(epoch=epoch, update=update)
         if not all(np.isfinite(v) for v in row.values()):
+            self.save_diagnostic_checkpoint(update, tag="stop")
             raise DiagnosticStop("Non-finite controller diagnostic")
         self.write("updates.jsonl", row)
         if update in self.checkpoint_updates:
@@ -85,6 +92,7 @@ class PMPORunDiagnostic:
             reason = "Abrupt entropy collapse with mean concentration above 100"
         self.previous_entropy_per_dim = entropy
         if reason:
+            self.save_diagnostic_checkpoint(update, tag="stop")
             self.write("stop.jsonl", dict(epoch=epoch, update=update, reason=reason))
             raise DiagnosticStop(reason)
 

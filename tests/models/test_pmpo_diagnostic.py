@@ -32,8 +32,12 @@ def test_health_stops_are_observation_only(tmp_path, key, value):
 
 
 def test_diagnostic_checkpoint_saved_at_milestones_without_touching_model(tmp_path):
+    from models.pmpo_beta import PMPOOptimizers
+
+    model = make_controller()
+    opt = PMPOOptimizers(model, warmup_steps=0)
     diag = PMPORunDiagnostic(SimpleNamespace(output_dir=str(tmp_path), evaluation_seeds=[11, 22],
-                                             checkpoint_updates=(2, 4)), make_controller(), {})
+                                             checkpoint_updates=(2, 4)), model, {}, optimizers=opt)
     before = [p.clone() for p in diag.model.parameters()]
     metrics = healthy()
     diag.check_update(metrics, 1, 1)
@@ -47,9 +51,22 @@ def test_diagnostic_checkpoint_saved_at_milestones_without_touching_model(tmp_pa
     for p, q in zip(before, diag.model.parameters()):
         torch.testing.assert_close(p, q, rtol=0, atol=0)
     saved = torch.load(tmp_path / "checkpoint_update_00002.pt", weights_only=False)
-    assert saved["update"] == 2 and set(saved) == {"actor", "value", "prior_actor", "update"}
-    for key, p in saved["actor"].items():
-        torch.testing.assert_close(p, diag.model.actor.state_dict()[key], rtol=0, atol=0)
+    assert saved["update"] == 2 and set(saved) == {"model_state", "optimizers", "rng", "config", "update"}
+    for key, p in saved["model_state"].items():
+        if torch.is_tensor(p):  # _extra_state (the model's own RNG dict) isn't a tensor
+            torch.testing.assert_close(p, diag.model.state_dict()[key], rtol=0, atol=0)
+    torch.testing.assert_close(saved["optimizers"]["actor"]["param_groups"][0]["lr"],
+                               opt.state_dict()["actor"]["param_groups"][0]["lr"])
+    assert saved["config"].fixed_prior == model.cfg.fixed_prior
+
+
+def test_diagnostic_checkpoint_saved_before_stop(tmp_path):
+    diag = diagnostics(tmp_path)
+    metrics = healthy()
+    metrics["kl_prior"] = 11
+    with pytest.raises(DiagnosticStop):
+        diag.check_update(metrics, 1, 7)
+    assert (tmp_path / "checkpoint_update_00007_stop.pt").exists()
 
 
 def test_sustained_boundary_and_constant_stops(tmp_path):

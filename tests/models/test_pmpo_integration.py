@@ -126,6 +126,85 @@ def test_fixed_prior_never_refreshes_while_actor_moves():
     assert torch.isfinite(kl_after).all() and (kl_after > 0).any()
 
 
+def test_slower_prior_refresh_blocks_and_checkpoint_round_trip():
+    # prior_refresh_interval=3 exercises EXACTLY the same modular-arithmetic refresh
+    # code path as the real 500-update experiment (nothing in forward()/PMPOBetaConfig
+    # is specific to the number 500) -- a small interval keeps this test fast while
+    # covering every block-boundary behavior requested for refresh=500.
+    from torch.distributions import kl_divergence
+    from models.pmpo_beta import PMPOBeta
+
+    model, _ = make_system(prior_refresh_interval=3)
+    opt = PMPOOptimizers(model, 0)
+
+    # 1. prior equals current actor at initialization.
+    initial_actor = deepcopy(model.actor.state_dict())
+    for key, p in model.prior_actor.state_dict().items():
+        torch.testing.assert_close(p, initial_actor[key], rtol=0, atol=0)
+    obs = torch.randn(4, 12, 8, 8)
+    # 6. KL immediately after refresh (here: at initialization, block 0) is ~0.
+    kl0 = kl_divergence(model.distribution(model.actor(obs)), model.distribution(model.prior_actor(obs))).sum(-1)
+    torch.testing.assert_close(kl0, torch.zeros_like(kl0), atol=1e-6, rtol=0)
+
+    def full_cycle():
+        # A real training step: only opt.step() advances self.updates (the modular
+        # refresh counter forward() reads), so every refresh-boundary check below uses
+        # this, never a bare model() call (which would leave self.updates unchanged).
+        opt.zero_grad()
+        loss, metrics = model()
+        loss.backward()
+        opt.step()
+        return metrics
+
+    # 2 & 3. prior remains frozen (no gradient, bit-identical) through updates 0, 1, 2
+    # (the whole first block, refresh_interval=3 -> next refresh at update 3).
+    for _ in range(3):
+        for key, p in model.prior_actor.state_dict().items():
+            torch.testing.assert_close(p, initial_actor[key], rtol=0, atol=0)
+        full_cycle()
+        assert all(p.grad is None for p in model.prior_actor.parameters())
+
+    # 4. current actor changed over that interval.
+    assert any(not torch.equal(p, initial_actor[n]) for n, p in model.actor.state_dict().items())
+    assert model.updates.item() == 3
+
+    # 5 & 6. at the refresh update (self.updates==3) the prior becomes an exact copy of
+    # the actor as of the START of this cycle, and the KL this SAME forward() computed
+    # (dist vs the just-refreshed prior, before this cycle's own gradient step moves the
+    # actor further) is ~0 -- read directly from that cycle's own metrics, not
+    # recomputed afterward (which would already reflect one more step of drift).
+    actor_at_block1_start = deepcopy(model.actor.state_dict())
+    metrics_at_refresh = full_cycle()
+    for key, p in model.prior_actor.state_dict().items():
+        torch.testing.assert_close(p, actor_at_block1_start[key], rtol=0, atol=0)
+    torch.testing.assert_close(metrics_at_refresh["kl_prior"], torch.zeros_like(metrics_at_refresh["kl_prior"]), atol=1e-5, rtol=0)
+
+    # 7. prior stays frozen through the whole second block (updates 3, 4, 5).
+    prior_block1 = deepcopy(model.prior_actor.state_dict())
+    for _ in range(2):
+        for key, p in model.prior_actor.state_dict().items():
+            torch.testing.assert_close(p, prior_block1[key], rtol=0, atol=0)
+        full_cycle()
+    assert model.updates.item() == 6
+
+    # 8. second refresh occurs correctly at self.updates==6.
+    actor_at_block2_start = deepcopy(model.actor.state_dict())
+    full_cycle()
+    for key, p in model.prior_actor.state_dict().items():
+        torch.testing.assert_close(p, actor_at_block2_start[key], rtol=0, atol=0)
+
+    # 9. checkpoint/resume: state_dict/load_state_dict round-trips the current prior
+    # block (prior_actor weights) and the update counter (which block we're in).
+    sd = deepcopy(model.state_dict())
+    fresh = make_controller(prior_refresh_interval=3)
+    fresh.load_state_dict(sd)
+    torch.testing.assert_close(fresh.updates, model.updates, rtol=0, atol=0)
+    for key, p in fresh.prior_actor.state_dict().items():
+        torch.testing.assert_close(p, model.prior_actor.state_dict()[key], rtol=0, atol=0)
+    for key, p in fresh.actor.state_dict().items():
+        torch.testing.assert_close(p, model.actor.state_dict()[key], rtol=0, atol=0)
+
+
 def test_env_loop_preserves_pre_reset_observation():
     from coroutines.env_loop import make_env_loop
     class InPlaceEnv:
