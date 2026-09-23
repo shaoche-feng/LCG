@@ -35,10 +35,21 @@ class PMPORunDiagnostic:
         self.fixed_real = None
         self.boundary_streak = self.constant_streak = self.one_sided_epochs = 0
         self.previous_entropy_per_dim = None
+        self.checkpoint_updates = set(getattr(cfg, "checkpoint_updates", ()))
 
     def write(self, name, record):
         with (self.path / name).open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, allow_nan=False) + "\n")
+
+    def save_diagnostic_checkpoint(self, update):
+        # Observation only: a plain torch.save of the CURRENT weights, taken between
+        # optimizer steps (never mid-backward), so it never perturbs training state or
+        # semantics. Actor/value/prior only -- no optimizer/scheduler state, since this
+        # snapshot exists purely so a stopped bounded diagnostic still has *some* real
+        # weights to evaluate/inspect, not so the run can be resumed exactly.
+        torch.save({"actor": self.model.actor.state_dict(), "value": self.model.value.state_dict(),
+                    "prior_actor": self.model.prior_actor.state_dict(), "update": update},
+                   self.path / f"checkpoint_update_{update:05d}.pt")
 
     def check_update(self, metrics, epoch, update):
         row = {k: float(v) for k, v in metrics.items()}
@@ -46,6 +57,8 @@ class PMPORunDiagnostic:
         if not all(np.isfinite(v) for v in row.values()):
             raise DiagnosticStop("Non-finite controller diagnostic")
         self.write("updates.jsonl", row)
+        if update in self.checkpoint_updates:
+            self.save_diagnostic_checkpoint(update)
         reason = None
         if max(row["alpha_max"], row["beta_max"]) > 1e4:
             reason = "Beta concentration exceeded 10000"

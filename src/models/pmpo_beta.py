@@ -27,6 +27,11 @@ class PMPOBetaConfig(ActorCriticConfig):
     alpha_pmpo: float = 0.5
     beta_kl: float = 0.3
     prior_refresh_interval: int = 10
+    # Diagnosis-only knob (see docs/pmpo_beta/k4_implementation.md): when True, the prior is
+    # snapshotted once at construction and never refreshed again, isolating the moving-prior
+    # trust-region mechanism as the single variable under test. False (default) preserves the
+    # existing every-prior_refresh_interval-updates moving prior exactly as before.
+    fixed_prior: bool = False
     concentration_min: float = 1.0
     imagination_horizon: int = 15
     max_grad_norm: float = 10.0
@@ -217,7 +222,7 @@ class PMPOBeta(nn.Module):
 
     def forward(self):
         c = self.cfg
-        if self.updates.item() % c.prior_refresh_interval == 0:
+        if not c.fixed_prior and self.updates.item() % c.prior_refresh_interval == 0:
             self.prior_actor.load_state_dict(self.actor.state_dict())
         self.prior_actor.eval()
         obs, act, rew, end, trunc, _, old_values, bootstrap, infos = self.collect_imagination()

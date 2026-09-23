@@ -31,6 +31,27 @@ def test_health_stops_are_observation_only(tmp_path, key, value):
         torch.testing.assert_close(p, q, rtol=0, atol=0)
 
 
+def test_diagnostic_checkpoint_saved_at_milestones_without_touching_model(tmp_path):
+    diag = PMPORunDiagnostic(SimpleNamespace(output_dir=str(tmp_path), evaluation_seeds=[11, 22],
+                                             checkpoint_updates=(2, 4)), make_controller(), {})
+    before = [p.clone() for p in diag.model.parameters()]
+    metrics = healthy()
+    diag.check_update(metrics, 1, 1)
+    assert not (tmp_path / "checkpoint_update_00001.pt").exists()
+    diag.check_update(metrics, 1, 2)
+    assert (tmp_path / "checkpoint_update_00002.pt").exists()
+    diag.check_update(metrics, 1, 3)
+    assert not (tmp_path / "checkpoint_update_00003.pt").exists()
+    diag.check_update(metrics, 1, 4)
+    assert (tmp_path / "checkpoint_update_00004.pt").exists()
+    for p, q in zip(before, diag.model.parameters()):
+        torch.testing.assert_close(p, q, rtol=0, atol=0)
+    saved = torch.load(tmp_path / "checkpoint_update_00002.pt", weights_only=False)
+    assert saved["update"] == 2 and set(saved) == {"actor", "value", "prior_actor", "update"}
+    for key, p in saved["actor"].items():
+        torch.testing.assert_close(p, diag.model.actor.state_dict()[key], rtol=0, atol=0)
+
+
 def test_sustained_boundary_and_constant_stops(tmp_path):
     diag = diagnostics(tmp_path)
     metrics = healthy()

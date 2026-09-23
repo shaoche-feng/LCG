@@ -93,6 +93,39 @@ def test_prior_refresh_blocks():
         torch.testing.assert_close(p, expected[key], rtol=0, atol=0)
 
 
+def test_fixed_prior_never_refreshes_while_actor_moves():
+    from torch.distributions import kl_divergence
+
+    # Tiny refresh_interval=2 means a moving prior WOULD refresh almost every call;
+    # fixed_prior=True must override that entirely, for the whole run.
+    model, _ = make_system(fixed_prior=True, prior_refresh_interval=2)
+    opt = PMPOOptimizers(model, 0)
+    original_prior = deepcopy(model.prior_actor.state_dict())
+    original_actor = deepcopy(model.actor.state_dict())
+
+    for name, p in original_prior.items():
+        torch.testing.assert_close(p, original_actor[name], rtol=0, atol=0)
+
+    obs = torch.randn(4, 12, 8, 8)
+    kl_initial = kl_divergence(model.distribution(model.actor(obs)), model.distribution(model.prior_actor(obs))).sum(-1)
+    torch.testing.assert_close(kl_initial, torch.zeros_like(kl_initial), atol=1e-6, rtol=0)
+
+    for _ in range(5):
+        opt.zero_grad()
+        loss, metrics = model()
+        assert torch.isfinite(torch.as_tensor(metrics["kl_prior"])).all()
+        loss.backward()
+        assert all(p.grad is None for p in model.prior_actor.parameters())
+        opt.step()
+        for key, p in model.prior_actor.state_dict().items():
+            torch.testing.assert_close(p, original_prior[key], rtol=0, atol=0)
+
+    assert all(not p.requires_grad for p in model.prior_actor.parameters())
+    assert any(not torch.equal(p, original_actor[n]) for n, p in model.actor.state_dict().items())
+    kl_after = kl_divergence(model.distribution(model.actor(obs)), model.distribution(model.prior_actor(obs))).sum(-1)
+    assert torch.isfinite(kl_after).all() and (kl_after > 0).any()
+
+
 def test_env_loop_preserves_pre_reset_observation():
     from coroutines.env_loop import make_env_loop
     class InPlaceEnv:
