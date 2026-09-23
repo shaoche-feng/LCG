@@ -16,8 +16,13 @@ actor_critic:
   # Dreamer 4 Eq. 11; KL and log probabilities sum action dimensions, in nats.
   alpha_pmpo: 0.5
   beta_kl: 0.3
-  # Snapshot before updates 0,10,20,...; held fixed for ten fresh-rollout updates.
-  prior_refresh_interval: 10
+  # Snapshot before updates 0,500,1000,...; held fixed for 500 fresh-rollout updates.
+  # A moving prior refreshed every 10 updates was validated to collapse (beta
+  # concentration runaway, entropy collapse, action-boundary drift, near-state-
+  # independent policy); 500 is the validated, characterized configuration -- see
+  # docs/pmpo_beta/k4_implementation.md and the fixed-prior/refresh-500/full-loop
+  # diagnostic runs on branch pmpo-beta-continuous.
+  prior_refresh_interval: 500
   concentration_min: 1.0
   imagination_horizon: ${world_model_env.horizon}
   max_grad_norm: 10.0
