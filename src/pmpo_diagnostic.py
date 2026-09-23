@@ -6,9 +6,20 @@ import random
 
 import numpy as np
 import torch
+import wandb
 
 from coroutines.frame_history import FrameHistory
 from envs.dm_control_env import DMControlEnv
+
+# Clean wandb namespace for the main PMPO monitoring metrics (see check_update);
+# mirrored only when a wandb run is already active (wandb.mode != "disabled"), so
+# training behaves identically with or without it. Keys are read from the SAME row
+# dict written to updates.jsonl, which remains the authoritative record either way.
+_WANDB_UPDATE_KEYS = (
+    "alpha_mean", "beta_mean", "policy_entropy", "kl_prior", "kl_initial", "loss_actor",
+    "loss_value", "actor_grad_norm", "value_grad_norm", "near_lower_fraction",
+    "near_upper_fraction", "positive_fraction",
+)
 
 
 @contextmanager
@@ -78,20 +89,32 @@ class PMPORunDiagnostic:
         if self.trainer_state_fn is None:
             return
         payload = {"trainer_state": self.trainer_state_fn(), "epoch": epoch, "update": update}
-        name = f"agent_epoch_{epoch:05d}_pmpo_update_{update:06d}" + (f"_{tag}" if tag else "")
-        torch.save(payload, self.path / f"{name}.pt")
+        # agent_pmpo_update_NNNNNN[_tag].pt -- epoch is still inside the payload for
+        # provenance, just not in the filename (the update count is what matters for
+        # matching this checkpoint to a prior-refresh block boundary).
+        name = f"agent_pmpo_update_{update:06d}" + (f"_{tag}" if tag else "")
+        path = self.path / f"{name}.pt"
+        torch.save(payload, path)
+        self.write("checkpoints.jsonl", dict(epoch=epoch, update=update, tag=tag, path=str(path)))
 
-    def check_update(self, metrics, epoch, update):
+    def check_update(self, metrics, epoch, update, real_steps=None):
         row = {k: float(v) for k, v in metrics.items()}
-        row.update(epoch=epoch, update=update)
-        if not all(np.isfinite(v) for v in row.values()):
+        interval = self.model.cfg.prior_refresh_interval
+        row.update(epoch=epoch, update=update, real_steps=real_steps,
+                   prior_refresh_interval=interval, prior_refresh_event=(update % interval == 0),
+                   prior_block_position=update % interval)
+        finite_row = {k: v for k, v in row.items() if isinstance(v, (int, float))}
+        if not all(np.isfinite(v) for v in finite_row.values()):
             self.save_diagnostic_checkpoint(update, tag="stop")
             self.save_full_training_checkpoint(epoch, update, tag="stop")
             raise DiagnosticStop("Non-finite controller diagnostic")
         self.write("updates.jsonl", row)
+        if wandb.run is not None:
+            wandb.log({"pmpo/actor_update": update, "pmpo/real_env_steps": real_steps,
+                       **{f"pmpo/{k}": row[k] for k in _WANDB_UPDATE_KEYS if k in row}})
         if update in self.checkpoint_updates:
             self.save_diagnostic_checkpoint(update)
-        if update > 0 and update % self.model.cfg.prior_refresh_interval == 0:
+        if update > 0 and update % interval == 0:
             self.save_full_training_checkpoint(epoch, update)
         reason = None
         if max(row["alpha_max"], row["beta_max"]) > 1e4:
@@ -202,13 +225,20 @@ class PMPORunDiagnostic:
         for name in ("alpha", "beta"):
             aggregate[f"{name}_min"] = min(r[f"{name}_min"] for r in rows)
             aggregate[f"{name}_max"] = max(r[f"{name}_max"] for r in rows)
-        row = dict(epoch=epoch, real_training_steps=real_steps, controller_updates=len(rows), **aggregate,
+        global_update = self.model.updates.item()
+        row = dict(epoch=epoch, real_training_steps=real_steps, controller_updates=len(rows),
+                   global_pmpo_update=global_update, **aggregate,
                    **self.world_model_loss_summary(logs), **self.evaluate())
+        if wandb.run is not None:
+            wandb.log({"pmpo/actor_update": global_update, "pmpo/real_env_steps": real_steps,
+                       "eval/return_mean": row["eval_return_mean"], "eval/return_median": row["eval_return_median"],
+                       "eval/return_std": row["eval_return_std"], "eval/return_min": row["eval_return_min"],
+                       "eval/return_max": row["eval_return_max"]})
         one_sided = min(row["positive_fraction"], row["negative_fraction"]) < 0.01
         self.one_sided_epochs = self.one_sided_epochs + 1 if one_sided else 0
         row["one_sided_epochs"] = self.one_sided_epochs
         row["prolonged_one_sided_flag"] = self.one_sided_epochs >= 3
         self.write("epochs.jsonl", row)
         print("PMPO_EPOCH " + json.dumps(row, allow_nan=False), flush=True)
-        self.save_full_training_checkpoint(epoch, self.model.updates.item(), tag="epoch")
+        self.save_full_training_checkpoint(epoch, global_update, tag="epoch")
         return row

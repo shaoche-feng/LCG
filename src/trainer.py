@@ -473,7 +473,8 @@ class Trainer(StateDictMixin):
                 loss.backward()
                 metrics.update(opt.step())
                 if self._pmpo_diagnostic is not None:
-                    self._pmpo_diagnostic.check_update(metrics, self.epoch, self.num_batch_train.actor_critic)
+                    self._pmpo_diagnostic.check_update(metrics, self.epoch, self.num_batch_train.actor_critic,
+                                                       real_steps=self.train_dataset.num_steps)
                 if self.agent.actor_critic.cfg.log_diagnostics:
                     print("PMPO_DIAGNOSTICS " + json.dumps({k: float(v) for k, v in metrics.items()}), flush=True)
                 self.num_batch_train.actor_critic += 1

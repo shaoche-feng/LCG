@@ -52,6 +52,8 @@ def test_actual_diamond_rollout_and_update():
     loss, metrics = model()
     assert metrics["rollout_length"] == 3
     assert abs(metrics["return_mean"]) < 1e6
+    assert "kl_initial" in metrics and float(metrics["kl_initial"]) == pytest.approx(0.0, abs=1e-5)
+    assert all(p.grad is None for p in model.initial_actor.parameters())
     loss.backward()
     metrics.update(opt.step())
     assert all(torch.isfinite(torch.as_tensor(v)).all() for v in metrics.values())
@@ -203,6 +205,50 @@ def test_slower_prior_refresh_blocks_and_checkpoint_round_trip():
         torch.testing.assert_close(p, model.prior_actor.state_dict()[key], rtol=0, atol=0)
     for key, p in fresh.actor.state_dict().items():
         torch.testing.assert_close(p, model.actor.state_dict()[key], rtol=0, atol=0)
+
+
+def test_resume_mid_block_does_not_restart_prior_schedule_from_zero():
+    # Simulates a real resume: train to a NON-multiple-of-interval update count (2 out
+    # of a 3-update block, i.e. the equivalent of "250 into the 1500-1999 block" from
+    # the 500-update production schedule), checkpoint via state_dict, load into a FRESH
+    # model/optimizer/env (matching what a real process restart does), then confirm the
+    # very next update does NOT refresh (still mid-block) and the refresh AFTER that
+    # lands at the correct absolute boundary (3), not at a schedule restarted from 0.
+    model, _ = make_system(prior_refresh_interval=3)
+    opt = PMPOOptimizers(model, 0)
+    for _ in range(2):
+        opt.zero_grad()
+        loss, _ = model()
+        loss.backward()
+        opt.step()
+    assert model.updates.item() == 2
+    prior_at_save = deepcopy(model.prior_actor.state_dict())
+    sd = deepcopy(model.state_dict())
+
+    fresh, _ = make_system(prior_refresh_interval=3)
+    fresh_opt = PMPOOptimizers(fresh, 0)
+    fresh.load_state_dict(sd)
+    for key, p in fresh.prior_actor.state_dict().items():
+        torch.testing.assert_close(p, prior_at_save[key], rtol=0, atol=0)
+
+    # Resumed update index 2 (mid-block): must NOT refresh.
+    fresh_opt.zero_grad()
+    loss, _ = fresh()
+    loss.backward()
+    fresh_opt.step()
+    assert fresh.updates.item() == 3
+    for key, p in fresh.prior_actor.state_dict().items():
+        torch.testing.assert_close(p, prior_at_save[key], rtol=0, atol=0)
+
+    # Resumed update index 3: this IS the correct absolute block boundary (3, not 0) --
+    # refresh must fire here, using the actor as of the start of this exact call.
+    actor_before_refresh = deepcopy(fresh.actor.state_dict())
+    fresh_opt.zero_grad()
+    loss, _ = fresh()
+    loss.backward()
+    fresh_opt.step()
+    for key, p in fresh.prior_actor.state_dict().items():
+        torch.testing.assert_close(p, actor_before_refresh[key], rtol=0, atol=0)
 
 
 def test_env_loop_preserves_pre_reset_observation():

@@ -118,6 +118,11 @@ class PMPOBeta(nn.Module):
         self.actor = VisualHead(stacked_cfg, cfg.actor_hidden_dims, 2 * cfg.continuous_action_dim)
         self.value = VisualHead(stacked_cfg, cfg.value_hidden_dims, 1)
         self.prior_actor = deepcopy(self.actor).requires_grad_(False).eval()
+        # Diagnostic only (see pmpo_diagnostic.py): a SEPARATE frozen snapshot from
+        # prior_actor, taken once here and never refreshed, so KL(current || initial)
+        # can distinguish local (per-block) trust-region movement from total cumulative
+        # drift over the whole run. Never read by the loss.
+        self.initial_actor = deepcopy(self.actor).requires_grad_(False).eval()
         self.continuous_action = True
         self.continuous_reward = True
         # Compatibility with env_loop: this feedforward prototype has no recurrent state.
@@ -237,12 +242,16 @@ class PMPOBeta(nn.Module):
         dist = self.distribution(raw)
         with torch.no_grad():
             prior = self.distribution(self.prior_actor(flat_obs))
+            # Diagnostic only, see initial_actor's docstring above: never added to
+            # actor_loss, computed fully detached so it cannot perturb the main graph.
+            kl_initial = kl_divergence(self.distribution(raw.detach()), self.distribution(self.initial_actor(flat_obs))).sum(-1)
         kl = kl_divergence(dist, prior).sum(-1)
         actor_loss = pmpo_loss(logp, advantage.flatten(), c.alpha_pmpo) + c.beta_kl * kl.mean()
         value_loss = F.mse_loss(values, targets.flatten())
         require_finite(targets=targets, values=values, kl=kl, actor_loss=actor_loss, value_loss=value_loss)
         metrics = self.diagnostics(raw.detach(), act.flatten(0, 1), logp.detach(), entropy.detach())
         metrics.update(loss_actor=actor_loss.detach(), loss_value=value_loss.detach(), kl_prior=kl.mean().detach(),
+                       kl_initial=kl_initial.mean().detach(),
                        value_mean=values.mean().detach(), value_std=values.std(unbiased=False).detach(),
                        return_mean=targets.mean(), return_std=targets.std(unbiased=False),
                        positive_fraction=(advantage >= 0).float().mean(), negative_fraction=(advantage < 0).float().mean(),

@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -81,13 +82,15 @@ def test_full_training_checkpoint_saved_every_prior_refresh_interval(tmp_path):
     for u in range(1, 7):
         diag.check_update(metrics, epoch=2, update=u)
     # prior_refresh_interval=3 -> full checkpoints at updates 3 and 6 only.
-    assert (tmp_path / "agent_epoch_00002_pmpo_update_000003.pt").exists()
-    assert (tmp_path / "agent_epoch_00002_pmpo_update_000006.pt").exists()
+    assert (tmp_path / "agent_pmpo_update_000003.pt").exists()
+    assert (tmp_path / "agent_pmpo_update_000006.pt").exists()
     for u in (1, 2, 4, 5):
-        assert not (tmp_path / f"agent_epoch_00002_pmpo_update_{u:06d}.pt").exists()
-    saved = torch.load(tmp_path / "agent_epoch_00002_pmpo_update_000003.pt", weights_only=False)
+        assert not (tmp_path / f"agent_pmpo_update_{u:06d}.pt").exists()
+    saved = torch.load(tmp_path / "agent_pmpo_update_000003.pt", weights_only=False)
     assert saved["epoch"] == 2 and saved["update"] == 3
     assert saved["trainer_state"] == {"fake": "trainer_state", "n_calls": 1}
+    checkpoint_events = [json.loads(l) for l in (tmp_path / "checkpoints.jsonl").read_text().splitlines()]
+    assert [e["update"] for e in checkpoint_events] == [3, 6]
 
 
 def test_full_training_checkpoint_saved_on_stop_and_none_without_callback(tmp_path):
@@ -98,14 +101,39 @@ def test_full_training_checkpoint_saved_on_stop_and_none_without_callback(tmp_pa
     metrics["kl_prior"] = 11
     with pytest.raises(DiagnosticStop):
         diag.check_update(metrics, epoch=1, update=5)
-    assert (tmp_path / "agent_epoch_00001_pmpo_update_000005_stop.pt").exists()
+    assert (tmp_path / "agent_pmpo_update_000005_stop.pt").exists()
 
     # Without a trainer_state_fn, save_full_training_checkpoint is a safe no-op --
     # check_update must not raise or write anything for the full-checkpoint path.
     diag2 = PMPORunDiagnostic(SimpleNamespace(output_dir=str(tmp_path / "no_cb"), evaluation_seeds=[11, 22]),
                               make_controller(prior_refresh_interval=1), {})
     diag2.check_update(healthy(), epoch=1, update=1)
-    assert not any((tmp_path / "no_cb").glob("agent_epoch_*"))
+    assert not any((tmp_path / "no_cb").glob("agent_pmpo_update_*"))
+
+
+def test_prior_block_logging_fields_and_real_steps(tmp_path):
+    diag = PMPORunDiagnostic(SimpleNamespace(output_dir=str(tmp_path), evaluation_seeds=[11, 22]),
+                             make_controller(prior_refresh_interval=500), {})
+    for update, expect_event, expect_position in [(0, True, 0), (1, False, 1), (499, False, 499), (500, True, 0)]:
+        diag.check_update(healthy(), epoch=1, update=update, real_steps=12345)
+    rows = [json.loads(l) for l in (tmp_path / "updates.jsonl").read_text().splitlines()]
+    for row, (update, expect_event, expect_position) in zip(rows, [(0, True, 0), (1, False, 1), (499, False, 499), (500, True, 0)]):
+        assert row["update"] == update
+        assert row["real_steps"] == 12345
+        assert row["prior_refresh_interval"] == 500
+        assert row["prior_refresh_event"] is expect_event
+        assert row["prior_block_position"] == expect_position
+
+
+def test_check_update_works_and_logs_correctly_without_wandb(tmp_path):
+    import wandb
+    assert wandb.run is None  # no active run in the test environment
+    diag = diagnostics(tmp_path)
+    # Must not raise even though wandb is inactive -- the wandb.run is not None guard
+    # makes the mirroring call a no-op, updates.jsonl remains the sole authoritative log.
+    diag.check_update(healthy(), epoch=1, update=1, real_steps=100)
+    rows = [json.loads(l) for l in (tmp_path / "updates.jsonl").read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["update"] == 1
 
 
 def test_finish_epoch_reports_world_model_losses_and_saves_full_checkpoint(tmp_path, monkeypatch):
@@ -141,7 +169,8 @@ def test_finish_epoch_reports_world_model_losses_and_saves_full_checkpoint(tmp_p
     assert row["denoiser_train_loss_mean"] == pytest.approx(1.4)
     assert row["denoiser_train_steps"] == 2
     assert row["rew_end_model_train_loss_mean"] == pytest.approx(0.7)
-    assert (tmp_path / f"agent_epoch_00001_pmpo_update_{model.updates.item():06d}_epoch.pt").exists()
+    assert row["global_pmpo_update"] == model.updates.item()
+    assert (tmp_path / f"agent_pmpo_update_{model.updates.item():06d}_epoch.pt").exists()
 
 
 def test_sustained_boundary_and_constant_stops(tmp_path):
