@@ -22,12 +22,15 @@ OUTPUT_DIR="outputs/k4-walker-100k"
 WANDB_PROJECT="lcg-controller-baselines"
 WANDB_RUN_NAME="walker-pmpo-100k-seed0"
 DEVICE=1
+# Override with PYTHON=/path/to/python if the target env's interpreter isn't on PATH
+# as a bare `python` (it usually isn't outside an activated conda env).
+PYTHON="${PYTHON:-python}"
 
 mkdir -p "${OUTPUT_DIR}"
 
 LAUNCH_CMD=(
   env MUJOCO_GL=egl "MUJOCO_EGL_DEVICE_ID=${DEVICE}" OMP_NUM_THREADS=1
-  python -u src/main.py
+  "${PYTHON}" -u src/main.py
   agent=pmpo_beta
   env=dm_control env.train.domain_name=walker env.train.task_name=walk
   "common.devices=${DEVICE}" common.seed=0
@@ -49,7 +52,7 @@ LAUNCH_CMD=(
 # the process starts writing its own local run directory (never blocks/depends on
 # training itself -- if wandb is slow to initialize, this just polls briefly and
 # records whatever is available). ---
-python - "$0" "${OUTPUT_DIR}" "${WANDB_PROJECT}" "${WANDB_RUN_NAME}" "${LAUNCH_CMD[@]}" <<'PYEOF'
+"${PYTHON}" - "$0" "${OUTPUT_DIR}" "${WANDB_PROJECT}" "${WANDB_RUN_NAME}" "${LAUNCH_CMD[@]}" <<'PYEOF'
 import json, os, subprocess, sys, platform
 from datetime import datetime, timezone
 
@@ -113,7 +116,7 @@ for _ in $(seq 1 30); do
     RUN_DIR="$(readlink -f "${RUN_LINK}" 2>/dev/null || true)"
     RUN_ID="$(basename "${RUN_DIR}" | sed -E 's/^run-[0-9_]+-//')"
     if [ -n "${RUN_ID}" ]; then
-      python - "${OUTPUT_DIR}" "${WANDB_PROJECT}" "${RUN_ID}" <<'PYEOF2'
+      "${PYTHON}" - "${OUTPUT_DIR}" "${WANDB_PROJECT}" "${RUN_ID}" <<'PYEOF2'
 import json, sys
 output_dir, project, run_id = sys.argv[1:]
 path = f"{output_dir}/run_metadata.json"
