@@ -94,7 +94,7 @@ class PMPORunDiagnostic:
                         total = 0.0
                         for step in range(10000):
                             state = history.state
-                            if self.fixed_real is None and len(fixed) < 128 and step % 4 == 0:
+                            if self.fixed_real is None and len(fixed) < 128 and (step < 4 or step % 4 == 0):
                                 fixed.append(state.cpu().clone())
                             action = model.sample_action(model.actor(state), deterministic=True)
                             image, reward, end, trunc, _ = env.step(action[0].cpu().numpy())

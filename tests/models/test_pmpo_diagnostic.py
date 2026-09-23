@@ -48,7 +48,8 @@ def test_sustained_boundary_and_constant_stops(tmp_path):
         diag.check_update(metrics, 1, 99)
 
 
-def test_fixed_seed_evaluation_and_temporal_probe_preserve_rng(tmp_path, monkeypatch):
+@pytest.mark.parametrize("episode_length", [4, 9])
+def test_fixed_seed_evaluation_and_temporal_probe_preserve_rng(tmp_path, monkeypatch, episode_length):
     import numpy as np
     import pmpo_diagnostic
     seeds = []
@@ -61,7 +62,7 @@ def test_fixed_seed_evaluation_and_temporal_probe_preserve_rng(tmp_path, monkeyp
             return np.zeros((8, 8, 3), dtype=np.uint8), {}
         def step(self, action):
             self.t += 1
-            return np.full((8, 8, 3), self.t, dtype=np.uint8), float(action.sum()), False, self.t == 9, {}
+            return np.full((8, 8, 3), self.t, dtype=np.uint8), float(action.sum()), False, self.t == episode_length, {}
         def close(self):
             pass
     monkeypatch.setattr(pmpo_diagnostic, "DMControlEnv", TinyEnv)
