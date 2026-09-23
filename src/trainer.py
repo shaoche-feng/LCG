@@ -221,8 +221,11 @@ class Trainer(StateDictMixin):
         if diagnostic_cfg is not None and diagnostic_cfg.enabled:
             if not isinstance(self.agent.actor_critic, PMPOBeta):
                 raise ValueError("PMPO diagnostic requires the PMPO controller")
-            if not 1 <= diagnostic_cfg.max_epochs <= 20:
-                raise ValueError("PMPO diagnostic epoch bound must be in [1, 20]")
+            # Upper bound is a sanity check against typos, not a protocol limit -- the
+            # 100k-real-step baseline (steps_per_epoch=500) resolves to 241 epochs, so
+            # 20 (fine for short bounded diagnostics) was too low for that run.
+            if not 1 <= diagnostic_cfg.max_epochs <= 2000:
+                raise ValueError("PMPO diagnostic epoch bound must be in [1, 2000]")
             self._pmpo_diagnostic = PMPORunDiagnostic(diagnostic_cfg, self.agent.actor_critic, cfg.env.test,
                                                       optimizers=self.opt.actor_critic, trainer_state_fn=self.state_dict)
 
