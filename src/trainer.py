@@ -224,7 +224,7 @@ class Trainer(StateDictMixin):
             if not 1 <= diagnostic_cfg.max_epochs <= 20:
                 raise ValueError("PMPO diagnostic epoch bound must be in [1, 20]")
             self._pmpo_diagnostic = PMPORunDiagnostic(diagnostic_cfg, self.agent.actor_critic, cfg.env.test,
-                                                      optimizers=self.opt.actor_critic)
+                                                      optimizers=self.opt.actor_critic, trainer_state_fn=self.state_dict)
 
         # LCG intrinsic-reward lifecycle -- disabled unless
         # cfg.intrinsic_reward.enabled is True (default False, see

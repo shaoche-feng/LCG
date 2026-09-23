@@ -69,6 +69,81 @@ def test_diagnostic_checkpoint_saved_before_stop(tmp_path):
     assert (tmp_path / "checkpoint_update_00007_stop.pt").exists()
 
 
+def test_full_training_checkpoint_saved_every_prior_refresh_interval(tmp_path):
+    model = make_controller(prior_refresh_interval=3)
+    calls = []
+    def trainer_state_fn():
+        calls.append(1)
+        return {"fake": "trainer_state", "n_calls": len(calls)}
+    diag = PMPORunDiagnostic(SimpleNamespace(output_dir=str(tmp_path), evaluation_seeds=[11, 22]),
+                             model, {}, trainer_state_fn=trainer_state_fn)
+    metrics = healthy()
+    for u in range(1, 7):
+        diag.check_update(metrics, epoch=2, update=u)
+    # prior_refresh_interval=3 -> full checkpoints at updates 3 and 6 only.
+    assert (tmp_path / "agent_epoch_00002_pmpo_update_000003.pt").exists()
+    assert (tmp_path / "agent_epoch_00002_pmpo_update_000006.pt").exists()
+    for u in (1, 2, 4, 5):
+        assert not (tmp_path / f"agent_epoch_00002_pmpo_update_{u:06d}.pt").exists()
+    saved = torch.load(tmp_path / "agent_epoch_00002_pmpo_update_000003.pt", weights_only=False)
+    assert saved["epoch"] == 2 and saved["update"] == 3
+    assert saved["trainer_state"] == {"fake": "trainer_state", "n_calls": 1}
+
+
+def test_full_training_checkpoint_saved_on_stop_and_none_without_callback(tmp_path):
+    model = make_controller(prior_refresh_interval=1000)  # never triggers on its own
+    diag = PMPORunDiagnostic(SimpleNamespace(output_dir=str(tmp_path), evaluation_seeds=[11, 22]),
+                             model, {}, trainer_state_fn=lambda: {"ok": True})
+    metrics = healthy()
+    metrics["kl_prior"] = 11
+    with pytest.raises(DiagnosticStop):
+        diag.check_update(metrics, epoch=1, update=5)
+    assert (tmp_path / "agent_epoch_00001_pmpo_update_000005_stop.pt").exists()
+
+    # Without a trainer_state_fn, save_full_training_checkpoint is a safe no-op --
+    # check_update must not raise or write anything for the full-checkpoint path.
+    diag2 = PMPORunDiagnostic(SimpleNamespace(output_dir=str(tmp_path / "no_cb"), evaluation_seeds=[11, 22]),
+                              make_controller(prior_refresh_interval=1), {})
+    diag2.check_update(healthy(), epoch=1, update=1)
+    assert not any((tmp_path / "no_cb").glob("agent_epoch_*"))
+
+
+def test_finish_epoch_reports_world_model_losses_and_saves_full_checkpoint(tmp_path, monkeypatch):
+    import numpy as np
+    import pmpo_diagnostic
+
+    class TinyEnv:
+        def __init__(self, **kwargs):
+            pass
+        def reset(self, seed):
+            self.t = 0
+            return np.zeros((8, 8, 3), dtype=np.uint8), {}
+        def step(self, action):
+            self.t += 1
+            return np.full((8, 8, 3), self.t, dtype=np.uint8), float(action.sum()), False, self.t == 4, {}
+        def close(self):
+            pass
+    monkeypatch.setattr(pmpo_diagnostic, "DMControlEnv", TinyEnv)
+
+    model = make_controller()
+    diag = PMPORunDiagnostic(SimpleNamespace(output_dir=str(tmp_path), evaluation_seeds=[11, 22]),
+                             model, {}, trainer_state_fn=lambda: {"ok": True})
+    metrics = healthy()
+    diag.check_update(metrics, epoch=1, update=1)
+    diag.check_update(metrics, epoch=1, update=2)
+    pmpo_log = dict(metrics, loss_actor=0.5, positive_fraction=0.5, negative_fraction=0.5,
+                    alpha_min=1., beta_min=1.)
+    logs = [{"actor_critic/train/" + k: v for k, v in pmpo_log.items()},
+            {"denoiser/train/loss": 1.5, "denoiser/train/other": 0.2},
+            {"denoiser/train/loss": 1.3, "denoiser/train/other": 0.1},
+            {"rew_end_model/train/loss": 0.7}]
+    row = diag.finish_epoch(1, logs, real_steps=500)
+    assert row["denoiser_train_loss_mean"] == pytest.approx(1.4)
+    assert row["denoiser_train_steps"] == 2
+    assert row["rew_end_model_train_loss_mean"] == pytest.approx(0.7)
+    assert (tmp_path / f"agent_epoch_00001_pmpo_update_{model.updates.item():06d}_epoch.pt").exists()
+
+
 def test_sustained_boundary_and_constant_stops(tmp_path):
     diag = diagnostics(tmp_path)
     metrics = healthy()
