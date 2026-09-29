@@ -1,0 +1,9 @@
+# Opt-in diagnostics for the full end-to-end DIAMOND + PMPO-Beta training loop
+# (real world-model training every epoch, no warm-start, no frozen anything); no
+# learning hyperparameter overrides. max_epochs is a generous cap so the run can
+# establish a multi-epoch trend without being open-ended.
+enabled: true
+max_epochs: 15
+evaluation_seeds: [1001, 1002, 1003, 1004]
+output_dir: pmpo_diagnostic
+checkpoint_updates: []
