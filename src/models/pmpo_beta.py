@@ -26,7 +26,16 @@ class PMPOBetaConfig(ActorCriticConfig):
     lambda_: float = 0.95
     alpha_pmpo: float = 0.5
     beta_kl: float = 0.3
+    # Entropy bonus coefficient (Stage 3 experiment): actor loss becomes
+    # L_PMPO + beta_kl * KL - entropy_coef * H(pi). 0.0 (default) exactly
+    # reproduces the frozen 100k baseline; no other term changes with it.
+    entropy_coef: float = 0.0
     prior_refresh_interval: int = 10
+    # Diagnosis-only knob (see docs/pmpo_beta/k4_implementation.md): when True, the prior is
+    # snapshotted once at construction and never refreshed again, isolating the moving-prior
+    # trust-region mechanism as the single variable under test. False (default) preserves the
+    # existing every-prior_refresh_interval-updates moving prior exactly as before.
+    fixed_prior: bool = False
     concentration_min: float = 1.0
     imagination_horizon: int = 15
     max_grad_norm: float = 10.0
@@ -104,8 +113,8 @@ class PMPOBeta(nn.Module):
             raise ValueError("Invalid discount, lambda, or PMPO mixing coefficient")
         if min(cfg.concentration_min, cfg.actor_lr, cfg.value_lr, cfg.max_grad_norm) <= 0:
             raise ValueError("Concentration floor, learning rates and gradient clip must be positive")
-        if cfg.beta_kl < 0 or cfg.prior_refresh_interval < 1 or cfg.imagination_horizon < 1:
-            raise ValueError("Invalid KL coefficient or rollout/block length")
+        if cfg.beta_kl < 0 or cfg.entropy_coef < 0 or cfg.prior_refresh_interval < 1 or cfg.imagination_horizon < 1:
+            raise ValueError("Invalid KL/entropy coefficient or rollout/block length")
         self.register_buffer("action_low", low.float())
         self.register_buffer("action_high", high.float())
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
@@ -113,6 +122,11 @@ class PMPOBeta(nn.Module):
         self.actor = VisualHead(stacked_cfg, cfg.actor_hidden_dims, 2 * cfg.continuous_action_dim)
         self.value = VisualHead(stacked_cfg, cfg.value_hidden_dims, 1)
         self.prior_actor = deepcopy(self.actor).requires_grad_(False).eval()
+        # Diagnostic only (see pmpo_diagnostic.py): a SEPARATE frozen snapshot from
+        # prior_actor, taken once here and never refreshed, so KL(current || initial)
+        # can distinguish local (per-block) trust-region movement from total cumulative
+        # drift over the whole run. Never read by the loss.
+        self.initial_actor = deepcopy(self.actor).requires_grad_(False).eval()
         self.continuous_action = True
         self.continuous_reward = True
         # Compatibility with env_loop: this feedforward prototype has no recurrent state.
@@ -217,7 +231,7 @@ class PMPOBeta(nn.Module):
 
     def forward(self):
         c = self.cfg
-        if self.updates.item() % c.prior_refresh_interval == 0:
+        if not c.fixed_prior and self.updates.item() % c.prior_refresh_interval == 0:
             self.prior_actor.load_state_dict(self.actor.state_dict())
         self.prior_actor.eval()
         obs, act, rew, end, trunc, _, old_values, bootstrap, infos = self.collect_imagination()
@@ -232,12 +246,21 @@ class PMPOBeta(nn.Module):
         dist = self.distribution(raw)
         with torch.no_grad():
             prior = self.distribution(self.prior_actor(flat_obs))
+            # Diagnostic only, see initial_actor's docstring above: never added to
+            # actor_loss, computed fully detached so it cannot perturb the main graph.
+            kl_initial = kl_divergence(self.distribution(raw.detach()), self.distribution(self.initial_actor(flat_obs))).sum(-1)
         kl = kl_divergence(dist, prior).sum(-1)
-        actor_loss = pmpo_loss(logp, advantage.flatten(), c.alpha_pmpo) + c.beta_kl * kl.mean()
+        pmpo_raw_loss = pmpo_loss(logp, advantage.flatten(), c.alpha_pmpo)
+        kl_loss = c.beta_kl * kl.mean()
+        entropy_loss = -c.entropy_coef * entropy.mean()
+        actor_loss = pmpo_raw_loss + kl_loss + entropy_loss
         value_loss = F.mse_loss(values, targets.flatten())
         require_finite(targets=targets, values=values, kl=kl, actor_loss=actor_loss, value_loss=value_loss)
         metrics = self.diagnostics(raw.detach(), act.flatten(0, 1), logp.detach(), entropy.detach())
         metrics.update(loss_actor=actor_loss.detach(), loss_value=value_loss.detach(), kl_prior=kl.mean().detach(),
+                       kl_initial=kl_initial.mean().detach(),
+                       loss_pmpo_raw=pmpo_raw_loss.detach(), loss_entropy=entropy_loss.detach(),
+                       loss_actor_total=actor_loss.detach(),
                        value_mean=values.mean().detach(), value_std=values.std(unbiased=False).detach(),
                        return_mean=targets.mean(), return_std=targets.std(unbiased=False),
                        positive_fraction=(advantage >= 0).float().mean(), negative_fraction=(advantage < 0).float().mean(),
@@ -260,6 +283,10 @@ class PMPOBeta(nn.Module):
                            value_target_correlation=correlation,
                            value_bias=(values.detach() - targets.flatten()).mean(),
                            value_abs_max=values.detach().abs().max(), return_abs_max=targets.abs().max())
+            width = self.action_high - self.action_low
+            per_dim_entropy = dist.entropy().detach() + width.log()
+            for d in range(per_dim_entropy.shape[-1]):
+                metrics[f"policy_entropy_dim_{d}"] = per_dim_entropy[:, d].mean()
             frames = flat_obs.reshape(-1, self.frame_stack, self.cfg.img_channels, self.cfg.img_size, self.cfg.img_size)
             difference = (frames[:, 1:] - frames[:, :-1]).abs().flatten(1).mean(1)
             metrics.update(stack_temporal_difference_mean=difference.mean(),

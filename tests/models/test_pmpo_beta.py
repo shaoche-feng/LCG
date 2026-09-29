@@ -80,6 +80,23 @@ def test_beta_kl_and_frozen_prior():
     assert all(p.grad is None and not p.requires_grad for p in model.prior_actor.parameters())
 
 
+def test_initial_actor_separate_from_prior_and_never_refreshed():
+    model = make_controller(prior_refresh_interval=1)  # refreshes prior_actor every update
+    obs = torch.randn(4, 12, 8, 8)
+    initial_before = {k: v.clone() for k, v in model.initial_actor.state_dict().items()}
+    same = kl_divergence(model.distribution(model.actor(obs)), model.distribution(model.initial_actor(obs))).sum(-1)
+    torch.testing.assert_close(same, torch.zeros_like(same), atol=1e-6, rtol=0)
+    with torch.no_grad():
+        model.actor.head[-1].bias[0] += 1
+    # prior_actor refreshes to match actor (interval=1); initial_actor must not.
+    model.prior_actor.load_state_dict(model.actor.state_dict())
+    for key, p in model.initial_actor.state_dict().items():
+        torch.testing.assert_close(p, initial_before[key], rtol=0, atol=0)
+    assert all(not p.requires_grad for p in model.initial_actor.parameters())
+    changed = kl_divergence(model.distribution(model.actor(obs)), model.distribution(model.initial_actor(obs))).sum(-1)
+    assert torch.isfinite(changed).all() and (changed > 0).all()
+
+
 @pytest.mark.parametrize("end,trunc,gamma,lam,expected", [
     ([0, 0], [0, 0], 1., 1., [13., 12.]),
     ([1, 0], [0, 0], 1., 1., [1., 12.]),
