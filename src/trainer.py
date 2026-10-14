@@ -221,9 +221,13 @@ class Trainer(StateDictMixin):
         if diagnostic_cfg is not None and diagnostic_cfg.enabled:
             if not isinstance(self.agent.actor_critic, PMPOBeta):
                 raise ValueError("PMPO diagnostic requires the PMPO controller")
-            if not 1 <= diagnostic_cfg.max_epochs <= 20:
-                raise ValueError("PMPO diagnostic epoch bound must be in [1, 20]")
-            self._pmpo_diagnostic = PMPORunDiagnostic(diagnostic_cfg, self.agent.actor_critic, cfg.env.test)
+            # Upper bound is a sanity check against typos, not a protocol limit -- the
+            # 100k-real-step baseline (steps_per_epoch=500) resolves to 241 epochs, so
+            # 20 (fine for short bounded diagnostics) was too low for that run.
+            if not 1 <= diagnostic_cfg.max_epochs <= 2000:
+                raise ValueError("PMPO diagnostic epoch bound must be in [1, 2000]")
+            self._pmpo_diagnostic = PMPORunDiagnostic(diagnostic_cfg, self.agent.actor_critic, cfg.env.test,
+                                                      optimizers=self.opt.actor_critic, trainer_state_fn=self.state_dict)
 
         # LCG intrinsic-reward lifecycle -- disabled unless
         # cfg.intrinsic_reward.enabled is True (default False, see
@@ -472,7 +476,8 @@ class Trainer(StateDictMixin):
                 loss.backward()
                 metrics.update(opt.step())
                 if self._pmpo_diagnostic is not None:
-                    self._pmpo_diagnostic.check_update(metrics, self.epoch, self.num_batch_train.actor_critic)
+                    self._pmpo_diagnostic.check_update(metrics, self.epoch, self.num_batch_train.actor_critic,
+                                                       real_steps=self.train_dataset.num_steps)
                 if self.agent.actor_critic.cfg.log_diagnostics:
                     print("PMPO_DIAGNOSTICS " + json.dumps({k: float(v) for k, v in metrics.items()}), flush=True)
                 self.num_batch_train.actor_critic += 1

@@ -6,9 +6,20 @@ import random
 
 import numpy as np
 import torch
+import wandb
 
 from coroutines.frame_history import FrameHistory
 from envs.dm_control_env import DMControlEnv
+
+# Clean wandb namespace for the main PMPO monitoring metrics (see check_update);
+# mirrored only when a wandb run is already active (wandb.mode != "disabled"), so
+# training behaves identically with or without it. Keys are read from the SAME row
+# dict written to updates.jsonl, which remains the authoritative record either way.
+_WANDB_UPDATE_KEYS = (
+    "alpha_mean", "beta_mean", "policy_entropy", "kl_prior", "kl_initial", "loss_actor",
+    "loss_value", "actor_grad_norm", "value_grad_norm", "near_lower_fraction",
+    "near_upper_fraction", "positive_fraction",
+)
 
 
 @contextmanager
@@ -28,24 +39,83 @@ class DiagnosticStop(RuntimeError):
 
 
 class PMPORunDiagnostic:
-    def __init__(self, cfg, model, env_cfg):
-        self.cfg, self.model, self.env_cfg = cfg, model, env_cfg
+    def __init__(self, cfg, model, env_cfg, optimizers=None, trainer_state_fn=None):
+        self.cfg, self.model, self.env_cfg, self.optimizers = cfg, model, env_cfg, optimizers
+        # trainer_state_fn (if given): a zero-arg callback returning the FULL Trainer
+        # state_dict (agent incl. denoiser/rew_end_model/actor_critic, all three
+        # optimizers, LR schedulers, epoch counter -- exactly what Trainer's own
+        # epoch-boundary save_checkpoint() already relies on for resumability). Used to
+        # save a genuinely resumable full-loop checkpoint every prior_refresh_interval
+        # PMPO updates, not just the lightweight actor/value/prior-only snapshot below.
+        self.trainer_state_fn = trainer_state_fn
         self.path = Path(cfg.output_dir)
         self.path.mkdir(parents=True, exist_ok=True)
         self.fixed_real = None
         self.boundary_streak = self.constant_streak = self.one_sided_epochs = 0
         self.previous_entropy_per_dim = None
+        self.checkpoint_updates = set(getattr(cfg, "checkpoint_updates", ()))
 
     def write(self, name, record):
         with (self.path / name).open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, allow_nan=False) + "\n")
 
-    def check_update(self, metrics, epoch, update):
+    def save_diagnostic_checkpoint(self, update, tag=None):
+        # Observation only: a plain torch.save taken between optimizer steps (never
+        # mid-backward), so it never perturbs training state or semantics. model_state
+        # is the FULL PMPOBeta state_dict (actor/value/prior_actor/updates-counter/
+        # action bounds, exactly what checkpoint/resume already relies on); optimizers
+        # (if provided) is PMPOOptimizers.state_dict() (actor+value Adam + both LR
+        # schedulers); rng is the model's own imagination-RNG snapshot dict (the only
+        # RNG state this branch tracks -- there is no separate global torch/numpy/python
+        # RNG checkpoint here, unlike the richer DrQ branch); config is the model's own
+        # PMPOBetaConfig (picklable dataclass) for exact hyperparameter provenance.
+        payload = {"model_state": self.model.state_dict(),
+                   "optimizers": self.optimizers.state_dict() if self.optimizers is not None else None,
+                   "rng": self.model._rng, "config": self.model.cfg, "update": update}
+        name = f"checkpoint_update_{update:05d}" + (f"_{tag}" if tag else "")
+        torch.save(payload, self.path / f"{name}.pt")
+
+    def save_full_training_checkpoint(self, epoch, update, tag=None):
+        # A genuinely resumable full-loop checkpoint: denoiser, reward/end model, PMPO
+        # actor/value/prior, all three optimizers, LR schedulers, epoch counter, and
+        # (via PMPOBeta's own get_extra_state/set_extra_state hook, folded into
+        # agent.actor_critic's own state_dict) the model's imagination-RNG snapshot --
+        # everything Trainer's own epoch-boundary save_checkpoint() already relies on
+        # for exact resume, just captured at a finer (prior-refresh-interval) cadence.
+        # Deliberately does NOT separately re-persist the collected real-environment
+        # dataset (train_dataset.save_to_default_path()/test_dataset's own on-disk
+        # files) the way the epoch-boundary checkpoint does -- that's orthogonal to
+        # controller/world-model resume fidelity and out of scope here.
+        if self.trainer_state_fn is None:
+            return
+        payload = {"trainer_state": self.trainer_state_fn(), "epoch": epoch, "update": update}
+        # agent_pmpo_update_NNNNNN[_tag].pt -- epoch is still inside the payload for
+        # provenance, just not in the filename (the update count is what matters for
+        # matching this checkpoint to a prior-refresh block boundary).
+        name = f"agent_pmpo_update_{update:06d}" + (f"_{tag}" if tag else "")
+        path = self.path / f"{name}.pt"
+        torch.save(payload, path)
+        self.write("checkpoints.jsonl", dict(epoch=epoch, update=update, tag=tag, path=str(path)))
+
+    def check_update(self, metrics, epoch, update, real_steps=None):
         row = {k: float(v) for k, v in metrics.items()}
-        row.update(epoch=epoch, update=update)
-        if not all(np.isfinite(v) for v in row.values()):
+        interval = self.model.cfg.prior_refresh_interval
+        row.update(epoch=epoch, update=update, real_steps=real_steps,
+                   prior_refresh_interval=interval, prior_refresh_event=(update % interval == 0),
+                   prior_block_position=update % interval)
+        finite_row = {k: v for k, v in row.items() if isinstance(v, (int, float))}
+        if not all(np.isfinite(v) for v in finite_row.values()):
+            self.save_diagnostic_checkpoint(update, tag="stop")
+            self.save_full_training_checkpoint(epoch, update, tag="stop")
             raise DiagnosticStop("Non-finite controller diagnostic")
         self.write("updates.jsonl", row)
+        if wandb.run is not None:
+            wandb.log({"pmpo/actor_update": update, "pmpo/real_env_steps": real_steps,
+                       **{f"pmpo/{k}": row[k] for k in _WANDB_UPDATE_KEYS if k in row}})
+        if update in self.checkpoint_updates:
+            self.save_diagnostic_checkpoint(update)
+        if update > 0 and update % interval == 0:
+            self.save_full_training_checkpoint(epoch, update)
         reason = None
         if max(row["alpha_max"], row["beta_max"]) > 1e4:
             reason = "Beta concentration exceeded 10000"
@@ -72,6 +142,8 @@ class PMPORunDiagnostic:
             reason = "Abrupt entropy collapse with mean concentration above 100"
         self.previous_entropy_per_dim = entropy
         if reason:
+            self.save_diagnostic_checkpoint(update, tag="stop")
+            self.save_full_training_checkpoint(epoch, update, tag="stop")
             self.write("stop.jsonl", dict(epoch=epoch, update=update, reason=reason))
             raise DiagnosticStop(reason)
 
@@ -125,6 +197,25 @@ class PMPORunDiagnostic:
                     eval_return_max=float(np.max(returns)), eval_returns=returns, eval_lengths=lengths,
                     evaluation_seeds=list(self.cfg.evaluation_seeds), **distribution)
 
+    def world_model_loss_summary(self, logs):
+        # Denoiser/reward-end-model train (and test, when that epoch runs evaluation)
+        # losses, straight from Trainer's own to_log rows -- observation only, never
+        # read back into any loss. Epochs where start_after_epochs skips a component
+        # (e.g. a warm-started diagnostic epoch 1) simply produce no matching rows.
+        summary = {}
+        for component in ("denoiser", "rew_end_model"):
+            for split in ("train", "test"):
+                prefix = f"{component}/{split}/"
+                values = {}
+                for log in logs:
+                    for k, v in log.items():
+                        if k.startswith(prefix):
+                            values.setdefault(k[len(prefix):], []).append(float(v))
+                for key, vals in values.items():
+                    summary[f"{component}_{split}_{key}_mean"] = float(np.mean(vals))
+                summary[f"{component}_{split}_steps"] = len(values.get("loss", []))
+        return summary
+
     def finish_epoch(self, epoch, logs, real_steps):
         rows = [{k.removeprefix("actor_critic/train/"): float(v) for k, v in log.items()}
                 for log in logs if "actor_critic/train/loss_actor" in log]
@@ -134,11 +225,20 @@ class PMPORunDiagnostic:
         for name in ("alpha", "beta"):
             aggregate[f"{name}_min"] = min(r[f"{name}_min"] for r in rows)
             aggregate[f"{name}_max"] = max(r[f"{name}_max"] for r in rows)
-        row = dict(epoch=epoch, real_training_steps=real_steps, controller_updates=len(rows), **aggregate, **self.evaluate())
+        global_update = self.model.updates.item()
+        row = dict(epoch=epoch, real_training_steps=real_steps, controller_updates=len(rows),
+                   global_pmpo_update=global_update, **aggregate,
+                   **self.world_model_loss_summary(logs), **self.evaluate())
+        if wandb.run is not None:
+            wandb.log({"pmpo/actor_update": global_update, "pmpo/real_env_steps": real_steps,
+                       "eval/return_mean": row["eval_return_mean"], "eval/return_median": row["eval_return_median"],
+                       "eval/return_std": row["eval_return_std"], "eval/return_min": row["eval_return_min"],
+                       "eval/return_max": row["eval_return_max"]})
         one_sided = min(row["positive_fraction"], row["negative_fraction"]) < 0.01
         self.one_sided_epochs = self.one_sided_epochs + 1 if one_sided else 0
         row["one_sided_epochs"] = self.one_sided_epochs
         row["prolonged_one_sided_flag"] = self.one_sided_epochs >= 3
         self.write("epochs.jsonl", row)
         print("PMPO_EPOCH " + json.dumps(row, allow_nan=False), flush=True)
+        self.save_full_training_checkpoint(epoch, global_update, tag="epoch")
         return row

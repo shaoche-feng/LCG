@@ -1,0 +1,8 @@
+# Opt-in diagnostics for the fixed-prior warm-started run; no learning hyperparameter
+# overrides. max_epochs=2 is only a safety margin -- the diagnostic is expected to be
+# stopped manually around 2000 PMPO updates, well inside epoch 1.
+enabled: true
+max_epochs: 2
+evaluation_seeds: [1001, 1002, 1003, 1004]
+output_dir: pmpo_diagnostic
+checkpoint_updates: [1, 100, 200, 350, 600, 1000, 1500, 2000]
