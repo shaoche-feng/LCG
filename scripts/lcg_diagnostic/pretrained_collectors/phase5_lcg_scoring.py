@@ -87,7 +87,7 @@ def load_agent(domain: str, checkpoint_path: Path, probe_task: str = "walk"):
     unchanged for walker/quadruped; hopper (no "walk" task) passes probe_task="stand"."""
     probe = DMControlEnv(domain_name=domain, task_name=probe_task, size=64, camera_id=0, action_repeat=2)
     fake_env = SimpleNamespace(
-        is_discrete=False, action_dim=probe.action_dim,
+        action_dim=probe.action_dim,
         action_low=torch.as_tensor(probe.action_low), action_high=torch.as_tensor(probe.action_high),
     )
     action_kwargs = get_action_space_kwargs(fake_env)

@@ -89,8 +89,7 @@ class ImaginationStepper:
         rew_out, logits_end, (self.hx_rew_end, self.cx_rew_end) = self.rew_end_model.predict_rew_end(
             self.obs_buffer[:, -1:], self.act_buffer[:, -1:], next_obs.unsqueeze(1),
             (self.hx_rew_end, self.cx_rew_end))
-        rew = rew_out.squeeze(1) if self.rew_end_model.continuous_reward else (
-            Categorical(logits=rew_out).sample().squeeze(1) - 1.0)
+        rew = rew_out.squeeze(1)
         end = Categorical(logits=logits_end).sample().squeeze(1)
         self.ep_len += 1
         trunc = (self.ep_len >= self.horizon).long()
@@ -422,7 +421,7 @@ def main():
                             act = model.sample_action(raw, deterministic=False)
                     rew_t = torch.stack(rews, dim=1); end_t = torch.stack(ends, dim=1)
                     trunc_t = torch.stack(truncs, dim=1); vboot_t = torch.stack(vnexts, dim=1)
-                    targets = compute_lambda_returns(rew_t, end_t, trunc_t, vboot_t, gamma, lambda_, continuous_reward=True)
+                    targets = compute_lambda_returns(rew_t, end_t, trunc_t, vboot_t, gamma, lambda_)
                     targets_list.append((targets[0, 0].item(), [r.item() for r in rews]))
                 return targets_list
 

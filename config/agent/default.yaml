@@ -23,11 +23,3 @@ rew_end_model:
   channels: [32,32,32,32]
   attn_depths: [0,0,0,0]
 
-actor_critic:
-  _target_: models.actor_critic.ActorCriticConfig
-  lstm_dim: 512
-  img_channels: ${agent.denoiser.inner_model.img_channels}
-  img_size: ${env.train.size}
-  channels: [32,32,64,64]
-  down: [1,1,1,1]
-

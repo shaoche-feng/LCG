@@ -2,37 +2,30 @@ import argparse
 from pathlib import Path
 from typing import Tuple
 
-from huggingface_hub import hf_hub_download
 from hydra import compose, initialize
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 import torch
 from torch.utils.data import DataLoader
 
-from agent import Agent
+from agent import Agent, get_action_space_kwargs
+from utils import normalize_saved_config
 from coroutines.collector import make_collector, NumToCollect
 from data import BatchSampler, collate_segments_to_batch, Dataset
-from envs import make_atari_env, WorldModelEnv
+from envs import make_dm_control_env, WorldModelEnv
 from game import ActionNames, DatasetEnv, Game, get_keymap_and_action_names, Keymap, NamedEnv, PlayEnv
-from utils import get_path_agent_ckpt, prompt_atari_game
+from utils import get_path_agent_ckpt
 
 
 OmegaConf.register_new_resolver("eval", eval)
 
 
-def download(filename: str) -> Path:
-    path = hf_hub_download(repo_id="eloialonso/diamond", filename=filename)
-    return Path(path)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--pretrained", action="store_true", help="Download pretrained world model and agent.")
     parser.add_argument("-d", "--dataset-mode", action="store_true", help="Dataset visualization mode.")
     parser.add_argument("-r", "--record", action="store_true", help="Record episodes in PlayEnv.")
     parser.add_argument("-n", "--num-steps-initial-collect", type=int, default=1000, help="Num steps initial collect.")
     parser.add_argument("--store-denoising-trajectory", action="store_true", help="Save denoising steps in info.")
-    parser.add_argument("--store-original-obs", action="store_true", help="Save original obs (pre resizing) in info.")
     parser.add_argument("--fps", type=int, default=15, help="Frame rate.")
     parser.add_argument("--size", type=int, default=640, help="Window size.")
     parser.add_argument("--no-header", action="store_true")
@@ -47,10 +40,10 @@ def check_args(args: argparse.Namespace) -> None:
         if Path(".git").is_dir():
             print("Error: cannot run dataset mode the root of the repository.")
             return False
-        if args.pretrained or args.record:
-            print("Warning: dataset mode, ignoring --pretrained and --record")
+        if args.record:
+            print("Warning: dataset mode, ignoring --record")
     else:
-        if not args.record and (args.store_denoising_trajectory or args.store_original_obs):
+        if not args.record and args.store_denoising_trajectory:
             print("Warning: not in recording mode, ignoring --store* options")
     return True
 
@@ -69,27 +62,16 @@ def prepare_dataset_mode(cfg: DictConfig) -> Tuple[DatasetEnv, Keymap, ActionNam
 
 
 def prepare_play_mode(cfg: DictConfig, args: argparse.Namespace) -> Tuple[PlayEnv, Keymap, ActionNames]:
-    # Checkpoint
-    if args.pretrained:
-        name = prompt_atari_game()
-        path_ckpt = download(f"atari_100k/models/{name}.pt")
-
-        # Override config
-        cfg.agent = OmegaConf.load(download("atari_100k/config/agent/default.yaml"))
-        cfg.env = OmegaConf.load(download("atari_100k/config/env/atari.yaml"))
-        cfg.env.train.id = cfg.env.test.id = f"{name}NoFrameskip-v4"
-        cfg.world_model_env.horizon = 50
-    else:
-        path_ckpt = get_path_agent_ckpt("checkpoints", epoch=-1)
+    path_ckpt = get_path_agent_ckpt("checkpoints", epoch=-1)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # Real envs
-    train_env = make_atari_env(num_envs=1, device=device, **cfg.env.train)
-    test_env = make_atari_env(num_envs=1, device=device, **cfg.env.test)
+    train_env = make_dm_control_env(num_envs=1, device=device, **{k: v for k, v in cfg.env.train.items() if k != "type"})
+    test_env = make_dm_control_env(num_envs=1, device=device, **{k: v for k, v in cfg.env.test.items() if k != "type"})
 
     # Models
-    agent = Agent(instantiate(cfg.agent, num_actions=test_env.num_actions)).to(device).eval()
+    agent = Agent(instantiate(cfg.agent, **get_action_space_kwargs(test_env))).to(device).eval()
     agent.load(path_ckpt)
 
     # Collect for imagination's initialization
@@ -122,7 +104,6 @@ def prepare_play_mode(cfg: DictConfig, args: argparse.Namespace) -> Tuple[PlayEn
         env_keymap,
         args.record,
         args.store_denoising_trajectory,
-        args.store_original_obs,
     )
 
     return play_env, env_keymap
@@ -137,6 +118,7 @@ def main():
 
     with initialize(version_base="1.3", config_path="../config"):
         cfg = compose(config_name="trainer")
+    cfg = normalize_saved_config(cfg)
 
     env, keymap = prepare_dataset_mode(cfg) if args.dataset_mode else prepare_play_mode(cfg, args)
     size = (args.size // cfg.env.train.size) * cfg.env.train.size  # window size

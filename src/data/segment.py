@@ -15,7 +15,7 @@ class SegmentId:
 @dataclass
 class Segment:
     obs: torch.FloatTensor
-    act: torch.Tensor  # int64 (T,) for discrete envs, float32 (T, action_dim) for continuous envs
+    act: torch.Tensor  # float32 (T, action_dim), in environment action bounds
     rew: torch.FloatTensor
     end: torch.ByteTensor
     trunc: torch.ByteTensor

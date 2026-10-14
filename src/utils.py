@@ -1,6 +1,7 @@
 
 from argparse import Namespace
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 import json
@@ -8,7 +9,7 @@ from pathlib import Path
 import random
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -18,36 +19,6 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 import wandb
-
-
-ATARI_100K_GAMES = [
-    "Alien",
-    "Amidar",
-    "Assault",
-    "Asterix",
-    "BankHeist",
-    "BattleZone",
-    "Boxing",
-    "Breakout",
-    "ChopperCommand",
-    "CrazyClimber",
-    "DemonAttack",
-    "Freeway",
-    "Frostbite",
-    "Gopher",
-    "Hero",
-    "Jamesbond",
-    "Kangaroo",
-    "Krull",
-    "KungFuMaster",
-    "MsPacman",
-    "Pong",
-    "PrivateEye",
-    "Qbert",
-    "RoadRunner",
-    "Seaquest",
-    "UpNDown",
-]
 
 
 Logs = List[Dict[str, float]]
@@ -248,34 +219,6 @@ def process_confusion_matrices_if_any_and_compute_classification_metrics(logs: L
         logs.append(metrics)  # Append the obtained metrics to logs (in place)
 
 
-def prompt_atari_game():
-    for i, game in enumerate(ATARI_100K_GAMES):
-        print(f"{i:2d}: {game}")
-    while True:
-        x = input("\nEnter a number: ")
-        if not x.isdigit():
-            print("Invalid.")
-            continue
-        x = int(x)
-        if x < 0 or x > 25:
-            print("Invalid.")
-            continue
-        break
-    game = ATARI_100K_GAMES[x]
-    return game
-
-
-def prompt_run_name(game):
-    cfg_file = Path("config/trainer.yaml")
-    cfg_name = OmegaConf.load(cfg_file).wandb.name
-    suffix = f"-{cfg_name}" if cfg_name is not None else ""
-    name = game + suffix
-    name_ = input(f"Confirm run name by pressing Enter (or enter a new name): {name}\n")
-    if name_ != "":
-        name = name_
-    return name
-
-
 def save_info_for_import_script(epoch: int, run_name: str, path_ckpt_dir: Path) -> None:
     with (path_ckpt_dir / "info_for_import_script.json").open("w") as f:
         json.dump({"epoch": epoch, "name": run_name}, f)
@@ -323,3 +266,89 @@ def try_until_no_except(func: Callable) -> None:
 def wandb_log(logs: Logs, epoch: int):
     for d in logs:
         wandb.log({"epoch": epoch, **d})
+
+
+def normalize_saved_config(cfg: DictConfig) -> DictConfig:
+    """Drop only obsolete schema fields; reject unsupported learning paths.
+
+    Works on a complete Trainer config or its ``agent`` subtree. The input and
+    historical YAML files are left intact. Environment-derived metadata is still
+    supplied by AgentConfig, exactly as in the original PMPO implementation.
+    """
+    cfg = deepcopy(cfg)
+    agent = cfg.get("agent", cfg)
+    if agent.actor_critic.get("_target_") != "models.pmpo_beta.PMPOBetaConfig":
+        raise ValueError("Only saved PMPO-Beta configurations are supported")
+    # A retained PMPO field may refer to an obsolete loss field. Materialize
+    # those values on the copy before deleting their interpolation targets.
+    OmegaConf.resolve(cfg)
+
+    with open_dict(cfg):
+        if "training" in cfg:
+            if cfg.training.get("model_free", False) is not False:
+                raise ValueError("Saved training.model_free must be false for PMPO")
+            cfg.training.pop("model_free", None)
+        if "env" in cfg:
+            # Validate both before deleting train.type: test.type may refer to it.
+            for split in ("train", "test"):
+                if cfg.env[split].get("type", "dm_control") != "dm_control":
+                    raise ValueError("Only DM Control environments are supported")
+            for split in ("test", "train"):
+                if "type" in cfg.env[split]:
+                    del cfg.env[split]["type"]
+        if "collection" in cfg:
+            first = cfg.collection.train.first_epoch
+            for name in ("max", "threshold_rew"):
+                if name in first:
+                    value = first[name]
+                    if not (name == "max" and value is None) and (type(value) is not int or value < 0):
+                        raise ValueError(f"Invalid obsolete collection.train.first_epoch.{name}")
+            first.pop("max", None)
+            first.pop("threshold_rew", None)
+        if "actor_critic" in cfg and "agent" in cfg:
+            # These settings never participated in PMPO's losses/optimizers.
+            if "actor_critic_loss" in cfg.actor_critic:
+                loss = cfg.actor_critic.actor_critic_loss
+                fields = {"_target_", "backup_every", "gamma", "lambda_",
+                          "weight_value_loss", "weight_entropy_loss"}
+                if not isinstance(loss, DictConfig) or set(loss) != fields:
+                    raise ValueError("Unrecognized obsolete actor_critic_loss fields")
+                if loss._target_ != "models.actor_critic.ActorCriticLossConfig":
+                    raise ValueError("Unrecognized obsolete actor_critic_loss target")
+                if type(loss.backup_every) is not int or loss.backup_every < 1:
+                    raise ValueError("Invalid obsolete actor_critic_loss.backup_every")
+                for name in fields - {"_target_", "backup_every"}:
+                    value = loss[name]
+                    if type(value) not in (int, float) or not np.isfinite(value) or value < 0:
+                        raise ValueError(f"Invalid obsolete actor_critic_loss.{name}")
+                    if name in ("gamma", "lambda_") and value > 1:
+                        raise ValueError(f"Invalid obsolete actor_critic_loss.{name}")
+                del cfg.actor_critic["actor_critic_loss"]
+            if "optimizer" in cfg.actor_critic:
+                optimizer = cfg.actor_critic.optimizer
+                if not isinstance(optimizer, DictConfig) or set(optimizer) != {"lr", "weight_decay", "eps"}:
+                    raise ValueError("Unrecognized obsolete actor_critic.optimizer fields")
+                for name, value in optimizer.items():
+                    if type(value) not in (int, float) or not np.isfinite(value):
+                        raise ValueError(f"Invalid obsolete actor_critic.optimizer.{name}")
+                    if value < 0 or (name != "weight_decay" and value == 0):
+                        raise ValueError(f"Invalid obsolete actor_critic.optimizer.{name}")
+                del cfg.actor_critic["optimizer"]
+
+        for component in (agent, agent.denoiser.inner_model, agent.rew_end_model, agent.actor_critic):
+            if component.get("num_actions") is not None:
+                raise ValueError("Discrete actions are unsupported")
+            component.pop("num_actions", None)
+        if "continuous_reward" in agent.denoiser.inner_model:
+            raise ValueError("continuous_reward was never an InnerModelConfig field")
+        for component in (agent, agent.rew_end_model, agent.actor_critic):
+            if component.get("continuous_reward", True) is not True:
+                raise ValueError("Reward-sign classification is unsupported")
+            component.pop("continuous_reward", None)
+        # The inherited policy LSTM width was unused by feedforward PMPO.
+        if "lstm_dim" in agent.actor_critic:
+            value = agent.actor_critic.lstm_dim
+            if type(value) is not int or value < 1:
+                raise ValueError("Invalid obsolete policy lstm_dim")
+        agent.actor_critic.pop("lstm_dim", None)
+    return cfg

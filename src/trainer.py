@@ -15,11 +15,12 @@ from tqdm import tqdm, trange
 import wandb
 
 from agent import Agent, get_action_space_kwargs
+from utils import normalize_saved_config
 from coroutines.collector import make_collector, NumToCollect
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
-from envs import make_atari_env, make_dm_control_env, WorldModelEnv
-from lcg import LCGConfig, LCGLifecycle
-from models.pmpo_beta import PMPOBeta, PMPOOptimizers
+from envs import make_dm_control_env, WorldModelEnv
+from lcg import LCGLifecycle
+from models.pmpo_beta import PMPOOptimizers
 from pmpo_diagnostic import PMPORunDiagnostic
 from utils import (
     broadcast_if_needed,
@@ -43,22 +44,20 @@ from utils import (
 class Trainer(StateDictMixin):
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
+        cfg = normalize_saved_config(cfg)
         OmegaConf.resolve(cfg)
         self._cfg = cfg
         self._rank = dist.get_rank() if dist.is_initialized() else 0
         self._world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        # Preserve legacy initialization; PMPO honors an explicit experiment seed.
-        is_pmpo = cfg.agent.actor_critic._target_ == "models.pmpo_beta.PMPOBetaConfig"
-        if is_pmpo and (self._world_size != 1 or cfg.actor_critic.training.grad_acc_steps != 1):
+        if self._world_size != 1 or cfg.actor_critic.training.grad_acc_steps != 1:
             raise ValueError("Minimal PMPO supports one device and grad_acc_steps=1")
-        seed = cfg.common.seed if is_pmpo and cfg.common.seed is not None else torch.seed() % 10 ** 9
+        seed = cfg.common.seed if cfg.common.seed is not None else torch.seed() % 10 ** 9
         set_seed(seed)
-        if is_pmpo:
-            torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.deterministic = True
 
         # Device
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu", self._rank)
+        self._device = torch.device("cuda", self._rank) if torch.cuda.is_available() else torch.device("cpu")
         print(f"Starting on {self._device}")
         self._use_cuda = self._device.type == "cuda"
         if self._use_cuda:
@@ -72,7 +71,6 @@ class Trainer(StateDictMixin):
 
         # Flags
         self._is_static_dataset = cfg.static_dataset.path is not None
-        self._is_model_free = cfg.training.model_free
 
         # Checkpointing
         self._path_ckpt_dir = Path("checkpoints")
@@ -113,7 +111,7 @@ class Trainer(StateDictMixin):
         self.test_dataset.load_from_default_path()
 
         # Envs
-        make_env = {"atari": make_atari_env, "dm_control": make_dm_control_env}[cfg.env.train.type]
+        make_env = make_dm_control_env
         env_kwargs_train = {k: v for k, v in cfg.env.train.items() if k != "type"}
         env_kwargs_test = {k: v for k, v in cfg.env.test.items() if k != "type"}
 
@@ -145,13 +143,13 @@ class Trainer(StateDictMixin):
 
         # Optimizers and LR schedulers
 
-        def build_opt(name: str) -> torch.optim.AdamW:
-            if name == "actor_critic" and isinstance(self.agent.actor_critic, PMPOBeta):
+        def build_opt(name: str):
+            if name == "actor_critic":
                 return PMPOOptimizers(self.agent.actor_critic, cfg.actor_critic.training.lr_warmup_steps)
             return configure_opt(getattr(self.agent, name), **getattr(cfg, name).optimizer)
 
-        def build_lr_sched(name: str) -> torch.optim.lr_scheduler.LambdaLR:
-            if isinstance(self.opt.get(name), PMPOOptimizers):
+        def build_lr_sched(name: str):
+            if name == "actor_critic":
                 return None  # both schedulers are owned/checkpointed by PMPOOptimizers
             return get_lr_sched(self.opt.get(name), getattr(cfg, name).training.lr_warmup_steps)
 
@@ -194,33 +192,26 @@ class Trainer(StateDictMixin):
 
         lcg_enabled = bool(getattr(cfg, "intrinsic_reward", None) is not None and cfg.intrinsic_reward.enabled)
 
-        if self._is_model_free:
-            rl_env = make_env(num_envs=cfg.actor_critic.training.batch_size, device=self._device, **env_kwargs_train)
+        c = cfg.actor_critic.training
+        sl = cfg.agent.denoiser.inner_model.num_steps_conditioning
+        bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
+        dl_actor_critic = make_data_loader(batch_sampler=bs)
+        wm_env_cfg = instantiate(cfg.world_model_env)
+        rl_env = WorldModelEnv(
+            self.agent.denoiser, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg,
+            return_imagined_candidate=lcg_enabled,
+        )
 
-        else:
-            c = cfg.actor_critic.training
-            sl = cfg.agent.denoiser.inner_model.num_steps_conditioning
-            bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
-            dl_actor_critic = make_data_loader(batch_sampler=bs)
-            wm_env_cfg = instantiate(cfg.world_model_env)
-            rl_env = WorldModelEnv(
-                self.agent.denoiser, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg,
-                return_imagined_candidate=lcg_enabled,
-            )
-
-            if cfg.training.compile_wm:
-                rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
-                rl_env.predict_rew_end = torch.compile(rl_env.predict_rew_end, mode="reduce-overhead")
+        if cfg.training.compile_wm:
+            rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
+            rl_env.predict_rew_end = torch.compile(rl_env.predict_rew_end, mode="reduce-overhead")
 
         # Setup training
         sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
-        actor_critic_loss_cfg = instantiate(cfg.actor_critic.actor_critic_loss)
-        self.agent.setup_training(sigma_distribution_cfg, actor_critic_loss_cfg, rl_env)
+        self.agent.setup_training(sigma_distribution_cfg, rl_env)
         diagnostic_cfg = cfg.get("pmpo_diagnostic")
         self._pmpo_diagnostic = None
         if diagnostic_cfg is not None and diagnostic_cfg.enabled:
-            if not isinstance(self.agent.actor_critic, PMPOBeta):
-                raise ValueError("PMPO diagnostic requires the PMPO controller")
             # Upper bound is a sanity check against typos, not a protocol limit -- the
             # 100k-real-step baseline (steps_per_epoch=500) resolves to 241 epochs, so
             # 20 (fine for short bounded diagnostics) was too low for that run.
@@ -232,9 +223,9 @@ class Trainer(StateDictMixin):
         # LCG intrinsic-reward lifecycle -- disabled unless
         # cfg.intrinsic_reward.enabled is True (default False, see
         # config/intrinsic_reward/lcg.yaml); only meaningful for the world-model
-        # (non-model-free) path. When disabled, self._lcg_lifecycle stays None and
+        # path. When disabled, self._lcg_lifecycle stays None and
         # train_agent()/train_component() take their exact original code paths.
-        if lcg_enabled and not self._is_model_free:
+        if lcg_enabled:
             lcg_cfg = instantiate(cfg.intrinsic_reward)
             self._lcg_lifecycle = LCGLifecycle(
                 lcg_cfg, sigma_distribution_cfg,
@@ -278,7 +269,7 @@ class Trainer(StateDictMixin):
         to_log = []
 
         if self.epoch == 0:
-            if self._is_model_free or self._is_static_dataset:
+            if self._is_static_dataset:
                 self.num_epochs_collect = 0
             else:
                 if self._rank == 0:
@@ -299,7 +290,7 @@ class Trainer(StateDictMixin):
                 print(f"\nEpoch {self.epoch} / {num_epochs}\n")
 
             # Training
-            should_collect_train = (self._rank == 0 and not self._is_model_free and not self._is_static_dataset and self.epoch <= self.num_epochs_collect)
+            should_collect_train = (self._rank == 0 and not self._is_static_dataset and self.epoch <= self.num_epochs_collect)
 
             if should_collect_train:
                 c = self._cfg.collection.train
@@ -320,7 +311,7 @@ class Trainer(StateDictMixin):
             if should_collect_test:
                 to_log += self.collect_test()
 
-            if should_test and not self._is_model_free:
+            if should_test:
                 to_log += self.test_agent()
 
             # Logging
@@ -345,39 +336,18 @@ class Trainer(StateDictMixin):
         c = self._cfg.collection.train
         min_steps = c.first_epoch.min
         steps_per_epoch = c.steps_per_epoch
-        max_steps = c.first_epoch.max
-        threshold_rew = c.first_epoch.threshold_rew
-        continuous_reward = self.agent.rew_end_model.continuous_reward
         assert min_steps % steps_per_epoch == 0
 
         steps = min_steps
         while True:
             to_log += self._train_collector.send(NumToCollect(steps=steps))
             num_steps = self.train_dataset.num_steps
-
-            if continuous_reward:
-                # Dense/continuous rewards have no meaningful "minority reward class" to wait for
-                # (see Stage 7B report for the full trace/rationale): stop purely on the step
-                # budget already represented by first_epoch.min, without ever consulting
-                # reward-sign counts, thresholds, or .sign().
-                if num_steps >= min_steps:
-                    break
-                print(f"Continuous reward collection: {num_steps}/{min_steps} steps -> keep collecting\n")
-            else:
-                total_minority_rew = sum(sorted(self.train_dataset.counts_rew)[:-1])
-                if total_minority_rew >= threshold_rew:
-                    break
-                if (max_steps is not None) and num_steps >= max_steps:
-                    print("Reached the specified maximum for initial collect")
-                    break
-                print(f"Minority reward: {total_minority_rew}/{threshold_rew} -> Keep collecting\n")
-
+            if num_steps >= min_steps:
+                break
             steps = steps_per_epoch
 
         print("\nSummary of initial collect:")
         print(f"Num steps: {num_steps} / {c.num_steps_total}")
-        if not continuous_reward:
-            print(f"Reward counts: {dict(self.train_dataset.counter_rew)}")
 
         remaining_steps = c.num_steps_total - num_steps
         assert remaining_steps % c.steps_per_epoch == 0
@@ -413,14 +383,14 @@ class Trainer(StateDictMixin):
         self.agent.train()
         self.agent.zero_grad()
         to_log = []
-        model_names = ["actor_critic"] if self._is_model_free else self._model_names
+        model_names = self._model_names
         for name in model_names:
             cfg = getattr(self._cfg, name).training
             if self.epoch > cfg.start_after_epochs:
                 if name == "actor_critic" and self._lcg_lifecycle is not None:
                     # World-model update for this round is complete (denoiser/rew_end_model
                     # already trained above) -- refresh h_D/CRN banks/RunningRMS once per
-                    # round, then rewire the frozen hook before this round's ActorCritic
+                    # round, then rewire the frozen hook before this round's PMPOBeta
                     # updates begin. See lcg.lifecycle.LCGLifecycle.
                     #
                     # round_identifier=self.epoch (not an internal counter): self.epoch is
@@ -451,7 +421,7 @@ class Trainer(StateDictMixin):
     def test_agent(self) -> Logs:
         self.agent.eval()
         to_log = []
-        model_names = [] if self._is_model_free else self._model_names[:-1]
+        model_names = self._model_names[:-1]
         for name in model_names:
             cfg = getattr(self._cfg, name).training
             if self.epoch > cfg.start_after_epochs:
@@ -465,7 +435,7 @@ class Trainer(StateDictMixin):
         lr_sched = self.lr_sched.get(name)
         data_loader = self._data_loader_train.get(name)
 
-        if isinstance(opt, PMPOOptimizers):
+        if name == "actor_critic":
             if cfg.grad_acc_steps != 1 or self._world_size != 1:
                 raise ValueError("Minimal PMPO supports one device and grad_acc_steps=1")
             model.train()
@@ -487,28 +457,16 @@ class Trainer(StateDictMixin):
 
         model.train()
         opt.zero_grad()
-        data_iterator = iter(data_loader) if data_loader is not None else None
+        data_iterator = iter(data_loader)
         to_log = []
 
         num_steps = cfg.grad_acc_steps * steps
 
-        # Gated purely-additive timing split: only active for actor_critic when LCG is
-        # enabled, so it costs nothing and changes nothing when LCG is disabled or for
-        # the other components.
-        lcg_timing = self._lcg_lifecycle is not None and name == "actor_critic"
-        t_forward_total = 0.0
-        t_backward_total = 0.0
-
         for i in trange(num_steps, desc=f"Training {name}", disable=self._rank > 0):
-            batch = next(data_iterator).to(self._device) if data_iterator is not None else None
-            if lcg_timing:
-                t0 = time.time()
-            loss, metrics = model(batch) if batch is not None else model()
+            batch = next(data_iterator).to(self._device)
+            loss, metrics = model(batch)
             if self._pmpo_diagnostic is not None and not torch.isfinite(loss).all():
                 raise FloatingPointError(f"Non-finite {name} loss")
-            if lcg_timing:
-                t_forward_total += time.time() - t0
-                t0 = time.time()
             loss.backward()
 
             num_batch = self.num_batch_train.get(name)
@@ -527,14 +485,8 @@ class Trainer(StateDictMixin):
                 if lr_sched is not None:
                     metrics["lr"] = lr_sched.get_last_lr()[0]
                     lr_sched.step()
-            if lcg_timing:
-                t_backward_total += time.time() - t0
 
             to_log.append(metrics)
-
-        if lcg_timing:
-            print(f"[LCG-TIMING] round={self._lcg_lifecycle.round_id} component=actor_critic "
-                  f"forward(imagination+scoring)={t_forward_total:.2f}s backward+opt={t_backward_total:.2f}s", flush=True)
 
         process_confusion_matrices_if_any_and_compute_classification_metrics(to_log)
         to_log = [{f"{name}/train/{k}": v for k, v in d.items()} for d in to_log]

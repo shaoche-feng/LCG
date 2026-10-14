@@ -35,8 +35,8 @@ def make_lcg_intrinsic_reward_fn(
     bank: JVPBank,
     chunk_size: int = 16,
 ) -> Callable[[List[Dict], Tensor], Tensor]:
-    """Builds an ActorCritic.intrinsic_reward_fn(infos, env_rew) -> Tensor hook (see
-    ActorCritic.set_intrinsic_reward_fn) using the production forward-mode JVP estimator
+    """Builds an PMPOBeta.intrinsic_reward_fn(infos, env_rew) -> Tensor hook (see
+    PMPOBeta.set_intrinsic_reward_fn) using the production forward-mode JVP estimator
     (genuine torch.func.jvp, simple IID Monte Carlo over the full training sigma
     distribution, Full CRN, M=bank.num_samples): scores every rollout step's
     info["imagined_candidate"] (populated by WorldModelEnv when constructed with
@@ -44,7 +44,7 @@ def make_lcg_intrinsic_reward_fn(
 
     h_D_inv_sqrt is precomputed ONCE by the caller (LCGLifecycle.refresh(), once per outer
     round) and passed in already-transformed -- h_D is fixed for the whole round, so
-    recomputing its rsqrt() on every one of this closure's calls (once per ActorCritic
+    recomputing its rsqrt() on every one of this closure's calls (once per PMPOBeta
     scoring step, i.e. many times per round) would be pure waste.
     """
     def intrinsic_reward_fn(infos: List[Dict], env_rew: Tensor) -> Tensor:

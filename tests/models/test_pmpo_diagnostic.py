@@ -19,6 +19,17 @@ def healthy():
                 fixed_policy_mean_state_std_0=0.1, policy_entropy=1.)
 
 
+def test_world_model_summary_counts_actual_denoiser_loss_key(tmp_path):
+    summary = diagnostics(tmp_path).world_model_loss_summary([
+        {"denoiser/train/loss_denoising": 1.5}, {"denoiser/train/loss_denoising": .5},
+        {"denoiser/test/loss_denoising": .75}, {"rew_end_model/train/loss_total": .25},
+    ])
+    assert summary["denoiser_train_steps"] == 2
+    assert summary["denoiser_test_steps"] == 1
+    assert summary["denoiser_train_loss_denoising_mean"] == 1.
+    assert summary["rew_end_model_train_steps"] == 1
+
+
 @pytest.mark.parametrize("key,value", [("alpha_max", 10001), ("kl_prior", 11),
                                       ("value_abs_max", 1000001), ("policy_entropy", -100)])
 def test_health_stops_are_observation_only(tmp_path, key, value):

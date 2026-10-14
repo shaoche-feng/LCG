@@ -93,9 +93,6 @@ def make_collector(
             pbar.close()
             metrics = {
                 "num_steps": dataset.num_steps,
-                "counts/rew_-1": dataset.counts_rew[0],
-                "counts/rew__0": dataset.counts_rew[1],
-                "counts/rew_+1": dataset.counts_rew[2],
                 "counts/end_0": dataset.counts_end[0],
                 "counts/end_1": dataset.counts_end[1],
             }

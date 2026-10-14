@@ -13,6 +13,220 @@ from models.pmpo_beta import PMPOOptimizers
 from test_pmpo_beta import make_controller
 
 
+def compose_cleanup_config(overrides=()):
+    from pathlib import Path
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+    root = Path(__file__).resolve().parents[2]
+    with initialize_config_dir(version_base="1.3", config_dir=str(root / "config")):
+        return compose(config_name="trainer", overrides=list(overrides))
+
+
+def test_default_hydra_agent_and_checkpoint(tmp_path):
+    from agent import Agent, get_action_space_kwargs
+    from hydra.utils import instantiate
+    cfg = compose_cleanup_config()
+    assert (cfg.env.train.domain_name, cfg.env.train.task_name) == ("cheetah", "run")
+    assert cfg.agent.actor_critic.prior_refresh_interval == 500
+    assert cfg.collection.train.steps_per_epoch == 100  # Recipes override this to 500.
+    env = SimpleNamespace(action_dim=6, action_low=torch.full((6,), -1.), action_high=torch.ones(6))
+    agent = Agent(instantiate(cfg.agent, **get_action_space_kwargs(env)))
+    assert isinstance(agent.rew_end_model.lstm, torch.nn.LSTM)
+    assert not hasattr(agent.actor_critic, "lstm_dim")
+    states = torch.randn(2, 12, 64, 64)
+    with torch.no_grad():
+        raw, value = agent.actor_critic.predict_act_value(states)
+        actions = agent.actor_critic.sample_action(raw, deterministic=True)
+    path = tmp_path / "agent.pt"
+    torch.save(agent.state_dict(), path)
+    restored = Agent(instantiate(cfg.agent, **get_action_space_kwargs(env)))
+    restored.load(path)
+    with torch.no_grad():
+        actual_raw, actual_value = restored.actor_critic.predict_act_value(states)
+        actual_actions = restored.actor_critic.sample_action(actual_raw, deterministic=True)
+    for actual, expected in ((actual_raw, raw), (actual_value, value), (actual_actions, actions)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_saved_pmpo_config_migration_preserves_learning_fields(tmp_path):
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf, open_dict
+    from utils import normalize_saved_config
+    cfg = compose_cleanup_config(["common.seed=23", "collection.train.steps_per_epoch=500",
+                                  "agent.actor_critic.entropy_coef=0.01"])
+    with open_dict(cfg):
+        cfg.training.model_free = False
+        cfg.env.train.type = "dm_control"
+        cfg.env.test.type = "${..train.type}"
+        cfg.collection.train.first_epoch.max = 10000
+        cfg.collection.train.first_epoch.threshold_rew = 10
+        cfg.actor_critic.actor_critic_loss = {
+            "_target_": "models.actor_critic.ActorCriticLossConfig", "backup_every": 15,
+            "gamma": .985, "lambda_": .95, "weight_value_loss": 1., "weight_entropy_loss": .001,
+        }
+        cfg.actor_critic.optimizer = {"lr": 123., "weight_decay": 0., "eps": 1e-8}
+        cfg.agent.actor_critic.lstm_dim = 512
+        for component in (cfg.agent, cfg.agent.denoiser.inner_model,
+                          cfg.agent.rew_end_model, cfg.agent.actor_critic):
+            component.num_actions = None
+        for component in (cfg.agent, cfg.agent.rew_end_model, cfg.agent.actor_critic):
+            component.continuous_reward = True
+    path = tmp_path / "historical.yaml"
+    OmegaConf.save(cfg, path)
+    original = path.read_bytes()
+    migrated = normalize_saved_config(OmegaConf.load(path))
+    assert path.read_bytes() == original and cfg.agent.actor_critic.lstm_dim == 512
+    assert migrated.agent.actor_critic.entropy_coef == 0.01
+    assert migrated.common.seed == 23 and migrated.collection.train.steps_per_epoch == 500
+    assert "model_free" not in migrated.training and "lstm_dim" not in migrated.agent.actor_critic
+    assert "actor_critic_loss" not in migrated.actor_critic and "optimizer" not in migrated.actor_critic
+    assert migrated.agent.rew_end_model.lstm_dim == 512
+    # Agent subtree migration also works with interpolation resolved by its parent.
+    kwargs = dict(continuous_action_dim=2, action_low=[-3., 0.5], action_high=[2., 7.])
+    assert instantiate(migrated.agent, **kwargs).actor_critic.entropy_coef == 0.01
+    assert instantiate(normalize_saved_config(cfg).agent, **kwargs).actor_critic.gamma == cfg.agent.actor_critic.gamma
+    # New unknown fields are not silently consumed by migration.
+    with open_dict(cfg):
+        cfg.agent.actor_critic.unknown_knob = 42
+    untouched = normalize_saved_config(cfg)
+    assert untouched.agent.actor_critic.unknown_knob == 42
+    with pytest.raises(Exception, match="unknown_knob"):
+        instantiate(untouched.agent, **kwargs)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("training.model_free", True), ("env.train.type", "atari"),
+    ("agent.num_actions", 6), ("agent.rew_end_model.continuous_reward", False),
+    ("agent.actor_critic._target_", "models.actor_critic.ActorCriticConfig"),
+    ("training.model_free", None), ("training.model_free", 0), ("training.model_free", ""),
+    ("agent.denoiser.inner_model.continuous_reward", True),
+    ("agent.actor_critic.lstm_dim", "512"), ("agent.actor_critic.lstm_dim", 0),
+    ("collection.train.first_epoch.max", -1), ("collection.train.first_epoch.threshold_rew", "10"),
+])
+def test_unsupported_saved_paths_fail_explicitly(field, value):
+    from omegaconf import OmegaConf
+    from utils import normalize_saved_config
+    cfg = compose_cleanup_config()
+    OmegaConf.update(cfg, field, value, force_add=True)
+    with pytest.raises(ValueError):
+        normalize_saved_config(cfg)
+
+
+@pytest.mark.parametrize("section,field,value", [
+    ("actor_critic_loss", "_target_", "invalid.CustomLoss"),
+    ("actor_critic_loss", "unknown", 42), ("actor_critic_loss", "gamma", float("nan")),
+    ("actor_critic_loss", "lambda_", 1.1), ("actor_critic_loss", "backup_every", True),
+    ("actor_critic_loss", "weight_entropy_loss", "0.001"),
+    ("optimizer", "_target_", "invalid.Optimizer"), ("optimizer", "lr", "0.01"),
+    ("optimizer", "eps", 0.), ("optimizer", "weight_decay", -1.),
+])
+def test_migration_rejects_invalid_fields_inside_discarded_sections(section, field, value):
+    from omegaconf import open_dict
+    from utils import normalize_saved_config
+    cfg = compose_cleanup_config()
+    with open_dict(cfg):
+        cfg.actor_critic.actor_critic_loss = {
+            "_target_": "models.actor_critic.ActorCriticLossConfig", "backup_every": 15,
+            "gamma": .985, "lambda_": .95, "weight_value_loss": 1., "weight_entropy_loss": .001,
+        }
+        cfg.actor_critic.optimizer = {"lr": 1e-4, "weight_decay": 0., "eps": 1e-8}
+        cfg.actor_critic[section][field] = value
+    with pytest.raises(ValueError):
+        normalize_saved_config(cfg)
+
+
+def test_migration_resolves_references_before_removing_obsolete_fields():
+    from omegaconf import OmegaConf, open_dict
+    from utils import normalize_saved_config
+    cfg = compose_cleanup_config()
+    with open_dict(cfg):
+        cfg.actor_critic.actor_critic_loss = {
+            "_target_": "models.actor_critic.ActorCriticLossConfig", "backup_every": 15,
+            "gamma": .93, "lambda_": .95, "weight_value_loss": 1., "weight_entropy_loss": .001,
+        }
+        cfg.agent.actor_critic.gamma = "${actor_critic.actor_critic_loss.gamma}"
+        cfg.collection.train.first_epoch.max = 10000
+        cfg.collection.train.first_epoch.threshold_rew = "${.max}"
+    original = OmegaConf.to_container(cfg, resolve=False)
+    migrated = normalize_saved_config(cfg)
+    assert migrated.agent.actor_critic.gamma == .93
+    assert "actor_critic_loss" not in migrated.actor_critic
+    assert "threshold_rew" not in migrated.collection.train.first_epoch
+    assert OmegaConf.to_container(cfg, resolve=False) == original
+    assert normalize_saved_config(cfg.agent).actor_critic.gamma == .93
+
+
+def test_historical_initialization_fingerprints_ignore_tensor_storage_identity(monkeypatch):
+    from pathlib import Path
+    import runpy
+    import sys
+    root = Path(__file__).resolve().parents[2]
+    # The historical script adds its import paths; isolate that side effect.
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    fingerprint = runpy.run_path(str(root / "scripts/lcg_diagnostic/pretrained_collectors/create_theta0.py"))["fingerprint"]
+    state = make_controller().state_dict()
+    copied = deepcopy(state)
+    assert fingerprint(state) == fingerprint(copied)
+    copied["_extra_state"]["rng"]["cpu"][0] ^= 1
+    assert fingerprint(state) != fingerprint(copied)
+
+
+def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatch):
+    """One real optimization step per component, without real-env collection."""
+    from pathlib import Path
+    from omegaconf import OmegaConf
+    from data import Dataset, Episode
+    from trainer import Trainer
+    import trainer as trainer_module
+    root = Path(__file__).resolve().parents[2]
+    dataset_root = tmp_path / "static"
+    for split in ("train", "test"):
+        dataset = Dataset(dataset_root / split, cache_in_ram=True)
+        for _ in range(2):
+            episode = Episode(torch.rand(10, 3, 8, 8) * 2 - 1, torch.rand(10, 2) * 2 - 1,
+                              torch.rand(10), torch.zeros(10, dtype=torch.long),
+                              torch.zeros(10, dtype=torch.long), {})
+            dataset.add_episode(episode)
+        dataset.save_to_default_path()
+    cfg = compose_cleanup_config([
+        "common.seed=7", "common.devices=cpu", "env.train.size=8",
+        "agent.denoiser.inner_model.num_steps_conditioning=2",
+        "agent.denoiser.inner_model.cond_channels=16", "agent.denoiser.inner_model.depths=[1]",
+        "agent.denoiser.inner_model.channels=[8]", "agent.denoiser.inner_model.attn_depths=[0]",
+        "agent.rew_end_model.lstm_dim=16", "agent.rew_end_model.cond_channels=16",
+        "agent.rew_end_model.depths=[1]", "agent.rew_end_model.channels=[8]",
+        "agent.rew_end_model.attn_depths=[0]", "agent.actor_critic.channels=[8]",
+        "agent.actor_critic.down=[0]", "agent.actor_critic.actor_hidden_dims=[16]",
+        "agent.actor_critic.value_hidden_dims=[16]", "world_model_env.horizon=2",
+        "world_model_env.num_batches_to_preload=1", "world_model_env.diffusion_sampler.num_steps_denoising=2",
+        f"static_dataset.path={dataset_root.as_posix()}", "training.num_final_epochs=1",
+        "training.compile_wm=false", "evaluation.every=1",
+        "denoiser.training.batch_size=2", "rew_end_model.training.batch_size=2",
+        "actor_critic.training.batch_size=2", "denoiser.training.steps_first_epoch=1",
+        "rew_end_model.training.steps_first_epoch=1", "actor_critic.training.steps_first_epoch=1",
+    ])
+    fake_env = SimpleNamespace(action_dim=2, action_low=torch.full((2,), -1.), action_high=torch.ones(2))
+    monkeypatch.setattr(trainer_module, "make_dm_control_env", lambda **kwargs: fake_env)
+    for method in ("init", "save", "log"):
+        monkeypatch.setattr(trainer_module.wandb, method, lambda *args, **kwargs: None)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".hydra").mkdir()
+    OmegaConf.save(cfg, tmp_path / ".hydra/config.yaml")
+    trainer = Trainer(cfg, root)
+    trainer._run()
+    assert trainer.epoch == 1 and trainer.num_epochs_collect == 0
+    assert trainer.train_dataset.num_steps == 20
+    assert trainer.agent.actor_critic.updates.item() == 1
+    assert trainer.num_batch_train.denoiser == trainer.num_batch_train.rew_end_model == 1
+    cfg.common.resume = True
+    resumed = Trainer(cfg, root)
+    assert resumed.epoch == 1 and resumed.num_batch_train.actor_critic == 1
+    for key, value in trainer.agent.state_dict().items():
+        if torch.is_tensor(value):
+            torch.testing.assert_close(resumed.agent.state_dict()[key], value, rtol=0, atol=0)
+
+
 class Prompts(IterableDataset):
     def __iter__(self):
         while True:
@@ -34,7 +248,7 @@ def make_system(device="cpu", **kwargs):
         sigma_data=0.5, sigma_offset_noise=0.3)).to(device)
     reward = RewEndModel(RewEndModelConfig(lstm_dim=16, img_channels=3, img_size=8, cond_channels=16,
                                          depths=[1], channels=[8], attn_depths=[False],
-                                         continuous_action_dim=2, continuous_reward=True)).to(device)
+                                         continuous_action_dim=2)).to(device)
     loader = DataLoader(Prompts(), batch_size=2, collate_fn=collate, generator=torch.Generator().manual_seed(0))
     env = WorldModelEnv(denoiser, reward, loader,
                         WorldModelEnvConfig(horizon=2, num_batches_to_preload=1,

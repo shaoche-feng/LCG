@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from contextlib import contextmanager
 import random
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -10,13 +11,21 @@ from torch import nn
 from torch.distributions import Beta, kl_divergence
 from torch.nn import functional as F
 
-from .actor_critic import ActorCriticConfig, ActorCriticEncoder, ActorCriticOutput, compute_lambda_returns
+from .actor_critic import ActorCriticEncoder, ActorCriticOutput, compute_lambda_returns
 from coroutines.env_loop import make_env_loop
 from envs import WorldModelEnv
 
 
 @dataclass
-class PMPOBetaConfig(ActorCriticConfig):
+class PMPOBetaConfig:
+    img_channels: int
+    img_size: int
+    channels: List[int]
+    down: List[int]
+    # Hydra constructs component configs before AgentConfig supplies environment metadata.
+    continuous_action_dim: Optional[int] = None
+    action_low: Optional[List[float]] = None
+    action_high: Optional[List[float]] = None
     frame_stack: int = 4
     actor_hidden_dims: tuple = (256, 256)
     value_hidden_dims: tuple = (256, 256)
@@ -100,7 +109,7 @@ class PMPOBeta(nn.Module):
             raise ValueError("This PMPO experiment requires exactly four frames")
         self.frame_stack = cfg.frame_stack
         seed = cfg.seed if cfg.seed is not None else 0
-        if cfg.continuous_action_dim is None or cfg.num_actions is not None:
+        if cfg.continuous_action_dim is None or cfg.continuous_action_dim < 1:
             raise ValueError("PMPOBeta requires an environment-derived continuous action space")
         low, high = torch.tensor(cfg.action_low), torch.tensor(cfg.action_high)
         if low.shape != (cfg.continuous_action_dim,) or high.shape != low.shape:
@@ -127,10 +136,6 @@ class PMPOBeta(nn.Module):
         # can distinguish local (per-block) trust-region movement from total cumulative
         # drift over the whole run. Never read by the loss.
         self.initial_actor = deepcopy(self.actor).requires_grad_(False).eval()
-        self.continuous_action = True
-        self.continuous_reward = True
-        # Compatibility with env_loop: this feedforward prototype has no recurrent state.
-        self.lstm_dim = 1
         self.intrinsic_reward_fn = None
         self.rl_env = None
         self._fixed_obs = None
@@ -200,12 +205,12 @@ class PMPOBeta(nn.Module):
         require_finite(log_probability=logp, entropy=entropy)
         return logp, entropy
 
-    def predict_act_value(self, obs, hx_cx):
+    def predict_act_value(self, obs):
         if obs.ndim != 4 or obs.shape[1] != self.cfg.img_channels * self.frame_stack:
             raise ValueError("PMPO requires the exact channel-concatenated four-frame state")
-        return ActorCriticOutput(self.actor(obs), self.value(obs).squeeze(-1), hx_cx)
+        return ActorCriticOutput(self.actor(obs), self.value(obs).squeeze(-1))
 
-    def setup_training(self, rl_env, loss_cfg=None):
+    def setup_training(self, rl_env):
         if not isinstance(rl_env, WorldModelEnv):
             raise ValueError("PMPO learns only from WorldModelEnv imagined transitions")
         if rl_env.data_loader.num_workers != 0:
@@ -237,7 +242,7 @@ class PMPOBeta(nn.Module):
         obs, act, rew, end, trunc, _, old_values, bootstrap, infos = self.collect_imagination()
         if self.intrinsic_reward_fn is not None:
             rew = self.intrinsic_reward_fn(infos, rew).detach()
-        targets = compute_lambda_returns(rew, end, trunc, bootstrap, c.gamma, c.lambda_, continuous_reward=True)
+        targets = compute_lambda_returns(rew, end, trunc, bootstrap, c.gamma, c.lambda_)
         advantage = targets - old_values
         flat_obs = obs.flatten(0, 1).detach()
         raw = self.actor(flat_obs)

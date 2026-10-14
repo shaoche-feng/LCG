@@ -213,7 +213,8 @@ class PMPORunDiagnostic:
                             values.setdefault(k[len(prefix):], []).append(float(v))
                 for key, vals in values.items():
                     summary[f"{component}_{split}_{key}_mean"] = float(np.mean(vals))
-                summary[f"{component}_{split}_steps"] = len(values.get("loss", []))
+                loss_key = "loss_denoising" if component == "denoiser" else "loss_total"
+                summary[f"{component}_{split}_steps"] = len(values.get(loss_key, values.get("loss", [])))
         return summary
 
     def finish_epoch(self, epoch, logs, real_steps):

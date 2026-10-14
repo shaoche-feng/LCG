@@ -22,8 +22,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _LCG_ROOT = _THIS_DIR.parent.parent.parent  # scripts/lcg_diagnostic/pretrained_collectors -> LCG/
 sys.path.insert(0, str(_THIS_DIR))
 sys.path.insert(0, str(_LCG_ROOT / "src" / "envs"))  # import the module directly, bypassing
-# src/envs/__init__.py's package-level imports (e.g. ale_py/AsyncVectorEnv), which are
-# irrelevant here and would needlessly couple this isolated script to the Atari path.
+# the vector/world-model environment imports, which are unnecessary for this collector check.
 
 from tdmpc2_adapter import load_pretrained_collector  # noqa: E402
 from dm_control_env import DMControlEnv  # noqa: E402 -- unmodified production wrapper

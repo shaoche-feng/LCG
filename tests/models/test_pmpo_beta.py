@@ -7,7 +7,7 @@ from models.actor_critic import compute_lambda_returns
 
 
 def make_controller(**kwargs):
-    cfg = dict(lstm_dim=1, img_channels=3, img_size=8, channels=[8], down=[0],
+    cfg = dict(img_channels=3, img_size=8, channels=[8], down=[0],
                continuous_action_dim=2, action_low=[-3., 0.5], action_high=[2., 7.],
                actor_hidden_dims=(16,), value_hidden_dims=(16,), imagination_horizon=3)
     cfg.update(kwargs)
@@ -107,7 +107,7 @@ def test_initial_actor_separate_from_prior_and_never_refreshed():
 ])
 def test_lambda_returns(end, trunc, gamma, lam, expected):
     actual = compute_lambda_returns(torch.tensor([[1., 2.]]), torch.tensor([end]), torch.tensor([trunc]),
-                                    torch.tensor([[5., 10.]]), gamma, lam, continuous_reward=True)
+                                    torch.tensor([[5., 10.]]), gamma, lam)
     torch.testing.assert_close(actual, torch.tensor([expected]))
 
 

@@ -99,7 +99,7 @@ class DatasetEnv:
                 f"Total     :  {self.ep_return:4.1f}",
             ],
             [
-                f"Action: {self.action_names[self.act]}",
+                f"Action: {self.act.tolist()}",
                 f"Trunc : {bool(self.trunc)}",
                 f"Done  : {bool(self.end)}",
                 f"Reward: {self.rew.item():.2f}",

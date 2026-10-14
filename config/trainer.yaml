@@ -1,7 +1,7 @@
 defaults:
   - _self_
-  - env: atari
-  - agent: default
+  - env: dm_control
+  - agent: pmpo_beta
   - intrinsic_reward: lcg
 
 
@@ -39,14 +39,7 @@ collection:
     epsilon: 0.01
     num_steps_total: 100000
     first_epoch:
-      # min: for discrete/Atari agents (RewEndModel.continuous_reward=False), the collection
-      # floor before the reward-class-balance heuristic below is even consulted. For
-      # continuous-reward agents (e.g. DM Control), min is used directly and *only* as the
-      # initial-collection step budget: collection stops as soon as num_steps >= min, and
-      # max/threshold_rew below are not used at all (see Trainer.collect_initial_dataset).
-      min: 5000
-      max: 10000  # null: no maximum. Atari-only.
-      threshold_rew: 10  # Atari-only.
+      min: 5000  # Initial collection budget for continuous rewards.
     steps_per_epoch: 100
   test:
     num_envs: 1
@@ -63,7 +56,6 @@ training:
   num_final_epochs: 50
   cache_in_ram: True
   num_workers_data_loaders: 0
-  model_free: False # if True, turn off world_model training and RL in imagination
   compile_wm: True
 
 evaluation:
@@ -137,19 +129,6 @@ actor_critic:
     steps_per_epoch: 400
     lr_warmup_steps: 100
     max_grad_norm: 100.0
-
-  actor_critic_loss:
-    _target_: models.actor_critic.ActorCriticLossConfig
-    backup_every: 15
-    gamma: 0.985
-    lambda_: 0.95
-    weight_value_loss: 1.0
-    weight_entropy_loss: 0.001
-
-  optimizer:
-    lr: 1e-4
-    weight_decay: 0
-    eps: 1e-8
 
 # LCG intrinsic-reward lifecycle config now lives in config/intrinsic_reward/lcg.yaml
 # (a Hydra config group, selected above via `defaults: - intrinsic_reward: lcg`), so a

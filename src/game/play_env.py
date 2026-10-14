@@ -1,9 +1,7 @@
 from collections import defaultdict, namedtuple
-import math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-import pygame
 import torch
 from torch import Tensor
 
@@ -11,6 +9,7 @@ from agent import Agent
 from data import Dataset, Episode
 from game.keymap import ActionNames, Keymap
 from envs import WorldModelEnv
+from coroutines.frame_history import FrameHistory
 
 
 NamedEnv = namedtuple("NamedEnv", "name env")
@@ -26,7 +25,6 @@ class PlayEnv:
         keymap: Keymap,
         recording_mode: bool,
         store_denoising_trajectory: bool,
-        store_original_obs: bool,
     ) -> None:
         self.agent = agent
         self.envs = envs
@@ -34,28 +32,17 @@ class PlayEnv:
         self.keymap = keymap
         self.recording_mode = recording_mode
         self.store_denoising_trajectory = store_denoising_trajectory
-        self.store_original_obs = store_original_obs
-        self.is_human_player = False
         self.env_id = 0
         self.env_name, self.env = self.envs[0]
-        self.obs, self.t, self.return_, self.hx_cx, self.ckpt_id, self.buffer, self.rec_dataset = (None,) * 7
+        self.obs, self.t, self.return_, self.buffer, self.rec_dataset = (None,) * 5
 
     def print_controls(self) -> None:
-        print("\nControls (play mode):\n")
-        print("m : controller (policy/human)")
-        print("↑ : imagination horizon (+1)")
-        print("↓ : imagination horizon (-1)")
-        print(f"→ : next environment ({' → '.join([env_name for (env_name, _) in self.envs])})")
-        print(f"← : prev environment ({' ← '.join([env_name for (env_name, _) in self.envs])})")
-        print("\nEnvironment actions:\n")
-        for keys, idx in self.keymap.items():
-            key_names = [pygame.key.name(key) for key in keys]
-            key_names = ["⎵" if key_name == "space" else key_name for key_name in key_names]
-            print(f"{' + '.join(key_names)} : {self.action_names[idx]}")
+        print("\nControls (policy viewer):\n")
+        print("up/down: imagination horizon (+1/-1)")
+        print("right/left: next/previous environment")
 
     def next_mode(self) -> bool:
-        self.switch_controller()
-        return True
+        return False
 
     def next_axis_1(self) -> bool:
         self.update_wm_horizon(+1)
@@ -79,17 +66,10 @@ class PlayEnv:
     def print_env(self) -> None:
         print(f"> Environment: {self.env_name}")
 
-    def print_control(self) -> None:
-        print(f"> Control: {'human' if self.is_human_player else 'policy'}")
-
     def switch_env(self, env_id: int) -> None:
         self.env_id = env_id % len(self.envs)
         self.env_name, self.env = self.envs[self.env_id]
         self.print_env()
-
-    def switch_controller(self) -> None:
-        self.is_human_player = not self.is_human_player
-        self.print_control()
 
     def update_wm_horizon(self, incr: int) -> None:
         if self.is_wm_env():
@@ -98,32 +78,30 @@ class PlayEnv:
     def reset_recording(self) -> None:
         self.buffer = defaultdict(list)
         self.buffer["info"] = defaultdict(list)
-        dir = Path("dataset") / f"rec_{self.env_name}_{'H' if self.is_human_player else 'π'}"
-        self.rec_dataset = Dataset(dir)
+        directory = Path("dataset") / f"rec_{self.env_name}_π"
+        self.rec_dataset = Dataset(directory)
         self.rec_dataset.load_from_default_path()
 
     def reset(self) -> Tuple[Tensor, None]:
         self.obs, _ = self.env.reset()
-        self.t, self.return_, self.hx_cx = 0, 0, None
+        self.t, self.return_ = 0, 0
+        self.history = FrameHistory(self.obs, self.agent.actor_critic.frame_stack)
         if self.recording_mode:
             self.reset_recording()
         return self.obs, None
 
     @torch.no_grad()
     def step(self, act: int) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]:
-        if self.is_human_player:
-            act = torch.tensor([act], device=self.agent.device)
-        else:
-            logits_act, value, self.hx_cx = self.agent.actor_critic.predict_act_value(self.obs, self.hx_cx)
-            dst = torch.distributions.categorical.Categorical(logits=logits_act)
-            act = dst.sample()
-            entropy = dst.entropy() / math.log(2)
-        entropy = None if self.is_human_player else f"{entropy.item():.2f}"
-        value = None if self.is_human_player else f"{value.item():.2f}"
+        model = self.agent.actor_critic
+        logits_act, value = model.predict_act_value(self.history.state)
+        act = model.sample_action(logits_act)
+        _, entropy = model.log_prob_and_entropy(logits_act, act)
+        entropy, value = f"{entropy.item():.2f}", f"{value.item():.2f}"
+        current_obs = self.obs.clone()
         next_obs, rew, end, trunc, env_info = self.env.step(act)
-        data = OneStepData(self.obs, act, rew, end, trunc)
+        data = OneStepData(current_obs, act, rew, end, trunc)
         self.return_ += rew.item()
-        control = "human" if self.is_human_player else "policy"
+        control = "policy"
         header = [
             [
                 f"Env     : {self.env_name}",
@@ -138,7 +116,7 @@ class PlayEnv:
                 f"Return: {self.return_:.2f}",
             ],
             [
-                f"Action : {self.action_names[act[0]]}",
+                f"Action : {act[0].tolist()}",
                 f"Entropy: {entropy}",
                 f"Value  : {value}",
             ],
@@ -154,16 +132,15 @@ class PlayEnv:
                 self.buffer[k].append(v)
             if self.store_denoising_trajectory and "denoising_trajectory" in env_info:
                 self.buffer["info"]["denoising_trajectory"].append(env_info["denoising_trajectory"])
-            if self.store_original_obs and "original_obs" in env_info:
-                original_obs = (torch.tensor(env_info["original_obs"][0]).permute(2, 0, 1).unsqueeze(0).contiguous())
-                self.buffer["info"]["original_obs"].append(original_obs)
             if end or trunc:
                 ep_dict = {k: torch.cat(v, dim=0) for k, v in self.buffer.items() if k != "info"}
                 ep_info = {k: torch.cat(v, dim=0) for k, v in self.buffer["info"].items()}
+                ep_info["final_observation"] = env_info["final_observation"][0].cpu()
                 ep = Episode(**ep_dict, info=ep_info).to("cpu")
                 self.rec_dataset.add_episode(ep)
                 self.rec_dataset.save_to_default_path()
 
+        self.history.advance(next_obs, torch.logical_or(end, trunc))
         self.obs = next_obs
         self.t += 1
 

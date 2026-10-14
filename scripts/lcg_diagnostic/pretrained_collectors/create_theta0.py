@@ -3,7 +3,7 @@
 domain start from an identical initial parameter state.
 
 Builds a real Agent (src/agent.py, unmodified) via Hydra config composition of
-config/agent/default.yaml, with action-space kwargs read from a throwaway
+config/agent/pmpo_beta.yaml, with action-space kwargs read from a throwaway
 DMControlEnv instance (no gymnasium/AsyncVectorEnv machinery needed for this).
 Fixes torch's global RNG to THETA0_SEED immediately before construction, since
 nn.Module weight init consumes the global RNG stream.
@@ -40,9 +40,16 @@ DOMAINS = ["walker", "quadruped"]
 def fingerprint(state_dict) -> str:
     h = hashlib.sha256()
     for k in sorted(state_dict.keys()):
-        t = state_dict[k].detach().cpu().contiguous()
         h.update(k.encode())
-        h.update(t.numpy().tobytes())
+        value = state_dict[k]
+        if torch.is_tensor(value):
+            h.update(value.detach().cpu().contiguous().numpy().tobytes())
+        else:
+            # PMPO checkpoints also carry the private imagination RNG stream.
+            # Pickled tensor storage IDs depend on allocation, even for identical
+            # RNG states. Canonical JSON keeps provenance hashes reproducible.
+            h.update(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                default=lambda item: item.tolist()).encode())
     return h.hexdigest()
 
 
@@ -55,7 +62,6 @@ def build_theta0(domain: str, seed: int = THETA0_SEED, out_path: Path = None, pr
     unchanged for walker/quadruped; hopper (no "walk" task) passes probe_task="stand"."""
     probe = DMControlEnv(domain_name=domain, task_name=probe_task, size=64, camera_id=0, action_repeat=2)
     fake_env = SimpleNamespace(
-        is_discrete=False,
         action_dim=probe.action_dim,
         action_low=torch.as_tensor(probe.action_low),
         action_high=torch.as_tensor(probe.action_high),

@@ -10,7 +10,7 @@ from .segment import SegmentId
 @dataclass
 class Batch:
     obs: torch.ByteTensor
-    act: torch.Tensor  # int64 (B, T) for discrete envs, float32 (B, T, action_dim) for continuous envs
+    act: torch.Tensor  # float32 (B, T, action_dim), in environment action bounds
     rew: torch.FloatTensor
     end: torch.LongTensor
     trunc: torch.LongTensor

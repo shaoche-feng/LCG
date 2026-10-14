@@ -55,10 +55,7 @@ class ImaginationStepper:
         rew_out, logits_end, (self.hx_rew_end, self.cx_rew_end) = self.rew_end_model.predict_rew_end(
             self.obs_buffer[:, -1:], self.act_buffer[:, -1:], next_obs.unsqueeze(1),
             (self.hx_rew_end, self.cx_rew_end))
-        if self.rew_end_model.continuous_reward:
-            rew = rew_out.squeeze(1)
-        else:
-            rew = Categorical(logits=rew_out).sample().squeeze(1) - 1.0
+        rew = rew_out.squeeze(1)
         end = Categorical(logits=logits_end).sample().squeeze(1)
         self.ep_len += 1
         trunc = (self.ep_len >= self.horizon).long()

@@ -13,7 +13,7 @@ class DMControlEnv(gymnasium.Env):
 
     Wraps `dm_control.suite.load(domain_name, task_name)` and exposes the
     standard gymnasium.Env `reset`/`step` interface expected downstream
-    (mirrors the role of `AtariPreprocessing` for the Atari path). Action
+    for training and evaluation. Action
     dimension and bounds are inferred from `env.action_spec()`, never
     hard-coded.
     """

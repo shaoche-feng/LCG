@@ -137,10 +137,7 @@ class WorldModelEnv:
             next_obs,
             (self.hx_rew_end, self.cx_rew_end),
         )
-        if self.rew_end_model.continuous_reward:
-            rew = rew_out.squeeze(1)  # (b, 1) -> (b,), predicted scalar reward used directly
-        else:
-            rew = Categorical(logits=rew_out).sample().squeeze(1) - 1.0  # in {-1, 0, 1}
+        rew = rew_out.squeeze(1)  # Predicted scalar reward used directly.
         end = Categorical(logits=logits_end).sample().squeeze(1)
         return rew, end
 

@@ -116,7 +116,7 @@ def validate_checkpoint(domain: str, checkpoint_path: Path, expected_fingerprint
 
     probe = DMControlEnv(domain_name=domain, task_name=probe_task, size=64, camera_id=0, action_repeat=2)
     fake_env = SimpleNamespace(
-        is_discrete=False, action_dim=probe.action_dim,
+        action_dim=probe.action_dim,
         action_low=torch.as_tensor(probe.action_low), action_high=torch.as_tensor(probe.action_high),
     )
     action_kwargs = get_action_space_kwargs(fake_env)
@@ -185,7 +185,6 @@ def train_one(domain: str, condition: str, seed: int = TRAINING_SEED, theta0_pat
         f"env.train.task_name={probe_task}",  # nominal only: static_dataset skips all live collection
         "common.devices=0",
         "intrinsic_reward.enabled=false",
-        "training.model_free=false",
         "training.compile_wm=false",  # avoid requiring Triton (unavailable on Windows here)
         f"static_dataset.path={static_dataset_dir.as_posix()}",
         f"initialization.path_to_ckpt={theta0_path.as_posix()}",

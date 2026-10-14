@@ -1,57 +1,13 @@
 from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
-import ale_py
 import gymnasium
 from gymnasium.vector import AsyncVectorEnv
 import numpy as np
 import torch
 from torch import Tensor
 
-from .atari_preprocessing import AtariPreprocessing
 from .dm_control_env import DMControlEnv
-
-
-def make_atari_env(
-    id: str,
-    num_envs: int,
-    device: torch.device,
-    done_on_life_loss: bool,
-    size: int,
-    max_episode_steps: Optional[int],
-) -> TorchEnv:
-    def env_fn():
-        env = gymnasium.make(
-            id,
-            full_action_space=False,
-            frameskip=1,
-            render_mode="rgb_array",
-            max_episode_steps=max_episode_steps,
-        )
-        env = AtariPreprocessing(
-            env=env,
-            noop_max=30,
-            frame_skip=4,
-            screen_size=size,
-        )
-        return env
-
-    # context="spawn": the Trainer initializes a CUDA context in this process before
-    # envs are created, and forking (Linux's default) a process that already holds a
-    # CUDA context deadlocks the worker. spawn avoids inheriting that state.
-    env = AsyncVectorEnv([env_fn for _ in range(num_envs)], context="spawn")
-
-    # The AsyncVectorEnv resets the env on termination, which means that it will
-    # reset the environment if we use the default AtariPreprocessing of gymnasium with
-    # terminate_on_life_loss=True (which means that we will only see the first life).
-    # Hence a separate wrapper for life_loss, coming after the AsyncVectorEnv.
-
-    if done_on_life_loss:
-        env = DoneOnLifeLoss(env)
-
-    env = TorchEnv(env, device)
-
-    return env
 
 
 def make_dm_control_env(
@@ -74,24 +30,11 @@ def make_dm_control_env(
             time_limit=time_limit,
         )
 
-    # context="spawn": see comment in make_atari_env above — same CUDA-after-fork deadlock.
+    # Spawn avoids inheriting the Trainer's initialized CUDA context (fork deadlocks).
     env = AsyncVectorEnv([env_fn for _ in range(num_envs)], context="spawn")
     env = TorchEnv(env, device)
 
     return env
-
-
-class DoneOnLifeLoss(gymnasium.Wrapper):
-    def __init__(self, env: AsyncVectorEnv) -> None:
-        super().__init__(env)
-
-    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-        obs, rew, end, trunc, info = self.env.step(actions)
-        life_loss = info["life_loss"]
-        if life_loss.any():
-            end[life_loss] = True
-            info["final_observation"] = obs
-        return obs, rew, end, trunc, info
 
 
 class TorchEnv(gymnasium.Wrapper):
@@ -101,18 +44,10 @@ class TorchEnv(gymnasium.Wrapper):
         self.num_envs = env.observation_space.shape[0]
 
         single_action_space = env.unwrapped.single_action_space
-        self.is_discrete = isinstance(single_action_space, gymnasium.spaces.Discrete)
-        if self.is_discrete:
-            self.num_actions = single_action_space.n
-            self.action_dim = None
-            self.action_low = None
-            self.action_high = None
-        else:
-            assert isinstance(single_action_space, gymnasium.spaces.Box)
-            self.num_actions = None
-            self.action_dim = int(single_action_space.shape[0])
-            self.action_low = torch.as_tensor(single_action_space.low, dtype=torch.float32, device=device)
-            self.action_high = torch.as_tensor(single_action_space.high, dtype=torch.float32, device=device)
+        assert isinstance(single_action_space, gymnasium.spaces.Box)
+        self.action_dim = int(single_action_space.shape[0])
+        self.action_low = torch.as_tensor(single_action_space.low, dtype=torch.float32, device=device)
+        self.action_high = torch.as_tensor(single_action_space.high, dtype=torch.float32, device=device)
 
         b, h, w, c = env.observation_space.shape
         self.observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(b, c, h, w))

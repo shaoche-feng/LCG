@@ -83,7 +83,7 @@ def test_full_pipeline_no_candidate_lost_or_duplicated(tiny_denoiser):
 
 
 def test_disabled_lcg_leaves_baseline_reward_untouched():
-    """Mirrors ActorCritic.forward()'s exact gate (src/models/actor_critic.py):
+    """Mirrors PMPOBeta.forward()'s exact gate (src/models/pmpo_beta.py):
     `if self.intrinsic_reward_fn is not None: rew = self.intrinsic_reward_fn(infos, rew)`.
     With intrinsic_reward_fn=None, rew must be completely unaffected."""
     original_rew = torch.randn(3, 4)

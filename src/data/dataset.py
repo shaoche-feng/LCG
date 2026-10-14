@@ -30,7 +30,6 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self.num_steps = None
         self.start_idx = None
         self.lengths = None
-        self.counter_rew = None
         self.counter_end = None
 
         self._directory = Path(directory).expanduser()
@@ -56,10 +55,6 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         return self._name
 
     @property
-    def counts_rew(self) -> List[int]:
-        return [self.counter_rew[r] for r in [-1, 0, 1]]
-
-    @property
     def counts_end(self) -> List[int]:
         return [self.counter_end[e] for e in [0, 1]]
 
@@ -68,7 +63,6 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self.num_steps = 0
         self.start_idx = np.array([], dtype=np.int64)
         self.lengths = np.array([], dtype=np.int64)
-        self.counter_rew = Counter()
         self.counter_end = Counter()
         self._cache.clear()
 
@@ -82,7 +76,9 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         if self._cache_in_ram and episode_id in self._cache:
             episode = self._cache[episode_id]
         else:
-            episode = Episode.load(self._get_episode_path(episode_id))
+            # Replay tensors live on CPU. Older episodes can carry CUDA final-
+            # observation metadata even when their observations/actions are CPU.
+            episode = Episode.load(self._get_episode_path(episode_id), map_location=torch.device("cpu"))
             if self._cache_in_ram:
                 self._cache[episode_id] = episode
         return episode
@@ -105,10 +101,8 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
             self.lengths[episode_id] = len(episode)
             self.start_idx[episode_id + 1 :] += incr_num_steps
             self.num_steps += incr_num_steps
-            self.counter_rew.subtract(old_episode.rew.sign().tolist())
             self.counter_end.subtract(old_episode.end.tolist())
 
-        self.counter_rew.update(episode.rew.sign().tolist())
         self.counter_end.update(episode.end.tolist())
 
         if self._save_on_disk:
@@ -128,6 +122,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         return self._directory / subfolders / f"{episode_id}.pt"
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        state_dict = {k: v for k, v in state_dict.items() if k != "counter_rew"}
         super().load_state_dict(state_dict)
         self._cache.clear()
 
@@ -141,6 +136,6 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
     def load_from_default_path(self) -> None:
         if self._default_path.is_file():
             # Trusted, locally generated DIAMOND dataset state (numpy arrays for start_idx/lengths,
-            # Counter objects for counter_rew/counter_end), not just tensor weights -- weights_only=False
+            # Counter object for counter_end), not just tensor weights -- weights_only=False
             # is required for PyTorch >=2.6, whose default changed to weights_only=True.
             self.load_state_dict(torch.load(self._default_path, weights_only=False))

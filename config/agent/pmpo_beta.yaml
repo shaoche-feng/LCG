@@ -4,8 +4,11 @@ defaults:
 
 actor_critic:
   _target_: models.pmpo_beta.PMPOBetaConfig
+  img_channels: ${agent.denoiser.inner_model.img_channels}
+  img_size: ${env.train.size}
+  channels: [32,32,64,64]
+  down: [1,1,1,1]
   frame_stack: 4
-  # lstm_dim inherited for schema compatibility; PMPO is feedforward.
   actor_hidden_dims: [256, 256]
   value_hidden_dims: [256, 256]
   actor_lr: 1e-4
