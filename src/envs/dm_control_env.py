@@ -21,6 +21,14 @@ REWARD_LABEL_TASK_GROUPS = {
     "walker": [("stand", "walk", "run")],
 }
 
+# Domains whose tasks end only at the time limit: no task overrides get_termination (only
+# lqr does). Exploration imagines no true endings, so it accepts only these domains.
+TIME_LIMIT_ONLY_DOMAINS = (
+    "acrobot", "ball_in_cup", "cartpole", "cheetah", "dog", "finger", "fish", "hopper", "humanoid",
+    "humanoid_CMU", "manipulator", "pendulum", "point_mass", "quadruped", "reacher", "stacker",
+    "swimmer", "walker",
+)
+
 
 def validate_task_names(
     domain_name: str,

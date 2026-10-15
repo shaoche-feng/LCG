@@ -208,7 +208,7 @@ class PMPORunDiagnostic:
         torch.save(payload, self.path / f"{name}.pt")
 
     def save_full_training_checkpoint(self, epoch, update, tag=None):
-        # The full Trainer state dict: denoiser, reward/end model, PMPO actor/value/prior,
+        # The full Trainer state dict: denoiser, reward/end model if any, PMPO actor/value/prior,
         # all three optimizers, LR schedulers, counters, this diagnostic's history, and
         # (via PMPOBeta's get_extra_state/set_extra_state hook) the imagination-RNG
         # snapshot, at a finer (prior-refresh-interval) cadence than Trainer's own
@@ -353,6 +353,8 @@ class PMPORunDiagnostic:
                     for k, v in log.items():
                         if k.startswith(prefix):
                             values.setdefault(k[len(prefix):], []).append(float(v))
+                if not values:  # e.g. exploration has no reward/end model
+                    continue
                 for key, vals in values.items():
                     summary[f"{component}_{split}_{key}_mean"] = float(np.mean(vals))
                 loss_key = "loss_denoising" if component == "denoiser" else "loss_total"

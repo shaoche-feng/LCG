@@ -101,17 +101,17 @@ def test_config_interpolation_and_collection_modes():
 
 @pytest.mark.parametrize("key", ["collection.train.first_epoch.mode", "collection.train.mode"])
 def test_trainer_rejects_unknown_collection_mode_before_any_work(key, tmp_path, monkeypatch):
-    import trainer as trainer_module
+    import exploration_trainer as trainer_module
     cfg = compose(["common.devices=cpu", f"{key}=epsilon"])
     monkeypatch.setattr(trainer_module.wandb, "init", lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ValueError, match=key.replace(".", r"\.")):
-        trainer_module.Trainer(cfg, Path(__file__).resolve().parents[2])
+        trainer_module.ExplorationTrainer(cfg, Path(__file__).resolve().parents[2])
     assert not (tmp_path / "checkpoints").exists()
 
 
 def test_trainer_passes_initial_and_later_collection_modes(monkeypatch):
-    import trainer as trainer_module
+    import exploration_trainer as trainer_module
 
     class Collector:
         def __init__(self, dataset):
@@ -122,13 +122,13 @@ def test_trainer_passes_initial_and_later_collection_modes(monkeypatch):
             return []
 
     class Data:
-        num_steps = 0
+        name, num_steps, counts_end = "train_dataset", 0, [0, 0]
         def state_dict(self):
             return {}
         def load_state_dict(self, state):
             pass
 
-    t = trainer_module.Trainer.__new__(trainer_module.Trainer)
+    t = trainer_module.ExplorationTrainer.__new__(trainer_module.ExplorationTrainer)
     t._cfg = OmegaConf.create(dict(
         collection=dict(train=dict(num_steps_total=40, steps_per_epoch=10, mode="policy",
                                    first_epoch=dict(min=20, mode="uniform"))),

@@ -199,8 +199,8 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
     import numpy as np
     from omegaconf import OmegaConf
     from data import Dataset, Episode
-    from trainer import Trainer
-    import trainer as trainer_module
+    from exploration_trainer import ExplorationTrainer
+    import exploration_trainer as trainer_module
     import pmpo_diagnostic
     root = Path(__file__).resolve().parents[2]
     dataset_root = tmp_path / "static"
@@ -227,6 +227,10 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
         "training.compile_wm=false", "evaluation.every=1",
         "denoiser.training.batch_size=2", "rew_end_model.training.batch_size=2",
         "actor_critic.training.batch_size=2", "denoiser.training.steps_first_epoch=1",
+        # Tiny LCG scorer for the one-level test denoiser.
+        "intrinsic_reward.theta_s.include=[conv_out.*]", "intrinsic_reward.precision_reference_size=8",
+        "intrinsic_reward.precision_num_mc=1", "intrinsic_reward.candidate_num_mc=2",
+        "intrinsic_reward.candidate_chunk_size=4",
         "rew_end_model.training.steps_first_epoch=1", "actor_critic.training.steps_first_epoch=1",
         *(["+pmpo_diagnostic=bounded", "denoiser.training.steps_per_epoch=1",
            "rew_end_model.training.steps_per_epoch=1", "actor_critic.training.steps_per_epoch=1"]
@@ -251,14 +255,14 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".hydra").mkdir()
     OmegaConf.save(cfg, tmp_path / ".hydra/config.yaml")
-    trainer = Trainer(cfg, root)
+    trainer = ExplorationTrainer(cfg, root)
     trainer._run()
     assert trainer.epoch == 1 and trainer.num_epochs_collect == 0
     assert trainer.train_dataset.num_steps == 20
     assert trainer.agent.actor_critic.updates.item() == 1
-    assert trainer.num_batch_train.denoiser == trainer.num_batch_train.rew_end_model == 1
+    assert trainer.num_batch_train.denoiser == 1 and trainer.agent.rew_end_model is None
     cfg.common.resume = True
-    resumed = Trainer(cfg, root)
+    resumed = ExplorationTrainer(cfg, root)
     assert resumed.epoch == 1 and resumed.num_batch_train.actor_critic == 1
     for key, value in trainer.agent.state_dict().items():
         if torch.is_tensor(value):
@@ -278,12 +282,12 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
         path = tmp_path / "pmpo_diagnostic/fixed_real_stacks.pt"
         torch.save(fixed_real + 1, path)
         different = path.read_bytes()
-        resumed = Trainer(cfg, root)
+        resumed = ExplorationTrainer(cfg, root)
         torch.testing.assert_close(resumed._pmpo_diagnostic.fixed_real, fixed_real, rtol=0, atol=0)
         assert path.read_bytes() == different
         path.unlink()
         cfg.training.num_final_epochs = 2
-        resumed = Trainer(cfg, root)
+        resumed = ExplorationTrainer(cfg, root)
         resumed._run()
         assert resumed.epoch == 2 and resumed._pmpo_diagnostic.updates_observed == 2
         torch.testing.assert_close(resumed._pmpo_diagnostic.fixed_real, fixed_real, rtol=0, atol=0)

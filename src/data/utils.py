@@ -22,6 +22,16 @@ def collate_segments_to_batch(segments: List[Segment]) -> Batch:
     return Batch(*stack, [s.info for s in segments], [s.id for s in segments], task_rew)
 
 
+def collate_segments_without_rewards(segments: List[Segment]) -> Batch:
+    """Batch for reward-free learners: task labels dropped, rew a zero placeholder, and no
+    episode metadata (no exploration learner reads batch.info)."""
+    batch = collate_segments_to_batch(segments)
+    batch.rew = torch.zeros_like(batch.rew)
+    batch.task_rew = None
+    batch.info = [{} for _ in segments]  # new dicts: the episodes' own info is untouched
+    return batch
+
+
 def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = True) -> Segment:
     assert segment_id.start < len(episode) and segment_id.stop > 0 and segment_id.start < segment_id.stop
     pad_len_right = max(0, segment_id.stop - len(episode))
@@ -50,10 +60,11 @@ def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = Tru
 
 
 class DatasetTraverser:
-    def __init__(self, dataset, batch_num_samples: int, chunk_size: int) -> None:
+    def __init__(self, dataset, batch_num_samples: int, chunk_size: int, collate_fn=collate_segments_to_batch) -> None:
         self.dataset = dataset
         self.batch_num_samples = batch_num_samples
         self.chunk_size = chunk_size
+        self.collate_fn = collate_fn
 
     def __len__(self):
         return math.ceil(
@@ -83,8 +94,8 @@ class DatasetTraverser:
                 chunks.pop()
 
             while len(chunks) >= self.batch_num_samples:
-                yield collate_segments_to_batch(chunks[: self.batch_num_samples])
+                yield self.collate_fn(chunks[: self.batch_num_samples])
                 chunks = chunks[self.batch_num_samples :]
 
         if len(chunks) > 0:
-            yield collate_segments_to_batch(chunks)
+            yield self.collate_fn(chunks)

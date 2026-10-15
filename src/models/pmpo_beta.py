@@ -237,6 +237,9 @@ class PMPOBeta(nn.Module):
 
     def forward(self):
         c = self.cfg
+        if self.intrinsic_reward_fn is None and self.rl_env.rew_end_model is None:
+            # Never train on the placeholder reward of a world model without a reward model.
+            raise RuntimeError("PMPO has no reward source: set an intrinsic reward hook or a reward model")
         if not c.fixed_prior and self.updates.item() % c.prior_refresh_interval == 0:
             self.prior_actor.load_state_dict(self.actor.state_dict())
         self.prior_actor.eval()

@@ -17,8 +17,8 @@ import wandb
 from agent import Agent, get_action_space_kwargs
 from utils import normalize_saved_config
 from coroutines.collector import COLLECTION_MODES, make_collector, NumToCollect
-from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
-from envs import make_dm_control_env, WorldModelEnv
+from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
+from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from lcg import LCGLifecycle
 from models.pmpo_beta import PMPOOptimizers
 from pmpo_diagnostic import PMPORunDiagnostic
@@ -41,7 +41,16 @@ from utils import (
 )
 
 
-class Trainer(StateDictMixin):
+class ExplorationTrainer(StateDictMixin):
+    """Reward-free exploration: collect real data, train the denoiser, refresh the intrinsic
+    scorer, and train the exploration policy in imagination on intrinsic reward only.
+
+    collection.train.mode selects the method: "policy" is learned (LCG) exploration and
+    needs intrinsic_reward.enabled; "uniform" is the uniform-random baseline, which trains
+    the denoiser only. Recorded task rewards stay in the dataset for downstream training;
+    every exploration learner input has them removed (collate_segments_without_rewards).
+    """
+
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         cfg = normalize_saved_config(cfg)
@@ -75,6 +84,17 @@ class Trainer(StateDictMixin):
             mode = OmegaConf.select(cfg, key)
             if mode not in COLLECTION_MODES:
                 raise ValueError(f"{key} must be one of {COLLECTION_MODES}, got {mode!r}")
+        self._learned_exploration = cfg.collection.train.mode == "policy"
+        lcg_enabled = bool(cfg.intrinsic_reward.enabled)
+        if self._learned_exploration and not lcg_enabled:
+            raise ValueError("Learned exploration (collection.train.mode=policy) needs intrinsic_reward.enabled=true")
+        if not self._learned_exploration and lcg_enabled:
+            raise ValueError("The uniform baseline trains no exploration policy; set intrinsic_reward.enabled=false")
+        if not self._learned_exploration and cfg.get("pmpo_diagnostic") is not None:
+            raise ValueError("pmpo_diagnostic needs PMPO updates; the uniform baseline has none")
+        # Imagined episodes never truly end, so real ones must not either.
+        if cfg.env.train.domain_name not in TIME_LIMIT_ONLY_DOMAINS:
+            raise ValueError(f"Domain {cfg.env.train.domain_name!r} is not verified to end only at its time limit")
 
         # Checkpointing
         self._path_ckpt_dir = Path("checkpoints")
@@ -123,8 +143,8 @@ class Trainer(StateDictMixin):
             action_kwargs = None
         action_kwargs, = broadcast_if_needed(action_kwargs)
 
-        # Create models
-        self.agent = Agent(instantiate(cfg.agent, **action_kwargs)).to(self._device)
+        # Create models (no reward/end model: exploration never uses task reward)
+        self.agent = Agent(instantiate(cfg.agent, rew_end_model=None, **action_kwargs)).to(self._device)
         self._agent = build_ddp_wrapper(**self.agent._modules) if dist.is_initialized() else self.agent
 
         if cfg.initialization.path_to_ckpt is not None:
@@ -141,28 +161,23 @@ class Trainer(StateDictMixin):
 
         ######################################################
 
-        # Optimizers and LR schedulers
+        # Optimizers and LR schedulers (CommonTools' rew_end_model slot stays None)
 
-        def build_opt(name: str):
-            if name == "actor_critic":
-                return PMPOOptimizers(self.agent.actor_critic, cfg.actor_critic.training.lr_warmup_steps)
-            return configure_opt(getattr(self.agent, name), **getattr(cfg, name).optimizer)
+        self._model_names = ["denoiser", "actor_critic"] if self._learned_exploration else ["denoiser"]
+        denoiser_opt = configure_opt(self.agent.denoiser, **cfg.denoiser.optimizer)
+        actor_critic_opt = None
+        if self._learned_exploration:
+            # Both PMPO schedulers are owned and checkpointed by PMPOOptimizers.
+            actor_critic_opt = PMPOOptimizers(self.agent.actor_critic, cfg.actor_critic.training.lr_warmup_steps)
+        self.opt = CommonTools(denoiser_opt, None, actor_critic_opt)
+        self.lr_sched = CommonTools(get_lr_sched(denoiser_opt, cfg.denoiser.training.lr_warmup_steps), None, None)
 
-        def build_lr_sched(name: str):
-            if name == "actor_critic":
-                return None  # both schedulers are owned/checkpointed by PMPOOptimizers
-            return get_lr_sched(self.opt.get(name), getattr(cfg, name).training.lr_warmup_steps)
-
-        self._model_names = ["denoiser", "rew_end_model", "actor_critic"]
-        self.opt = CommonTools(*map(build_opt, self._model_names))
-        self.lr_sched = CommonTools(*map(build_lr_sched, self._model_names))
-
-        # Data loaders
+        # Data loaders: task rewards are removed from every exploration learner input.
 
         make_data_loader = partial(
             DataLoader,
             dataset=self.train_dataset,
-            collate_fn=collate_segments_to_batch,
+            collate_fn=collate_segments_without_rewards,
             num_workers=num_workers,
             persistent_workers=(num_workers > 0),
             pin_memory=self._use_cuda,
@@ -178,33 +193,24 @@ class Trainer(StateDictMixin):
         seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
         bs = make_batch_sampler(c.batch_size, seq_length, get_sample_weights(c.sample_weights))
         dl_denoiser_train = make_data_loader(batch_sampler=bs)
-        dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length)
+        dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length, collate_segments_without_rewards)
 
-        c = cfg.rew_end_model.training
-        bs = make_batch_sampler(c.batch_size, c.seq_length, get_sample_weights(c.sample_weights), can_sample_beyond_end=True)
-        dl_rew_end_model_train = make_data_loader(batch_sampler=bs)
-        dl_rew_end_model_test = DatasetTraverser(self.test_dataset, c.batch_size, c.seq_length)
+        self._data_loader_train = CommonTools(dl_denoiser_train, None, None)
+        self._data_loader_test = CommonTools(dl_denoiser_test, None, None)
 
-        self._data_loader_train = CommonTools(dl_denoiser_train, dl_rew_end_model_train, None)
-        self._data_loader_test = CommonTools(dl_denoiser_test, dl_rew_end_model_test, None)
+        # RL env: imagination without a reward/end model (zero reward placeholder, no
+        # true endings, truncation at the horizon). Only learned exploration uses it.
 
-        # RL env
-
-        lcg_enabled = bool(getattr(cfg, "intrinsic_reward", None) is not None and cfg.intrinsic_reward.enabled)
-
-        c = cfg.actor_critic.training
-        sl = cfg.agent.denoiser.inner_model.num_steps_conditioning
-        bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
-        dl_actor_critic = make_data_loader(batch_sampler=bs)
-        wm_env_cfg = instantiate(cfg.world_model_env)
-        rl_env = WorldModelEnv(
-            self.agent.denoiser, self.agent.rew_end_model, dl_actor_critic, wm_env_cfg,
-            return_imagined_candidate=lcg_enabled,
-        )
-
-        if cfg.training.compile_wm:
-            rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
-            rl_env.predict_rew_end = torch.compile(rl_env.predict_rew_end, mode="reduce-overhead")
+        rl_env = None
+        if self._learned_exploration:
+            c = cfg.actor_critic.training
+            sl = cfg.agent.denoiser.inner_model.num_steps_conditioning
+            bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
+            dl_actor_critic = make_data_loader(batch_sampler=bs)
+            wm_env_cfg = instantiate(cfg.world_model_env)
+            rl_env = WorldModelEnv(self.agent.denoiser, None, dl_actor_critic, wm_env_cfg, return_imagined_candidate=True)
+            if cfg.training.compile_wm:
+                rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
 
         # Setup training
         sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
@@ -220,12 +226,9 @@ class Trainer(StateDictMixin):
             self._pmpo_diagnostic = PMPORunDiagnostic(diagnostic_cfg, self.agent.actor_critic, cfg.env.test,
                                                       optimizers=self.opt.actor_critic, trainer_state_fn=self.state_dict)
 
-        # LCG intrinsic-reward lifecycle -- disabled unless
-        # cfg.intrinsic_reward.enabled is True (default False, see
-        # config/intrinsic_reward/lcg.yaml); only meaningful for the world-model
-        # path. When disabled, self._lcg_lifecycle stays None and
-        # train_agent()/train_component() take their exact original code paths.
-        if lcg_enabled:
+        # LCG intrinsic-reward lifecycle, the only exploration scorer (learned exploration).
+        self._lcg_lifecycle = None
+        if self._learned_exploration:
             lcg_cfg = instantiate(cfg.intrinsic_reward)
             self._lcg_lifecycle = LCGLifecycle(
                 lcg_cfg, sigma_distribution_cfg,
@@ -233,15 +236,13 @@ class Trainer(StateDictMixin):
                 img_size=cfg.env.train.size,
                 device=self._device,
             )
-        else:
-            self._lcg_lifecycle = None
 
         # Training state (things to be saved/restored)
         self.epoch = 0
         self.num_epochs_collect = None
         self.num_episodes_test = 0
-        self.num_batch_train = CommonTools(0, 0, 0)
-        self.num_batch_test = CommonTools(0, 0, 0)
+        self.num_batch_train = CommonTools(0, None, 0)
+        self.num_batch_test = CommonTools(0, None, 0)
 
         if cfg.common.resume:
             self.load_state_checkpoint()
@@ -277,6 +278,7 @@ class Trainer(StateDictMixin):
                     to_log += to_log_
                 self.num_epochs_collect, sd_train_dataset = broadcast_if_needed(self.num_epochs_collect, self.train_dataset.state_dict())
                 self.train_dataset.load_state_dict(sd_train_dataset)
+                self.check_no_true_termination(self.train_dataset)
 
         num_epochs = self.num_epochs_collect + self._cfg.training.num_final_epochs
         if self._pmpo_diagnostic is not None:
@@ -295,6 +297,7 @@ class Trainer(StateDictMixin):
             if should_collect_train:
                 c = self._cfg.collection.train
                 to_log += self._train_collector.send(NumToCollect(steps=c.steps_per_epoch, mode=c.mode))
+                self.check_no_true_termination(self.train_dataset)
             sd_train_dataset, = broadcast_if_needed(self.train_dataset.state_dict())  # update dataset for ranks > 0
             self.train_dataset.load_state_dict(sd_train_dataset)
             
@@ -355,15 +358,22 @@ class Trainer(StateDictMixin):
 
         return num_epochs_collect, to_log
 
+    def check_no_true_termination(self, dataset: Dataset) -> None:
+        if dataset.counts_end[1] > 0:
+            raise RuntimeError(f"{dataset.name} has a true termination; exploration supports time-limit-only tasks")
+
     def collect_test(self, final: bool = False) -> Logs:
         c = self._cfg.collection.test
         episodes = c.num_final_episodes if final else c.num_episodes
         td = self.test_dataset
         td.clear()
-        to_log = self._test_collector.send(NumToCollect(episodes=episodes))
+        # Same action source as training collection: the baseline has no trained policy.
+        mode = self._cfg.collection.train.mode
+        to_log = self._test_collector.send(NumToCollect(episodes=episodes, mode=mode))
         key_ep_id = f"{td.name}/episode_id"
         to_log = [{k: v + self.num_episodes_test if k == key_ep_id else v for k, v in x.items()} for x in to_log]
 
+        self.check_no_true_termination(td)
         print(f"\nSummary of {'final' if final else 'test'} collect: {td.num_episodes} episodes ({td.num_steps} steps)")
         keys = [key_ep_id, "return", "length"]
         to_log_episodes = [x for x in to_log if set(x.keys()) == set(keys)]
@@ -387,45 +397,24 @@ class Trainer(StateDictMixin):
         for name in model_names:
             cfg = getattr(self._cfg, name).training
             if self.epoch > cfg.start_after_epochs:
-                if name == "actor_critic" and self._lcg_lifecycle is not None:
-                    # World-model update for this round is complete (denoiser/rew_end_model
-                    # already trained above) -- refresh h_D/CRN banks/RunningRMS once per
-                    # round, then rewire the frozen hook before this round's PMPOBeta
-                    # updates begin. See lcg.lifecycle.LCGLifecycle.
-                    #
-                    # round_identifier=self.epoch (not an internal counter): self.epoch is
-                    # already persisted/restored by Trainer's own checkpoint (StateDictMixin
-                    # picks up every non-underscore-prefixed attribute, and self._lcg_lifecycle
-                    # itself is NOT checkpointed), so deriving the LCG round seed from it means
-                    # a resumed run continues the seed sequence rather than restarting it from 0
-                    # and reusing seeds (and therefore historical subsets/candidate banks) an
-                    # earlier, pre-resume round already used.
+                if name == "actor_critic":
+                    # Refresh the intrinsic scorer on this epoch's denoiser, then rewire the
+                    # PMPO hook. The round seed is the checkpointed epoch, so a resumed run
+                    # continues the seed sequence (the lifecycle itself is not checkpointed).
                     self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
                     self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
                 steps = cfg.steps_first_epoch if self.epoch == 1 else cfg.steps_per_epoch
-                if self._lcg_lifecycle is not None:
-                    t0 = time.time()
-                    to_log += self.train_component(name, steps)
-                    # NOTE: self._lcg_lifecycle.round_id is only authoritative for `name ==
-                    # "actor_critic"` (refresh() has just run this epoch); for
-                    # denoiser/rew_end_model it would still show the *previous* round's id,
-                    # so this line is labeled by epoch instead to avoid mislabeling.
-                    round_label = self._lcg_lifecycle.round_id if name == "actor_critic" else f"pending(epoch={self.epoch})"
-                    print(f"[LCG-TIMING] round={round_label} component={name} "
-                          f"time={time.time() - t0:.2f}s", flush=True)
-                else:
-                    to_log += self.train_component(name, steps)
+                t0 = time.time()
+                to_log += self.train_component(name, steps)
+                print(f"[TIMING] epoch={self.epoch} component={name} time={time.time() - t0:.2f}s", flush=True)
         return to_log
 
     @torch.no_grad()
     def test_agent(self) -> Logs:
         self.agent.eval()
         to_log = []
-        model_names = self._model_names[:-1]
-        for name in model_names:
-            cfg = getattr(self._cfg, name).training
-            if self.epoch > cfg.start_after_epochs:
-                to_log += self.test_component(name)
+        if self.epoch > self._cfg.denoiser.training.start_after_epochs:
+            to_log += self.test_component("denoiser")
         return to_log
 
     def train_component(self, name: str, steps: int) -> Logs:

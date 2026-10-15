@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -12,7 +12,7 @@ from models.rew_end_model import RewEndModel
 
 ResetOutput = Tuple[torch.FloatTensor, Dict[str, Any]]
 StepOutput = Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]
-InitialCondition = Tuple[Tensor, Tensor, Tensor, Tuple[Tensor, Tensor]]
+InitialCondition = Tuple[Tensor, Tensor, Tensor, Optional[Tuple[Tensor, Tensor]]]
 
 
 @dataclass
@@ -37,10 +37,14 @@ class WorldModelEnvConfig:
 
 
 class WorldModelEnv:
+    """Imagination with the denoiser. Without a reward/end model (rew_end_model=None) it
+    returns a zero reward placeholder and no true endings: episodes are only truncated at
+    the horizon, and PMPO must supply its own (intrinsic) reward."""
+
     def __init__(
         self,
         denoiser: Denoiser,
-        rew_end_model: RewEndModel,
+        rew_end_model: Optional[RewEndModel],
         data_loader: DataLoader,
         cfg: WorldModelEnvConfig,
         return_denoising_trajectory: bool = False,
@@ -74,11 +78,11 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def reset(self, **kwargs) -> ResetOutput:
-        obs, act, valid, (hx, cx) = self.generator_init.send(self.num_envs)
+        obs, act, valid, hx_cx = self.generator_init.send(self.num_envs)
         self.obs_buffer = obs
         self.act_buffer = act
-        self.hx_rew_end = hx
-        self.cx_rew_end = cx
+        if self.rew_end_model is not None:
+            self.hx_rew_end, self.cx_rew_end = hx_cx
         self.ep_len = torch.zeros(self.num_envs, dtype=torch.long, device=obs.device)
         # The replay prompt (frames and padding mask) seeds the policy's frame history.
         return self.obs_buffer[:, -1], {"prompt": (obs.clone(), valid)}
@@ -86,11 +90,11 @@ class WorldModelEnv:
     @torch.no_grad()
     def reset_dead(self, dead: torch.BoolTensor) -> Tuple[Tensor, Tensor]:
         """Returns the new replay prompts of the dead rows."""
-        obs, act, valid, (hx, cx) = self.generator_init.send(dead.sum().item())
+        obs, act, valid, hx_cx = self.generator_init.send(dead.sum().item())
         self.obs_buffer[dead] = obs
         self.act_buffer[dead] = act
-        self.hx_rew_end[:, dead] = hx
-        self.cx_rew_end[:, dead] = cx
+        if self.rew_end_model is not None:
+            self.hx_rew_end[:, dead], self.cx_rew_end[:, dead] = hx_cx
         self.ep_len[dead] = 0
         return obs, valid
 
@@ -103,7 +107,11 @@ class WorldModelEnv:
             candidate_x_act = self.act_buffer.clone()
 
         next_obs, denoising_trajectory = self.predict_next_obs()
-        rew, end = self.predict_rew_end(next_obs.unsqueeze(1))
+        if self.rew_end_model is None:
+            rew = torch.zeros(self.num_envs, device=next_obs.device)
+            end = torch.zeros(self.num_envs, dtype=torch.long, device=next_obs.device)
+        else:
+            rew, end = self.predict_rew_end(next_obs.unsqueeze(1))
 
         self.ep_len += 1
         trunc = (self.ep_len >= self.horizon).long()
@@ -163,14 +171,15 @@ class WorldModelEnv:
                 obs = batch.obs.to(self.device)
                 act = batch.act.to(self.device)
                 valid = batch.mask_padding.to(self.device)
-                with torch.no_grad():
-                    *_, (hx, cx) = self.rew_end_model.predict_rew_end(obs[:, :-1], act[:, :-1], obs[:, 1:])  # Burn-in of rew/end model
-                assert hx.size(0) == cx.size(0) == 1
                 obs_.extend(list(obs))
                 act_.extend(list(act))
                 valid_.extend(list(valid))
-                hx_.extend(list(hx[0]))
-                cx_.extend(list(cx[0]))
+                if self.rew_end_model is not None:
+                    with torch.no_grad():
+                        *_, (hx, cx) = self.rew_end_model.predict_rew_end(obs[:, :-1], act[:, :-1], obs[:, 1:])  # Burn-in of rew/end model
+                    assert hx.size(0) == cx.size(0) == 1
+                    hx_.extend(list(hx[0]))
+                    cx_.extend(list(cx[0]))
 
             # Yield new initial conditions for dead envs
             c = 0
@@ -178,7 +187,10 @@ class WorldModelEnv:
                 obs = torch.stack(obs_[c : c + num_dead])
                 act = torch.stack(act_[c : c + num_dead])
                 valid = torch.stack(valid_[c : c + num_dead])
-                hx = torch.stack(hx_[c : c + num_dead]).unsqueeze(0)
-                cx = torch.stack(cx_[c : c + num_dead]).unsqueeze(0)
+                hx_cx = None
+                if self.rew_end_model is not None:
+                    hx = torch.stack(hx_[c : c + num_dead]).unsqueeze(0)
+                    cx = torch.stack(cx_[c : c + num_dead]).unsqueeze(0)
+                    hx_cx = (hx, cx)
                 c += num_dead
-                num_dead = yield obs, act, valid, (hx, cx)
+                num_dead = yield obs, act, valid, hx_cx

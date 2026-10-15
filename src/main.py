@@ -8,7 +8,7 @@ import torch
 from torch.distributed import init_process_group, destroy_process_group
 import torch.multiprocessing as mp
 
-from trainer import Trainer
+from exploration_trainer import ExplorationTrainer
 from utils import skip_if_run_is_over
 
 
@@ -34,7 +34,7 @@ def main_ddp(rank: int, world_size: int, cfg: DictConfig, root_dir: Path) -> Non
 
 @skip_if_run_is_over
 def run(cfg: DictConfig, root_dir: Path) -> None:
-    trainer = Trainer(cfg, root_dir)
+    trainer = ExplorationTrainer(cfg, root_dir)
     trainer.run()
 
 

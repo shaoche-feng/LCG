@@ -21,7 +21,7 @@ wandb:
 initialization:
   path_to_ckpt: null
   load_denoiser: True
-  load_rew_end_model: True
+  load_rew_end_model: False  # exploration builds no reward/end model
   load_actor_critic: True
 
 common:
@@ -41,7 +41,9 @@ collection:
     first_epoch:
       min: 5000  # Initial collection budget for continuous rewards.
       mode: uniform  # uniform: independent uniform actions in bounds, policy never evaluated; or policy
-    mode: policy  # collection after the initial budget: policy (with epsilon) or uniform
+    # After the initial budget: policy = learned exploration (needs intrinsic_reward.enabled),
+    # uniform = uniform-random baseline (no policy updates; intrinsic_reward.enabled=false).
+    mode: policy
     steps_per_epoch: 100
   test:
     num_envs: 1
@@ -104,6 +106,8 @@ denoiser:
     sigma_min: 2e-3
     sigma_max: 20
 
+# Reward/end model training settings: for the future downstream trainer; unused by
+# ExplorationTrainer, which builds no reward/end model.
 rew_end_model:
   training:
     seq_length: ${eval:'${world_model_env.horizon} + ${agent.denoiser.inner_model.num_steps_conditioning}'}

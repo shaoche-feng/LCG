@@ -15,7 +15,7 @@ from utils import extract_state_dict
 @dataclass
 class AgentConfig:
     denoiser: DenoiserConfig
-    rew_end_model: RewEndModelConfig
+    rew_end_model: Optional[RewEndModelConfig]  # None: no reward/end model (exploration)
     actor_critic: PMPOBetaConfig
     continuous_action_dim: Optional[int] = None  # continuous action dimension, e.g. DM Control
     action_low: Optional[List[float]] = None  # required iff continuous_action_dim is set
@@ -29,7 +29,8 @@ class AgentConfig:
 
         self.denoiser.inner_model.continuous_action_dim = self.continuous_action_dim
 
-        self.rew_end_model.continuous_action_dim = self.continuous_action_dim
+        if self.rew_end_model is not None:
+            self.rew_end_model.continuous_action_dim = self.continuous_action_dim
 
         self.actor_critic.continuous_action_dim = self.continuous_action_dim
         self.actor_critic.action_low = self.action_low
@@ -49,7 +50,7 @@ class Agent(nn.Module):
     def __init__(self, cfg: AgentConfig) -> None:
         super().__init__()
         self.denoiser = Denoiser(cfg.denoiser)
-        self.rew_end_model = RewEndModel(cfg.rew_end_model)
+        self.rew_end_model = RewEndModel(cfg.rew_end_model) if cfg.rew_end_model is not None else None
         self.actor_critic = PMPOBeta(cfg.actor_critic)
 
     @property
@@ -59,10 +60,11 @@ class Agent(nn.Module):
     def setup_training(
         self,
         sigma_distribution_cfg: SigmaDistributionConfig,
-        rl_env: WorldModelEnv,
+        rl_env: Optional[WorldModelEnv],
     ) -> None:
         self.denoiser.setup_training(sigma_distribution_cfg)
-        self.actor_critic.setup_training(rl_env)
+        if rl_env is not None:  # None: no policy training (uniform baseline)
+            self.actor_critic.setup_training(rl_env)
 
     def load(
         self,
@@ -77,6 +79,8 @@ class Agent(nn.Module):
         if load_denoiser:
             self.denoiser.load_state_dict(sd["denoiser"])
         if load_rew_end_model:
+            if self.rew_end_model is None:
+                raise ValueError("load_rew_end_model=True, but this agent has no reward/end model")
             self.rew_end_model.load_state_dict(sd["rew_end_model"])
         if load_actor_critic:
             self.actor_critic.load_state_dict(sd["actor_critic"])
