@@ -22,7 +22,7 @@ actor_critic:
   # Stage 3 entropy-bonus experiment (frozen 100k baseline used 0.0, i.e. no entropy
   # term at all -- see the plateau/over-concentration investigation on
   # branch pmpo-beta-continuous). 0.0 is bit-identical to the baseline actor loss.
-  entropy_coef: 0.0
+  entropy_coef: 0.01
   # Snapshot before updates 0,500,1000,...; held fixed for 500 fresh-rollout updates.
   # A moving prior refreshed every 10 updates was validated to collapse (beta
   # concentration runaway, entropy collapse, action-boundary drift, near-state-
