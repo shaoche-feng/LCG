@@ -12,7 +12,14 @@ from .segment import Segment, SegmentId
 def collate_segments_to_batch(segments: List[Segment]) -> Batch:
     attrs = ("obs", "act", "rew", "end", "trunc", "mask_padding")
     stack = (torch.stack([getattr(s, x) for s in segments]) for x in attrs)
-    return Batch(*stack, [s.info for s in segments], [s.id for s in segments])
+    num_labeled = sum(s.task_rew is not None for s in segments)
+    if num_labeled == 0:
+        task_rew = None
+    elif num_labeled == len(segments):
+        task_rew = torch.stack([s.task_rew for s in segments])
+    else:
+        raise ValueError("Cannot batch segments with and without task reward labels")
+    return Batch(*stack, [s.info for s in segments], [s.id for s in segments], task_rew)
 
 
 def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = True) -> Segment:
@@ -38,6 +45,7 @@ def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = Tru
         mask_padding,
         info=episode.info,
         id=SegmentId(segment_id.episode_id, start, stop),
+        task_rew=None if episode.task_rew is None else pad(episode.task_rew[start:stop]),
     )
 
 

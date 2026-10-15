@@ -40,6 +40,8 @@ collection:
     num_steps_total: 100000
     first_epoch:
       min: 5000  # Initial collection budget for continuous rewards.
+      mode: uniform  # uniform: independent uniform actions in bounds, policy never evaluated; or policy
+    mode: policy  # collection after the initial budget: policy (with epsilon) or uniform
     steps_per_epoch: 100
   test:
     num_envs: 1

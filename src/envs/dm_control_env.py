@@ -1,4 +1,6 @@
 from __future__ import annotations
+from collections.abc import Sequence
+import pickle
 from typing import Any, Dict, Optional, Tuple
 
 import gymnasium
@@ -8,14 +10,51 @@ import numpy as np
 from dm_control import suite
 
 
-class DMControlEnv(gymnasium.Env):
-    """General DM Control Suite adapter producing RGB observations.
+# Task groups that can share one collected trajectory, each task's reward recorded on it.
+# Evidence and exclusions: docs/DM_CONTROL_TASK_COMPATIBILITY.md (dm_control 1.0.44).
+REWARD_LABEL_TASK_GROUPS = {
+    "acrobot": [("swingup", "swingup_sparse")],
+    "cartpole": [("balance", "balance_sparse"), ("swingup", "swingup_sparse")],
+    "hopper": [("stand", "hop")],
+    "humanoid": [("stand", "walk", "run", "run_pure_state")],
+    "humanoid_CMU": [("stand", "walk", "run")],
+    "walker": [("stand", "walk", "run")],
+}
 
-    Wraps `dm_control.suite.load(domain_name, task_name)` and exposes the
-    standard gymnasium.Env `reset`/`step` interface expected downstream
-    for training and evaluation. Action
-    dimension and bounds are inferred from `env.action_spec()`, never
-    hard-coded.
+
+def validate_task_names(
+    domain_name: str,
+    task_names: Sequence[str],
+) -> Tuple[str, ...]:
+    """The first task drives collection; every task is reward-labeled on its physics."""
+    if isinstance(task_names, str) or not isinstance(task_names, Sequence):
+        raise ValueError(f"task_names must be a list of task names, got {task_names!r}")
+
+    if not task_names or not all(isinstance(name, str) for name in task_names):
+        raise ValueError(f"task_names must contain one or more strings, got {list(task_names)}")
+
+    if len(set(task_names)) != len(task_names):
+        raise ValueError(f"task_names contains duplicates: {list(task_names)}")
+
+    available = {task for domain, task in suite.ALL_TASKS if domain == domain_name}
+    unknown = set(task_names) - available
+    if unknown:
+        raise ValueError(f"Unknown tasks for {domain_name}: {sorted(unknown)}")
+
+    if len(task_names) > 1:
+        groups = REWARD_LABEL_TASK_GROUPS.get(domain_name, [])
+        if not any(set(task_names) <= set(group) for group in groups):
+            raise ValueError(
+                f"Unsupported task combination for {domain_name}: {list(task_names)}; "
+                f"verified groups: {groups or 'none'}"
+            )
+    return tuple(task_names)
+
+
+class DMControlEnv(gymnasium.Env):
+    """DM Control Suite adapter producing RGB observations.
+
+    info["task_rewards"] holds each task's reward for the step, ordered as task_names.
     """
 
     metadata: Dict[str, Any] = {"render_modes": []}
@@ -23,7 +62,7 @@ class DMControlEnv(gymnasium.Env):
     def __init__(
         self,
         domain_name: str,
-        task_name: str,
+        task_names: Sequence,
         size: int = 64,
         camera_id: int = 0,
         action_repeat: int = 2,
@@ -35,13 +74,14 @@ class DMControlEnv(gymnasium.Env):
         assert action_repeat > 0
 
         self.domain_name = domain_name
-        self.task_name = task_name
+        self.task_names = validate_task_names(domain_name, task_names)
         self.size = size
         self.camera_id = camera_id
         self.action_repeat = action_repeat
         self._time_limit = time_limit
 
-        self._dm_env = self._make_dm_env(seed)
+        self._dm_env = self._make_dm_env(self.task_names[0], seed)
+        self._label_tasks = self._load_label_tasks()
 
         action_spec = self._dm_env.action_spec()
         self.action_dim: int = int(np.prod(action_spec.shape))
@@ -53,13 +93,38 @@ class DMControlEnv(gymnasium.Env):
 
         self._action_dtype = action_spec.dtype
 
-    def _make_dm_env(self, seed: Optional[int]):
+    def _make_dm_env(self, task_name: str, seed: Optional[int]):
         task_kwargs: Dict[str, Any] = {}
         if self._time_limit is not None:
             task_kwargs["time_limit"] = self._time_limit
         if seed is not None:
             task_kwargs["random"] = seed
-        return suite.load(self.domain_name, self.task_name, task_kwargs=task_kwargs or None)
+        return suite.load(self.domain_name, task_name, task_kwargs=task_kwargs or None)
+
+    def _load_label_tasks(self) -> tuple:
+        """Load reward-label tasks compatible with the collection environment."""
+        reference = self._dm_env
+        tasks = []
+        for name in self.task_names[1:]:
+            # Only the task object is kept; a fixed seed avoids drawing OS entropy.
+            env = self._make_dm_env(name, seed=0)
+            same_model = pickle.dumps(env.physics.model.ptr) == pickle.dumps(reference.physics.model.ptr)
+            checks = {
+                "task class": type(env.task) is type(reference.task),
+                "physics class": type(env.physics) is type(reference.physics),
+                "MuJoCo model": same_model,
+                "control timestep": env.control_timestep() == reference.control_timestep(),
+                "time limit": env._step_limit == reference._step_limit,
+                "action spec": env.action_spec() == reference.action_spec(),
+            }
+            for field, matches in checks.items():
+                if not matches:
+                    raise ValueError(
+                        f"Task {self.domain_name}/{name} has a different {field} "
+                        f"from collection task {self.task_names[0]}"
+                    )
+            tasks.append(env.task)
+        return tuple(tasks)
 
     def _render(self) -> np.ndarray:
         return self._dm_env.physics.render(height=self.size, width=self.size, camera_id=self.camera_id)
@@ -70,7 +135,7 @@ class DMControlEnv(gymnasium.Env):
         super().reset(seed=seed)
         # dm_control has no in-place RNG reseed hook, so a new seed rebuilds the task.
         if seed is not None:
-            self._dm_env = self._make_dm_env(seed)
+            self._dm_env = self._make_dm_env(self.task_names[0], seed)
         self._dm_env.reset()
         obs = self._render()
         return obs, {}
@@ -84,6 +149,7 @@ class DMControlEnv(gymnasium.Env):
         dm_action = action.astype(self._action_dtype)
 
         total_reward = 0.0
+        label_rewards = [0.0] * len(self._label_tasks)
         terminated = False
         truncated = False
         discount = None
@@ -91,6 +157,9 @@ class DMControlEnv(gymnasium.Env):
         for _ in range(self.action_repeat):
             timestep = self._dm_env.step(dm_action)
             total_reward += float(timestep.reward)
+            # Same physics state at which dm_control computed timestep.reward.
+            for i, task in enumerate(self._label_tasks):
+                label_rewards[i] += float(task.get_reward(self._dm_env.physics))
             if timestep.last():
                 discount = timestep.discount
                 # DM Control convention: discount == 0.0 on true termination,
@@ -100,25 +169,7 @@ class DMControlEnv(gymnasium.Env):
                 break
 
         obs = self._render()
-        info: Dict[str, Any] = {"discount": discount}
+        task_rewards = np.array([total_reward, *label_rewards], dtype=np.float64)
+        info: Dict[str, Any] = {"discount": discount, "task_rewards": task_rewards}
         return obs, total_reward, terminated, truncated, info
 
-
-def make_dm_control_env(
-    domain_name: str,
-    task_name: str,
-    size: int = 64,
-    camera_id: int = 0,
-    action_repeat: int = 2,
-    time_limit: Optional[float] = None,
-    seed: Optional[int] = None,
-) -> DMControlEnv:
-    return DMControlEnv(
-        domain_name=domain_name,
-        task_name=task_name,
-        size=size,
-        camera_id=camera_id,
-        action_repeat=action_repeat,
-        time_limit=time_limit,
-        seed=seed,
-    )

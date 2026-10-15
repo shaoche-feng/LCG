@@ -27,7 +27,8 @@ def test_default_hydra_agent_and_checkpoint(tmp_path):
     from agent import Agent, get_action_space_kwargs
     from hydra.utils import instantiate
     cfg = compose_cleanup_config()
-    assert (cfg.env.train.domain_name, cfg.env.train.task_name) == ("cheetah", "run")
+    assert cfg.env.train.domain_name == "walker"
+    assert list(cfg.env.train.task_names) == list(cfg.env.test.task_names) == ["stand", "walk", "run"]
     assert cfg.agent.actor_critic.prior_refresh_interval == 500
     assert cfg.collection.train.steps_per_epoch == 100  # Recipes override this to 500.
     env = SimpleNamespace(action_dim=6, action_low=torch.full((6,), -1.), action_high=torch.ones(6))

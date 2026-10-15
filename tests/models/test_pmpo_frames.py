@@ -210,9 +210,11 @@ def test_dm_control_action_repeat_reward_aggregation_and_done(discount, terminat
     env.action_space = gymnasium.spaces.Box(-1., 1., (2,), np.float32)
     env._action_dtype, env.action_repeat = np.float64, 4
     env._dm_env = Physics()
+    env._label_tasks = ()
     env._render = lambda: np.zeros((8, 8, 3), np.uint8)
     _, reward, end, trunc, info = env.step(np.array([0.25, -0.5]))
     assert reward == 1.5 and env._dm_env.calls == 2
+    assert info["task_rewards"].tolist() == [1.5]
     assert (end, trunc) == (terminated, truncated) and info["discount"] == discount
 
 

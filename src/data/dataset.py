@@ -31,6 +31,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self.start_idx = None
         self.lengths = None
         self.counter_end = None
+        self.task_names = None  # task labels shared by every episode, None if unlabeled
 
         self._directory = Path(directory).expanduser()
         self._name = name if name is not None else self._directory.stem
@@ -64,6 +65,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self.start_idx = np.array([], dtype=np.int64)
         self.lengths = np.array([], dtype=np.int64)
         self.counter_end = Counter()
+        self.task_names = None
         self._cache.clear()
 
     def clear(self) -> None:
@@ -86,6 +88,11 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
     def add_episode(self, episode: Episode, *, episode_id: Optional[int] = None) -> int:
         self.assert_not_static()
         episode = episode.to("cpu")
+
+        if self.num_episodes == 0:
+            self.task_names = episode.task_names
+        elif episode.task_names != self.task_names:
+            raise ValueError(f"Episode task labels {episode.task_names} do not match {self.name}'s {self.task_names}")
 
         if episode_id is None:
             episode_id = self.num_episodes
@@ -123,6 +130,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         state_dict = {k: v for k, v in state_dict.items() if k != "counter_rew"}
+        state_dict.setdefault("task_names", None)  # datasets saved before task labels existed
         super().load_state_dict(state_dict)
         self._cache.clear()
 

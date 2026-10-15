@@ -16,7 +16,7 @@ import wandb
 
 from agent import Agent, get_action_space_kwargs
 from utils import normalize_saved_config
-from coroutines.collector import make_collector, NumToCollect
+from coroutines.collector import COLLECTION_MODES, make_collector, NumToCollect
 from data import BatchSampler, collate_segments_to_batch, Dataset, DatasetTraverser
 from envs import make_dm_control_env, WorldModelEnv
 from lcg import LCGLifecycle
@@ -71,6 +71,10 @@ class Trainer(StateDictMixin):
 
         # Flags
         self._is_static_dataset = cfg.static_dataset.path is not None
+        for key in ("collection.train.first_epoch.mode", "collection.train.mode"):
+            mode = OmegaConf.select(cfg, key)
+            if mode not in COLLECTION_MODES:
+                raise ValueError(f"{key} must be one of {COLLECTION_MODES}, got {mode!r}")
 
         # Checkpointing
         self._path_ckpt_dir = Path("checkpoints")
@@ -111,13 +115,9 @@ class Trainer(StateDictMixin):
         self.test_dataset.load_from_default_path()
 
         # Envs
-        make_env = make_dm_control_env
-        env_kwargs_train = {k: v for k, v in cfg.env.train.items() if k != "type"}
-        env_kwargs_test = {k: v for k, v in cfg.env.test.items() if k != "type"}
-
         if self._rank == 0:
-            train_env = make_env(num_envs=cfg.collection.train.num_envs, device=self._device, **env_kwargs_train)
-            test_env = make_env(num_envs=cfg.collection.test.num_envs, device=self._device, **env_kwargs_test)
+            train_env = make_dm_control_env(num_envs=cfg.collection.train.num_envs, device=self._device, **cfg.env.train)
+            test_env = make_dm_control_env(num_envs=cfg.collection.test.num_envs, device=self._device, **cfg.env.test)
             action_kwargs = get_action_space_kwargs(test_env)
         else:
             action_kwargs = None
@@ -294,7 +294,7 @@ class Trainer(StateDictMixin):
 
             if should_collect_train:
                 c = self._cfg.collection.train
-                to_log += self._train_collector.send(NumToCollect(steps=c.steps_per_epoch))
+                to_log += self._train_collector.send(NumToCollect(steps=c.steps_per_epoch, mode=c.mode))
             sd_train_dataset, = broadcast_if_needed(self.train_dataset.state_dict())  # update dataset for ranks > 0
             self.train_dataset.load_state_dict(sd_train_dataset)
             
@@ -340,7 +340,7 @@ class Trainer(StateDictMixin):
 
         steps = min_steps
         while True:
-            to_log += self._train_collector.send(NumToCollect(steps=steps))
+            to_log += self._train_collector.send(NumToCollect(steps=steps, mode=c.first_epoch.mode))
             num_steps = self.train_dataset.num_steps
             if num_steps >= min_steps:
                 break

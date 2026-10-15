@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -17,9 +17,10 @@ class Batch:
     mask_padding: torch.BoolTensor
     info: List[Dict[str, Any]]
     segment_ids: List[SegmentId]
+    task_rew: Optional[torch.FloatTensor] = None  # (B, T, num_tasks), None for unlabeled data
 
     def pin_memory(self) -> Batch:
-        return Batch(**{k: v if k in ("segment_ids", "info") else v.pin_memory() for k, v in self.__dict__.items()})
+        return Batch(**{k: v.pin_memory() if torch.is_tensor(v) else v for k, v in self.__dict__.items()})
 
     def to(self, device: torch.device) -> Batch:
-        return Batch(**{k: v if k in ("segment_ids", "info") else v.to(device) for k, v in self.__dict__.items()})
+        return Batch(**{k: v.to(device) if torch.is_tensor(v) else v for k, v in self.__dict__.items()})

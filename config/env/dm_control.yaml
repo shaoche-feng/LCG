@@ -1,6 +1,6 @@
 train:
-  domain_name: cheetah
-  task_name: run
+  domain_name: walker
+  task_names: [stand, walk, run]
   size: 64
   camera_id: 0
   action_repeat: 2
@@ -8,7 +8,7 @@ train:
 
 test:
   domain_name: ${..train.domain_name}
-  task_name: ${..train.task_name}
+  task_names: ${..train.task_names}
   size: ${..train.size}
   camera_id: ${..train.camera_id}
   action_repeat: ${..train.action_repeat}

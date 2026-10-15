@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -22,6 +22,7 @@ class Segment:
     mask_padding: torch.BoolTensor
     info: Dict[str, Any]
     id: SegmentId
+    task_rew: Optional[torch.FloatTensor] = None  # (T, num_tasks), padded like rew
 
     @property
     def effective_size(self):
