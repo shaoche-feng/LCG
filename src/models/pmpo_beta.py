@@ -39,7 +39,8 @@ class PMPOBetaConfig:
     # L_PMPO + beta_kl * KL - entropy_coef * H(pi). 0.0 (default) exactly
     # reproduces the frozen 100k baseline; no other term changes with it.
     entropy_coef: float = 0.0
-    prior_refresh_interval: int = 10
+    # Matches config/agent/pmpo_beta.yaml; saved configs always state their own value.
+    prior_refresh_interval: int = 500
     # Diagnosis-only knob (see docs/pmpo_beta/k4_implementation.md): when True, the prior is
     # snapshotted once at construction and never refreshed again, isolating the moving-prior
     # trust-region mechanism as the single variable under test. False (default) preserves the

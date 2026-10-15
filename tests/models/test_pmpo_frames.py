@@ -284,3 +284,203 @@ def test_viewer_uses_stacked_beta_policy_and_records_final_observation(tmp_path,
     viewer.print_controls()
     assert viewer.next_mode() is False and viewer.next_axis_2() is True
     hook.remove()
+
+
+def prompt_frames(values, padded=0):
+    """One replay prompt (1, t, 3, 8, 8) of distinguishable frames; the first `padded`
+    are replay padding (zeros), as before an episode's start."""
+    frames = torch.stack([frame(v)[0] for v in values])[None]
+    frames[:, :padded] = 0
+    return frames, (torch.arange(len(values)) >= padded)[None]
+
+
+def prompt_stack(values, padded=0):
+    """Expected policy stack: the latest four valid frames, the earliest one repeated."""
+    valid = list(values)[padded:]
+    return stack(([valid[0]] * 4 + valid)[-4:])
+
+
+@pytest.mark.parametrize("length,padded,expected", [
+    (2, 0, [1, 1, 1, 2]), (2, 1, [2, 2, 2, 2]),
+    (4, 0, [1, 2, 3, 4]), (4, 2, [3, 3, 3, 4]),
+    (6, 0, [3, 4, 5, 6]), (6, 3, [4, 4, 5, 6]), (6, 5, [6, 6, 6, 6]),
+])
+def test_prompt_history_uses_latest_valid_frames_in_order(length, padded, expected):
+    frames, valid = prompt_frames(range(1, length + 1), padded)
+    history = FrameHistory(frames[:, -1], 4, (frames, valid))
+    torch.testing.assert_close(history.state, stack(expected), rtol=0, atol=0)
+
+
+def test_prompt_reset_replaces_only_reset_rows_without_aliasing():
+    first0, valid0 = prompt_frames([1, 2, 3, 4])
+    first1, valid1 = prompt_frames([11, 12, 13, 14], padded=2)
+    frames, valid = torch.cat([first0, first1]), torch.cat([valid0, valid1])
+    history = FrameHistory(frames[:, -1], 4, (frames, valid))
+    retained = history.state
+    frames.fill_(-1)  # The environment may overwrite its prompt buffer.
+    new_frames, new_valid = prompt_frames([21, 22, 23])
+    history.advance(torch.cat([frame(5), new_frames[:, -1]]), torch.tensor([False, True]), (new_frames, new_valid))
+    new_frames.fill_(-1)
+    torch.testing.assert_close(retained, torch.cat([stack([1, 2, 3, 4]), stack([13, 13, 13, 14])]), rtol=0, atol=0)
+    torch.testing.assert_close(history.state, torch.cat([stack([2, 3, 4, 5]), stack([21, 21, 22, 23])]),
+                               rtol=0, atol=0)
+    with pytest.raises(ValueError, match="pad only before"):
+        FrameHistory(frame(0), 4, (prompt_frames([1, 2])[0], torch.tensor([[True, False]])))
+
+
+class PromptEnv:
+    """WorldModelEnv-shaped stand-in: replay prompts at reset and when env 0 is cut at
+    step 2. Observations come from a buffer mutated in place, as in WorldModelEnv."""
+    num_envs = 2
+
+    def __init__(self, length, ending):
+        self.length, self.ending = length, ending
+
+    def prompt(self, start, padded):
+        return prompt_frames(range(start, start + self.length), padded)
+
+    def reset(self, **kwargs):
+        self.t = 0
+        (frames0, valid0), (frames1, valid1) = self.prompt(1, 0), self.prompt(11, 1)
+        frames, valid = torch.cat([frames0, frames1]), torch.cat([valid0, valid1])
+        self.obs = frames[:, -1].clone()
+        return self.obs, {"prompt": (frames, valid)}
+
+    def step(self, action):
+        self.t += 1
+        self.obs[0].fill_(100 + self.t)
+        self.obs[1].fill_(200 + self.t)
+        end, trunc = torch.zeros(2, dtype=torch.long), torch.zeros(2, dtype=torch.long)
+        info = {}
+        if self.t == 2:
+            (end if self.ending == "end" else trunc)[0] = 1
+            info["final_observation"] = self.obs[:1].clone()  # 102 ends the old trajectory.
+            frames, valid = self.prompt(31, 0)
+            self.obs[0] = frames[0, -1]
+            info["burnin_obs"] = frames[:, :-1]
+            info["prompt"] = (frames, valid)
+        return self.obs, torch.ones(2), end, trunc, info
+
+
+@pytest.mark.parametrize("ending", ["end", "trunc"])
+@pytest.mark.parametrize("length", [2, 4, 6])
+def test_env_loop_seeds_and_resets_imagined_history_from_prompts(length, ending):
+    model = make_controller()
+    loop = make_env_loop(PromptEnv(length, ending), model, store_policy_observations=True)
+    with torch.no_grad():
+        states, _, _, _, _, raw, values, bootstrap, _ = loop.send(3)
+    loop.close()
+
+    def shifted(state, value):
+        return torch.cat([state[:, 3:], frame(value)], 1)
+    initial0, initial1 = prompt_stack(range(1, 1 + length)), prompt_stack(range(11, 11 + length), padded=1)
+    expected = [[initial0, shifted(initial0, 101), prompt_stack(range(31, 31 + length))],
+                [initial1, shifted(initial1, 201), shifted(shifted(initial1, 201), 202)]]
+    for env in range(2):
+        for t in range(3):
+            torch.testing.assert_close(states[env, t][None], expected[env][t], rtol=0, atol=0)
+    with torch.no_grad():
+        for t in range(3):  # Stored states reproduce the generation-time predictions.
+            torch.testing.assert_close(model.actor(states[:, t]), raw[:, t], rtol=0, atol=0)
+            torch.testing.assert_close(model.value(states[:, t]).squeeze(-1), values[:, t], rtol=0, atol=0)
+        # Env 0 bootstraps from its ending history and final observation, not its new prompt;
+        # env 1 from its own next state.
+        torch.testing.assert_close(bootstrap[0, 1], model.value(shifted(expected[0][1], 102))[0, 0], rtol=0, atol=0)
+        torch.testing.assert_close(bootstrap[1, 1], values[1, 2], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("length", [2, 4, 6])
+def test_world_model_env_prompts_seed_policy_history_without_extra_draws(length):
+    from types import SimpleNamespace
+    from torch.utils.data import DataLoader, IterableDataset
+    from envs import WorldModelEnv, WorldModelEnvConfig
+    from models.diffusion import Denoiser, DenoiserConfig, DiffusionSamplerConfig
+    from models.diffusion.inner_model import InnerModelConfig
+    from models.rew_end_model import RewEndModel, RewEndModelConfig
+
+    drawn = []
+
+    class Replay(IterableDataset):
+        """Distinguishable prompts; every other one is padded before its episode start."""
+        def __iter__(self):
+            k = 0
+            while True:
+                values, padded = [0.1 * (k + 1) + 0.01 * j for j in range(length)], k % 2
+                frames, valid = prompt_frames(values, padded)
+                drawn.append((values, padded))
+                yield SimpleNamespace(obs=frames[0], act=torch.zeros(length, 2), mask=valid[0])
+                k += 1
+
+    def collate(samples):
+        return SimpleNamespace(obs=torch.stack([s.obs for s in samples]), act=torch.stack([s.act for s in samples]),
+                               mask_padding=torch.stack([s.mask for s in samples]))
+
+    torch.manual_seed(0)
+    denoiser = Denoiser(DenoiserConfig(
+        inner_model=InnerModelConfig(img_channels=3, num_steps_conditioning=length, cond_channels=24, depths=[1],
+                                     channels=[8], attn_depths=[False], continuous_action_dim=2),
+        sigma_data=0.5, sigma_offset_noise=0.3))
+    reward = RewEndModel(RewEndModelConfig(lstm_dim=16, img_channels=3, img_size=8, cond_channels=16, depths=[1],
+                                           channels=[8], attn_depths=[False], continuous_action_dim=2))
+    env = WorldModelEnv(denoiser, reward, DataLoader(Replay(), batch_size=2, collate_fn=collate),
+                        WorldModelEnvConfig(horizon=2, num_batches_to_preload=1,
+                                            diffusion_sampler=DiffusionSamplerConfig(num_steps_denoising=2)))
+    predict = env.predict_rew_end  # Keep rollouts to the horizon: no sampled terminations.
+    env.predict_rew_end = lambda next_obs: (predict(next_obs)[0], torch.zeros(2, dtype=torch.long))
+    model = make_controller()
+    loop = make_env_loop(env, model, store_policy_observations=True)
+    with torch.no_grad():
+        states, _, _, _, trunc, raw, values, bootstrap, infos = loop.send(3)
+    loop.close()
+
+    assert trunc[:, 1].all() and len(drawn) == 4  # One batch per reset; history adds no draws.
+    for env_index in range(2):
+        torch.testing.assert_close(states[env_index, 0][None], prompt_stack(*drawn[env_index]), rtol=0, atol=0)
+        torch.testing.assert_close(states[env_index, 2][None], prompt_stack(*drawn[2 + env_index]), rtol=0, atol=0)
+    torch.testing.assert_close(states[:, 1, :-3], states[:, 0, 3:], rtol=0, atol=0)
+    new_frames, _ = infos[1]["prompt"]
+    torch.testing.assert_close(infos[1]["burnin_obs"], new_frames[:, :-1], rtol=0, atol=0)
+    final = infos[1]["final_observation"]
+    assert not torch.equal(final, new_frames[:, -1])
+    with torch.no_grad():
+        # Cut rollouts bootstrap from the ending history plus final_observation.
+        torch.testing.assert_close(bootstrap[:, 1], model.value(torch.cat([states[:, 1, 3:], final], 1)).squeeze(-1),
+                                   rtol=0, atol=0)
+        for t in range(3):
+            torch.testing.assert_close(model.actor(states[:, t]), raw[:, t], rtol=0, atol=0)
+            torch.testing.assert_close(model.value(states[:, t]).squeeze(-1), values[:, t], rtol=0, atol=0)
+
+
+def test_viewer_seeds_world_model_history_from_prompts(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from game.play_env import PlayEnv, NamedEnv
+
+    class PromptViewerEnv:
+        def reset(self):
+            self.t = 0
+            frames, valid = prompt_frames([1, 2, 3], padded=1)
+            self.obs = frames[:, -1].clone()
+            return self.obs, {"prompt": (frames, valid)}
+        def step(self, action):
+            self.t += 1
+            self.obs.fill_(10 + self.t)
+            info = {}
+            if self.t == 1:
+                info["final_observation"] = self.obs.clone()
+                frames, valid = prompt_frames([21, 22, 23, 24, 25])
+                self.obs.copy_(frames[:, -1])
+                info["prompt"] = (frames, valid)
+            return self.obs, torch.tensor([0.]), torch.tensor([0]), torch.tensor([int(self.t == 1)]), info
+
+    monkeypatch.chdir(tmp_path)
+    model = make_controller()
+    observed = []
+    hook = model.actor.register_forward_pre_hook(lambda m, args: observed.append(args[0].clone()))
+    viewer = PlayEnv(SimpleNamespace(actor_critic=model), [NamedEnv("wm", PromptViewerEnv())], ["noop"], {},
+                     False, False)
+    viewer.reset()
+    viewer.step(0)
+    viewer.step(0)
+    hook.remove()
+    torch.testing.assert_close(observed[0], stack([2, 2, 2, 3]), rtol=0, atol=0)
+    torch.testing.assert_close(observed[1], stack([22, 23, 24, 25]), rtol=0, atol=0)

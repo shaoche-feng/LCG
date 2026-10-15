@@ -17,8 +17,9 @@ def make_env_loop(
     num_steps = yield
 
     seed = random.randint(0, 2**31 - 1)
-    obs, _ = env.reset(seed=[seed + i for i in range(env.num_envs)])
-    history = FrameHistory(obs, model.frame_stack)
+    obs, info = env.reset(seed=[seed + i for i in range(env.num_envs)])
+    # WorldModelEnv supplies its replay prompt; real resets repeat the first frame.
+    history = FrameHistory(obs, model.frame_stack, info.get("prompt"))
 
     while True:
         all_ = []
@@ -59,7 +60,8 @@ def make_env_loop(
             all_.append([stored_obs, act, rew, end, trunc, logits_act, val, None])
             infos.append(info)
 
-            history.advance(next_obs, dead)
+            # After the final-observation bootstrap above used the ending history.
+            history.advance(next_obs, dead, info.get("prompt"))
 
             obs = next_obs
             n += 1

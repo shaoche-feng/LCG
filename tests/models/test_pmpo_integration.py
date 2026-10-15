@@ -49,6 +49,25 @@ def test_default_hydra_agent_and_checkpoint(tmp_path):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_prior_refresh_interval_defaults_agree_and_explicit_values_are_honored():
+    from dataclasses import fields
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+    from models.pmpo_beta import PMPOBetaConfig
+    from utils import normalize_saved_config
+    python_default = next(f.default for f in fields(PMPOBetaConfig) if f.name == "prior_refresh_interval")
+    cfg = compose_cleanup_config()
+    assert python_default == cfg.agent.actor_critic.prior_refresh_interval == 500
+    assert make_controller().cfg.prior_refresh_interval == 500
+    assert make_controller(prior_refresh_interval=3).cfg.prior_refresh_interval == 3
+    overridden = compose_cleanup_config(["agent.actor_critic.prior_refresh_interval=250"])
+    assert instantiate(overridden.agent.actor_critic).prior_refresh_interval == 250
+    # Saved run configs always state their interval, including the early value of 10.
+    saved = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    saved.agent.actor_critic.prior_refresh_interval = 10
+    assert instantiate(normalize_saved_config(saved).agent.actor_critic).prior_refresh_interval == 10
+
+
 def test_saved_pmpo_config_migration_preserves_learning_fields(tmp_path):
     from hydra.utils import instantiate
     from omegaconf import OmegaConf, open_dict
@@ -279,7 +298,10 @@ class Prompts(IterableDataset):
 
 
 def collate(samples):
-    return SimpleNamespace(obs=torch.stack([s.obs for s in samples]), act=torch.stack([s.act for s in samples]))
+    obs = torch.stack([s.obs for s in samples])
+    # Full-length prompts: no padding before an episode start.
+    return SimpleNamespace(obs=obs, act=torch.stack([s.act for s in samples]),
+                           mask_padding=torch.ones(obs.shape[:2], dtype=torch.bool))
 
 
 def make_system(device="cpu", **kwargs):

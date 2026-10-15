@@ -83,9 +83,10 @@ class PlayEnv:
         self.rec_dataset.load_from_default_path()
 
     def reset(self) -> Tuple[Tensor, None]:
-        self.obs, _ = self.env.reset()
+        self.obs, env_info = self.env.reset()
         self.t, self.return_ = 0, 0
-        self.history = FrameHistory(self.obs, self.agent.actor_critic.frame_stack)
+        # WorldModelEnv supplies its replay prompt; real resets repeat the first frame.
+        self.history = FrameHistory(self.obs, self.agent.actor_critic.frame_stack, env_info.get("prompt"))
         if self.recording_mode:
             self.reset_recording()
         return self.obs, None
@@ -140,7 +141,7 @@ class PlayEnv:
                 self.rec_dataset.add_episode(ep)
                 self.rec_dataset.save_to_default_path()
 
-        self.history.advance(next_obs, torch.logical_or(end, trunc))
+        self.history.advance(next_obs, torch.logical_or(end, trunc), env_info.get("prompt"))
         self.obs = next_obs
         self.t += 1
 

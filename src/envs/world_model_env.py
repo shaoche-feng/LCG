@@ -12,7 +12,7 @@ from models.rew_end_model import RewEndModel
 
 ResetOutput = Tuple[torch.FloatTensor, Dict[str, Any]]
 StepOutput = Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]
-InitialCondition = Tuple[Tensor, Tensor, Tuple[Tensor, Tensor]]
+InitialCondition = Tuple[Tensor, Tensor, Tensor, Tuple[Tensor, Tensor]]
 
 
 @dataclass
@@ -74,22 +74,25 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def reset(self, **kwargs) -> ResetOutput:
-        obs, act, (hx, cx) = self.generator_init.send(self.num_envs)
+        obs, act, valid, (hx, cx) = self.generator_init.send(self.num_envs)
         self.obs_buffer = obs
         self.act_buffer = act
         self.hx_rew_end = hx
         self.cx_rew_end = cx
         self.ep_len = torch.zeros(self.num_envs, dtype=torch.long, device=obs.device)
-        return self.obs_buffer[:, -1], {}
+        # The replay prompt (frames and padding mask) seeds the policy's frame history.
+        return self.obs_buffer[:, -1], {"prompt": (obs.clone(), valid)}
 
     @torch.no_grad()
-    def reset_dead(self, dead: torch.BoolTensor) -> None:
-        obs, act, (hx, cx) = self.generator_init.send(dead.sum().item())
+    def reset_dead(self, dead: torch.BoolTensor) -> Tuple[Tensor, Tensor]:
+        """Returns the new replay prompts of the dead rows."""
+        obs, act, valid, (hx, cx) = self.generator_init.send(dead.sum().item())
         self.obs_buffer[dead] = obs
         self.act_buffer[dead] = act
         self.hx_rew_end[:, dead] = hx
         self.cx_rew_end[:, dead] = cx
         self.ep_len[dead] = 0
+        return obs, valid
 
     @torch.no_grad()
     def step(self, act: torch.Tensor) -> StepOutput:
@@ -119,7 +122,9 @@ class WorldModelEnv:
             info["imagined_candidate"] = ImaginedCandidate(candidate_x_obs, candidate_x_act, next_obs.clone())
 
         if dead.any():
-            self.reset_dead(dead)
+            # final_observation ends the old trajectory; the returned observation,
+            # burnin_obs and prompt belong to the new replay prompt.
+            info["prompt"] = self.reset_dead(dead)
             info["final_observation"] = next_obs[dead]
             info["burnin_obs"] = self.obs_buffer[dead, :-1]
 
@@ -152,16 +157,18 @@ class WorldModelEnv:
 
         while True:
             # Preload on device and burnin rew/end model
-            obs_, act_, hx_, cx_ = [], [], [], []
+            obs_, act_, valid_, hx_, cx_ = [], [], [], [], []
             for _ in range(num_batches_to_preload):
                 batch = next(data_iterator)
                 obs = batch.obs.to(self.device)
                 act = batch.act.to(self.device)
+                valid = batch.mask_padding.to(self.device)
                 with torch.no_grad():
                     *_, (hx, cx) = self.rew_end_model.predict_rew_end(obs[:, :-1], act[:, :-1], obs[:, 1:])  # Burn-in of rew/end model
                 assert hx.size(0) == cx.size(0) == 1
                 obs_.extend(list(obs))
                 act_.extend(list(act))
+                valid_.extend(list(valid))
                 hx_.extend(list(hx[0]))
                 cx_.extend(list(cx[0]))
 
@@ -170,7 +177,8 @@ class WorldModelEnv:
             while c + num_dead <= len(obs_):
                 obs = torch.stack(obs_[c : c + num_dead])
                 act = torch.stack(act_[c : c + num_dead])
+                valid = torch.stack(valid_[c : c + num_dead])
                 hx = torch.stack(hx_[c : c + num_dead]).unsqueeze(0)
                 cx = torch.stack(cx_[c : c + num_dead]).unsqueeze(0)
                 c += num_dead
-                num_dead = yield obs, act, (hx, cx)
+                num_dead = yield obs, act, valid, (hx, cx)
