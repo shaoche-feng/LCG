@@ -33,7 +33,25 @@ OMP_NUM_THREADS=1 MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 /home/bigking/anaconda3/e
 
 Runs save the effective Hydra configuration, source/scripts, datasets, agent versions, and full resume state under their output directory. `static_dataset.path` retains training from an existing dataset. `intrinsic_reward.enabled` controls the optional LCG lifecycle; it is disabled by default.
 
-From a run folder, `bash scripts/resume.sh` resumes the saved training state. `python src/play.py` shows the PMPO policy in the world model and real environments; arrow keys switch environments and adjust imagination horizon. `-r` records policy episodes and `-d` browses datasets, displaying continuous action vectors. The viewer uses the same four-frame state and action sampling as collection.
+To resume a run, pass its folder to the resume script, from the repository or anywhere else:
+
+```bash
+PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/resume.sh outputs/<run> [overrides...]
+```
+
+The script resumes with the run folder's own copied `src/`, saved `config/trainer.yaml` and `checkpoints/state.pt`, never this checkout's source or defaults. The folder defaults to the current directory. Saved settings are kept, and Hydra overrides after the folder apply on top. Two kinds of argument are rejected:
+
+- An override in any form (`key=`, `+key=`, `++key=`, `~key`) that changes or deletes a key the script sets. That covers `common.devices`, `common.resume`, `hydra.run.dir`, `hydra.job.chdir` and `hydra.output_subdir`, and parent mappings such as `common` or `hydra.job`.
+- A Hydra option such as `--config-name` or `--multirun`. The script refuses to start, with a nonzero exit, when any of these is missing. Diagnostic snapshots under `pmpo_diagnostic/` are not resume inputs. It prints the resolved interpreter, run folder, device and rendering settings before launching, and returns the training process's exit status.
+
+- `PYTHON`: interpreter (default `python`; paths with spaces are fine).
+- `DEVICE`: GPU index or `cpu` (default: the saved `common.devices`). `src/main.py` exports it as `CUDA_VISIBLE_DEVICES`, so it is a physical GPU index; a conflicting pre-set `CUDA_VISIBLE_DEVICES` is an error.
+- `MUJOCO_GL` / `MUJOCO_EGL_DEVICE_ID`: on Linux they default to `egl` and the same GPU index; a conflicting EGL device is an error. On Windows and macOS, MuJoCo's platform default is used unless `MUJOCO_GL` is set.
+- `OMP_NUM_THREADS`: defaults to 1, as in the launch scripts.
+
+A completed run has a `.run_is_over` sentinel, written whenever training returns normally, including at a `pmpo_diagnostic.max_epochs` cap. The script refuses such a run. To extend it deliberately, rename the sentinel (for example `mv .run_is_over .run_is_over.<date>`) and pass the override that raises the bound, such as `pmpo_diagnostic.max_epochs=300`. `bash scripts/resume.sh --help` lists these details. Run folders created before this script changed keep their own older copy in `<run>/scripts/`; use this repository's script for them.
+
+`python src/play.py` shows the PMPO policy in the world model and real environments; arrow keys switch environments and adjust imagination horizon. `-r` records policy episodes and `-d` browses datasets, displaying continuous action vectors. The viewer uses the same four-frame state and action sampling as collection.
 
 ## Compatibility and history
 
