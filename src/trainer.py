@@ -510,6 +510,21 @@ class Trainer(StateDictMixin):
         to_log = [{f"{name}/test/{k}": v for k, v in d.items()} for d in to_log]
         return to_log
 
+    def state_dict(self) -> dict:
+        state = super().state_dict()
+        if self._pmpo_diagnostic is not None:
+            state["pmpo_diagnostic"] = self._pmpo_diagnostic.state_dict()
+        return state
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        # Checkpoints saved without a diagnostic carry no "pmpo_diagnostic" entry.
+        state_dict = dict(state_dict)
+        diagnostic_state = state_dict.pop("pmpo_diagnostic", None)
+        super().load_state_dict(state_dict)
+        if self._pmpo_diagnostic is not None:
+            # After the agent: the history is validated against the restored PMPOBeta.updates.
+            self._pmpo_diagnostic.load_state_dict(diagnostic_state)
+
     def load_state_checkpoint(self) -> None:
         # Trusted, locally generated DIAMOND state (includes Dataset state: numpy arrays, Counters,
         # etc.), not just tensor weights -- weights_only=False is required for PyTorch >=2.6, whose

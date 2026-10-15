@@ -172,13 +172,16 @@ def test_historical_initialization_fingerprints_ignore_tensor_storage_identity(m
     assert fingerprint(state) != fingerprint(copied)
 
 
-def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatch, diagnostic):
     """One real optimization step per component, without real-env collection."""
     from pathlib import Path
+    import numpy as np
     from omegaconf import OmegaConf
     from data import Dataset, Episode
     from trainer import Trainer
     import trainer as trainer_module
+    import pmpo_diagnostic
     root = Path(__file__).resolve().parents[2]
     dataset_root = tmp_path / "static"
     for split in ("train", "test"):
@@ -205,9 +208,24 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
         "denoiser.training.batch_size=2", "rew_end_model.training.batch_size=2",
         "actor_critic.training.batch_size=2", "denoiser.training.steps_first_epoch=1",
         "rew_end_model.training.steps_first_epoch=1", "actor_critic.training.steps_first_epoch=1",
+        *(["+pmpo_diagnostic=bounded", "denoiser.training.steps_per_epoch=1",
+           "rew_end_model.training.steps_per_epoch=1", "actor_critic.training.steps_per_epoch=1"]
+          if diagnostic else []),
     ])
     fake_env = SimpleNamespace(action_dim=2, action_low=torch.full((2,), -1.), action_high=torch.ones(2))
     monkeypatch.setattr(trainer_module, "make_dm_control_env", lambda **kwargs: fake_env)
+    class TinyEvalEnv:
+        def __init__(self, **kwargs):
+            pass
+        def reset(self, seed):
+            self.t = 0
+            return np.zeros((8, 8, 3), dtype=np.uint8), {}
+        def step(self, action):
+            self.t += 1
+            return np.full((8, 8, 3), self.t, dtype=np.uint8), 0., False, self.t == 4, {}
+        def close(self):
+            pass
+    monkeypatch.setattr(pmpo_diagnostic, "DMControlEnv", TinyEvalEnv)
     for method in ("init", "save", "log"):
         monkeypatch.setattr(trainer_module.wandb, method, lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
@@ -225,6 +243,31 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
     for key, value in trainer.agent.state_dict().items():
         if torch.is_tensor(value):
             torch.testing.assert_close(resumed.agent.state_dict()[key], value, rtol=0, atol=0)
+    if diagnostic:
+        fixed_real = trainer._pmpo_diagnostic.fixed_real
+        original = trainer._pmpo_diagnostic.state_dict()
+        restored = resumed._pmpo_diagnostic.state_dict()
+        restored_fixed, original_fixed = restored.pop("fixed_real"), original.pop("fixed_real")
+        assert restored_fixed["encoding"] == original_fixed["encoding"] == "uint8_pixels_div"
+        assert torch.equal(restored_fixed["values"], original_fixed["values"])
+        assert torch.equal(resumed._pmpo_diagnostic.fixed_real, fixed_real)
+        assert restored == original and restored["updates_observed"] == 1
+        stored = torch.load(tmp_path / "checkpoints/state.pt", weights_only=False)["pmpo_diagnostic"]["fixed_real"]
+        assert stored["encoding"] == "uint8_pixels_div" and stored["values"].dtype == torch.uint8
+        # state.pt, not fixed_real_stacks.pt, is authoritative for the fixed states.
+        path = tmp_path / "pmpo_diagnostic/fixed_real_stacks.pt"
+        torch.save(fixed_real + 1, path)
+        different = path.read_bytes()
+        resumed = Trainer(cfg, root)
+        torch.testing.assert_close(resumed._pmpo_diagnostic.fixed_real, fixed_real, rtol=0, atol=0)
+        assert path.read_bytes() == different
+        path.unlink()
+        cfg.training.num_final_epochs = 2
+        resumed = Trainer(cfg, root)
+        resumed._run()
+        assert resumed.epoch == 2 and resumed._pmpo_diagnostic.updates_observed == 2
+        torch.testing.assert_close(resumed._pmpo_diagnostic.fixed_real, fixed_real, rtol=0, atol=0)
+        torch.testing.assert_close(torch.load(path, weights_only=True), fixed_real, rtol=0, atol=0)
 
 
 class Prompts(IterableDataset):

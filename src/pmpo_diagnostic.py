@@ -38,6 +38,48 @@ class DiagnosticStop(RuntimeError):
     pass
 
 
+def normalize_pixels(pixels):
+    """uint8 RGB -> [-1, 1] float32; evaluation preprocessing and checkpoint decoding."""
+    return pixels.float().div(255).mul(2).sub(1)
+
+
+# normalize_pixels rounds differently by device, so each uint8 encoding names the
+# arithmetic that reproduces the stored states; all decoding runs on CPU.
+_RECIPROCAL_255 = torch.tensor(1.0) / torch.tensor(255.0)
+PIXEL_DECODERS = {
+    # CPU evaluation: true division.
+    "uint8_pixels_div": lambda pixels: pixels.float().div(255).mul(2).sub(1),
+    # CUDA evaluation: PyTorch divides by a scalar as a multiply by its float32 reciprocal.
+    "uint8_pixels_mul_reciprocal": lambda pixels: pixels.float().mul(_RECIPROCAL_255).mul(2).sub(1),
+}
+
+
+def encode_fixed_real(fixed_real):
+    """Checkpoint form of the fixed states: uint8 pixels when a decoder reproduces them
+    bit for bit, else the float32 tensor itself."""
+    if fixed_real is None:
+        return None
+    fixed_real = fixed_real.cpu()
+    pixels = fixed_real.add(1).div(2).mul(255).round().clamp(0, 255).to(torch.uint8)
+    for encoding, decode in PIXEL_DECODERS.items():
+        if torch.equal(decode(pixels), fixed_real):
+            return dict(encoding=encoding, values=pixels)
+    return dict(encoding="float32", values=fixed_real)
+
+
+def decode_fixed_real(stored):
+    if stored is None:
+        return None
+    if torch.is_tensor(stored):  # Earlier diagnostic states stored the float32 tensor itself.
+        return stored.cpu()
+    values = stored["values"].cpu()
+    if stored["encoding"] in PIXEL_DECODERS:
+        return PIXEL_DECODERS[stored["encoding"]](values)
+    if stored["encoding"] == "float32":
+        return values
+    raise ValueError(f"Unknown fixed_real encoding {stored['encoding']!r}")
+
+
 class PMPORunDiagnostic:
     def __init__(self, cfg, model, env_cfg, optimizers=None, trainer_state_fn=None):
         self.cfg, self.model, self.env_cfg, self.optimizers = cfg, model, env_cfg, optimizers
@@ -50,10 +92,100 @@ class PMPORunDiagnostic:
         self.trainer_state_fn = trainer_state_fn
         self.path = Path(cfg.output_dir)
         self.path.mkdir(parents=True, exist_ok=True)
+        # Not read here: a fresh run records its own reference set, and a restored run
+        # takes its observations from the checkpoint (see load_state_dict).
+        self.path_fixed_real = self.path / "fixed_real_stacks.pt"
         self.fixed_real = None
         self.boundary_streak = self.constant_streak = self.one_sided_epochs = 0
         self.previous_entropy_per_dim = None
+        # Completed PMPO updates whose rows were processed, including non-finite rows,
+        # which are kept out of the stop-rule history. With the diagnostic active from
+        # the start, this equals PMPOBeta.updates in every checkpoint saving it.
+        self.updates_observed = 0
+        self.nonfinite_updates = 0
         self.checkpoint_updates = set(getattr(cfg, "checkpoint_updates", ()))
+
+    def state_dict(self):
+        return dict(updates_observed=self.updates_observed, nonfinite_updates=self.nonfinite_updates,
+                    boundary_streak=self.boundary_streak, constant_streak=self.constant_streak,
+                    one_sided_epochs=self.one_sided_epochs, previous_entropy_per_dim=self.previous_entropy_per_dim,
+                    fixed_real=encode_fixed_real(self.fixed_real))
+
+    def load_state_dict(self, state):
+        """Call after the model state is restored: the history must describe the same
+        moment as the restored PMPOBeta.updates."""
+        model_updates = self.model.updates.item()
+        if state is None:
+            print("PMPO diagnostic: checkpoint has no diagnostic history; stop-rule streaks restart", flush=True)
+            self.updates_observed = model_updates
+            self.load_fixed_real_file()
+            return
+        if state["updates_observed"] != model_updates:
+            raise ValueError(f"PMPO diagnostic history observed {state['updates_observed']} updates, "
+                             f"but the restored model completed {model_updates}")
+        self.updates_observed = state["updates_observed"]
+        self.nonfinite_updates = state["nonfinite_updates"]
+        self.boundary_streak = state["boundary_streak"]
+        self.constant_streak = state["constant_streak"]
+        self.one_sided_epochs = state["one_sided_epochs"]
+        self.previous_entropy_per_dim = state["previous_entropy_per_dim"]
+        if "fixed_real" not in state:
+            self.load_fixed_real_file()
+            return
+        # None: saved before the first evaluation; the next evaluation records a new set.
+        self.fixed_real = decode_fixed_real(state["fixed_real"])
+        if self.fixed_real is None:
+            return
+        if not self.path_fixed_real.exists():
+            torch.save(self.fixed_real, self.path_fixed_real)
+            return
+        try:
+            on_disk = torch.load(self.path_fixed_real, map_location="cpu", weights_only=True)
+            matches = torch.is_tensor(on_disk) and torch.equal(on_disk, self.fixed_real)
+        except Exception:
+            matches = False
+        if not matches:
+            print("PMPO diagnostic: fixed_real_stacks.pt is unreadable or differs from the checkpoint; "
+                  "using the checkpoint's observations and leaving the file unchanged", flush=True)
+
+    def load_fixed_real_file(self):
+        """Fallback for checkpoints without observations: use fixed_real_stacks.pt only if
+        it holds valid reference stacks for this model, and report which case applies."""
+        if not self.path_fixed_real.is_file():
+            print("PMPO diagnostic: no fixed_real_stacks.pt; the next evaluation records a new reference set",
+                  flush=True)
+            return
+        cfg = self.model.cfg
+        shape = (cfg.img_channels * self.model.frame_stack, cfg.img_size, cfg.img_size)
+        try:
+            fixed_real = torch.load(self.path_fixed_real, map_location="cpu", weights_only=True)
+        except Exception as error:
+            problem = f"unreadable ({type(error).__name__})"
+        else:
+            if not torch.is_tensor(fixed_real) or fixed_real.dtype != torch.float32:
+                problem = "not a float32 tensor"
+            elif fixed_real.ndim != 4 or tuple(fixed_real.shape[1:]) != shape or not 1 <= len(fixed_real) <= 128:
+                problem = f"shape {tuple(fixed_real.shape)} is not (1..128, *{shape})"
+            elif not torch.isfinite(fixed_real).all() or fixed_real.abs().max() > 1:
+                problem = "values are non-finite or outside [-1, 1]"
+            else:
+                problem = None
+        if problem:
+            print(f"PMPO diagnostic: fixed_real_stacks.pt is not usable ({problem}); it is kept, "
+                  "and the next evaluation records a new reference set", flush=True)
+            return
+        print("PMPO diagnostic: checkpoint has no fixed observations; using fixed_real_stacks.pt", flush=True)
+        self.fixed_real = fixed_real
+
+    def save_fixed_real_file(self):
+        # A new reference set never overwrites an earlier file (stale, unreadable or rejected).
+        if self.path_fixed_real.exists():
+            n = 1
+            while (preserved := self.path / f"fixed_real_stacks.preserved_{n}.pt").exists():
+                n += 1
+            self.path_fixed_real.rename(preserved)
+            print(f"PMPO diagnostic: kept the earlier fixed_real_stacks.pt as {preserved.name}", flush=True)
+        torch.save(self.fixed_real, self.path_fixed_real)
 
     def write(self, name, record):
         with (self.path / name).open("a", encoding="utf-8") as file:
@@ -76,16 +208,16 @@ class PMPORunDiagnostic:
         torch.save(payload, self.path / f"{name}.pt")
 
     def save_full_training_checkpoint(self, epoch, update, tag=None):
-        # A genuinely resumable full-loop checkpoint: denoiser, reward/end model, PMPO
-        # actor/value/prior, all three optimizers, LR schedulers, epoch counter, and
-        # (via PMPOBeta's own get_extra_state/set_extra_state hook, folded into
-        # agent.actor_critic's own state_dict) the model's imagination-RNG snapshot --
-        # everything Trainer's own epoch-boundary save_checkpoint() already relies on
-        # for exact resume, just captured at a finer (prior-refresh-interval) cadence.
-        # Deliberately does NOT separately re-persist the collected real-environment
-        # dataset (train_dataset.save_to_default_path()/test_dataset's own on-disk
-        # files) the way the epoch-boundary checkpoint does -- that's orthogonal to
-        # controller/world-model resume fidelity and out of scope here.
+        # The full Trainer state dict: denoiser, reward/end model, PMPO actor/value/prior,
+        # all three optimizers, LR schedulers, counters, this diagnostic's history, and
+        # (via PMPOBeta's get_extra_state/set_extra_state hook) the imagination-RNG
+        # snapshot, at a finer (prior-refresh-interval) cadence than Trainer's own
+        # epoch-boundary save_checkpoint(). The model and diagnostic history describe
+        # the same completed update. It is not a supported mid-epoch resume point:
+        # Trainer only resumes from checkpoints/state.pt; inside a refresh or stop save
+        # Trainer's PMPO batch counter still lags PMPOBeta.updates by one; Trainer.epoch
+        # is the epoch in progress; and the real-environment datasets are not
+        # re-persisted here.
         if self.trainer_state_fn is None:
             return
         payload = {"trainer_state": self.trainer_state_fn(), "epoch": epoch, "update": update}
@@ -104,7 +236,10 @@ class PMPORunDiagnostic:
                    prior_refresh_interval=interval, prior_refresh_event=(update % interval == 0),
                    prior_block_position=update % interval)
         finite_row = {k: v for k, v in row.items() if isinstance(v, (int, float))}
+        self.updates_observed += 1
         if not all(np.isfinite(v) for v in finite_row.values()):
+            # The update completed, but its values never enter the stop-rule history.
+            self.nonfinite_updates += 1
             self.save_diagnostic_checkpoint(update, tag="stop")
             self.save_full_training_checkpoint(epoch, update, tag="stop")
             raise DiagnosticStop("Non-finite controller diagnostic")
@@ -112,10 +247,20 @@ class PMPORunDiagnostic:
         if wandb.run is not None:
             wandb.log({"pmpo/actor_update": update, "pmpo/real_env_steps": real_steps,
                        **{f"pmpo/{k}": row[k] for k in _WANDB_UPDATE_KEYS if k in row}})
+        # The model already completed this update, so every snapshot below must include it.
+        reason = self.observe(row)
         if update in self.checkpoint_updates:
             self.save_diagnostic_checkpoint(update)
         if update > 0 and update % interval == 0:
             self.save_full_training_checkpoint(epoch, update)
+        if reason:
+            self.save_diagnostic_checkpoint(update, tag="stop")
+            self.save_full_training_checkpoint(epoch, update, tag="stop")
+            self.write("stop.jsonl", dict(epoch=epoch, update=update, reason=reason))
+            raise DiagnosticStop(reason)
+
+    def observe(self, row):
+        """Fold one finite row into the stop-rule history; return the stop reason, if any."""
         reason = None
         if max(row["alpha_max"], row["beta_max"]) > 1e4:
             reason = "Beta concentration exceeded 10000"
@@ -124,12 +269,12 @@ class PMPORunDiagnostic:
         if max(row["value_abs_max"], row["return_abs_max"]) > 1e6:
             reason = "Value or lambda-return magnitude exceeded 1e6"
         boundary = row["near_lower_fraction"] + row["near_upper_fraction"]
-        self.boundary_streak = self.boundary_streak + 1 if boundary > 0.95 else 0
+        boundary_streak = self.boundary_streak + 1 if boundary > 0.95 else 0
         fixed_std = max(v for k, v in row.items() if k.startswith("fixed_policy_mean_state_std_"))
-        self.constant_streak = self.constant_streak + 1 if fixed_std < 1e-6 else 0
-        if self.boundary_streak >= 50:
+        constant_streak = self.constant_streak + 1 if fixed_std < 1e-6 else 0
+        if boundary_streak >= 50:
             reason = "Over 95% near-bound actions for 50 consecutive updates"
-        if self.constant_streak >= 100:
+        if constant_streak >= 100:
             reason = "Fixed-state actions effectively constant for 100 consecutive updates"
         # Differential entropy can legitimately be negative. Observe canonical
         # entropy per dimension, with an abrupt-drop/concentration condition.
@@ -140,12 +285,9 @@ class PMPORunDiagnostic:
         if (self.previous_entropy_per_dim is not None and entropy < self.previous_entropy_per_dim - 2
                 and max(row["alpha_mean"], row["beta_mean"]) > 100):
             reason = "Abrupt entropy collapse with mean concentration above 100"
+        self.boundary_streak, self.constant_streak = boundary_streak, constant_streak
         self.previous_entropy_per_dim = entropy
-        if reason:
-            self.save_diagnostic_checkpoint(update, tag="stop")
-            self.save_full_training_checkpoint(epoch, update, tag="stop")
-            self.write("stop.jsonl", dict(epoch=epoch, update=update, reason=reason))
-            raise DiagnosticStop(reason)
+        return reason
 
     @torch.no_grad()
     def evaluate(self):
@@ -161,7 +303,7 @@ class PMPORunDiagnostic:
                     try:
                         image, _ = env.reset(seed=int(seed))
                         def observation(image):
-                            return torch.as_tensor(image.copy(), device=model.device).permute(2, 0, 1).float().div(255).mul(2).sub(1).unsqueeze(0)
+                            return normalize_pixels(torch.as_tensor(image.copy(), device=model.device).permute(2, 0, 1)).unsqueeze(0)
                         history = FrameHistory(observation(image), model.frame_stack)
                         total = 0.0
                         for step in range(10000):
@@ -182,7 +324,7 @@ class PMPORunDiagnostic:
                         env.close()
                 if self.fixed_real is None:
                     self.fixed_real = torch.cat(fixed)
-                    torch.save(self.fixed_real, self.path / "fixed_real_stacks.pt")
+                    self.save_fixed_real_file()
                 states = self.fixed_real.to(model.device)
                 temporal = {k: float(v) for k, v in model.temporal_diagnostics(states, "real_fixed").items()}
                 raw = model.actor(states)
