@@ -4,9 +4,12 @@ from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
+import hashlib
+from importlib.metadata import version as package_version
 import json
 from pathlib import Path
 import random
+import subprocess
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -190,7 +193,7 @@ def keep_agent_copies_every(
     get_path(0).parent.mkdir(parents=False, exist_ok=True)
 
     # Save agent
-    save_with_backup(agent_sd, get_path(epoch))
+    save_atomically(agent_sd, get_path(epoch))
 
     # Clean oldest
     if (num_to_keep is not None) and (epoch % every == 0):
@@ -224,12 +227,11 @@ def save_info_for_import_script(epoch: int, run_name: str, path_ckpt_dir: Path) 
         json.dump({"epoch": epoch, "name": run_name}, f)
 
 
-def save_with_backup(obj: Any, path: Path):
-    bk = path.with_suffix(".bk")
-    if path.is_file():
-        path.rename(bk)
-    torch.save(obj, path)
-    bk.unlink(missing_ok=True)
+def save_atomically(obj: Any, path: Path):
+    """Write aside, then replace: an interrupted save leaves the previous file intact."""
+    tmp = path.with_suffix(".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(path)
 
 
 def set_seed(seed: int) -> None:
@@ -352,3 +354,50 @@ def normalize_saved_config(cfg: DictConfig) -> DictConfig:
                 raise ValueError("Invalid obsolete policy lstm_dim")
         agent.actor_critic.pop("lstm_dim", None)
     return cfg
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Packages whose versions must match for a faithful resume.
+CHECKED_PACKAGES = ("torch", "numpy", "mujoco", "dm_control", "gymnasium")
+
+
+def source_identity(root_dir: Path) -> Dict[str, Any]:
+    def git(*args):
+        try:
+            return subprocess.run(["git", "-C", str(root_dir), *args], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    commit = git("rev-parse", "HEAD")
+    return dict(git_commit=commit, git_dirty=None if commit is None else bool(git("status", "--porcelain")),
+                packages={name: package_version(name) for name in CHECKED_PACKAGES})
+
+
+def check_same_packages(source: Dict[str, Any]) -> None:
+    current = {name: package_version(name) for name in CHECKED_PACKAGES}
+    changed = {k: (v, current[k]) for k, v in source["packages"].items() if current.get(k) != v}
+    if changed:
+        raise ValueError(f"Cannot resume faithfully: package versions changed (saved, now): {changed}")
+
+
+def rng_state() -> Dict[str, Any]:
+    return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
+
+
+def set_rng_state(state: Dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if state["cuda"] is not None:
+        if not torch.cuda.is_available() or torch.cuda.device_count() != len(state["cuda"]):
+            raise ValueError("Checkpoint CUDA RNG state needs the same number of visible GPUs")
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])

@@ -33,6 +33,13 @@ checkpointing:
   save_agent_every: 5
   num_to_keep: 11  # number of checkpoints to keep, use null to disable
 
+# Downstream milestones (milestones/steps_NNNNNN/), published at epoch boundaries. Values are
+# placeholders; final timing and retention are undecided.
+milestones:
+  at_steps: []  # publish at the first epoch boundary reaching each real-step count
+  every_steps: null  # also publish every N real steps (null: off)
+  keep_last: null  # keep only the newest N milestones (null: keep all)
+
 collection:
   train:
     num_envs: 1

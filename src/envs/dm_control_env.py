@@ -1,10 +1,12 @@
 from __future__ import annotations
 from collections.abc import Sequence
+import hashlib
 import pickle
 from typing import Any, Dict, Optional, Tuple
 
 import gymnasium
 from gymnasium.spaces import Box
+import mujoco
 import numpy as np
 
 from dm_control import suite
@@ -133,6 +135,34 @@ class DMControlEnv(gymnasium.Env):
                     )
             tasks.append(env.task)
         return tuple(tasks)
+
+    @property
+    def collection_state(self) -> Dict[str, Any]:
+        """Everything needed to continue this env exactly: the full MuJoCo data (including
+        solver warm start, time and derived quantities), the task's attributes and RNG, and
+        the episode step count. qpos/qvel alone would not reproduce the next steps."""
+        env = self._dm_env
+        return dict(
+            model=self._model_digest(),
+            data=pickle.dumps(env.physics.data.ptr),
+            task=pickle.dumps(env.task.__dict__),
+            step_count=env._step_count,
+            reset_next_step=env._reset_next_step,
+        )
+
+    @collection_state.setter
+    def collection_state(self, state: Dict[str, Any]) -> None:
+        # A different model (other task, or one a reset edited) cannot be restored exactly.
+        if state["model"] != self._model_digest():
+            raise ValueError(f"Saved state of {self.domain_name}/{self.task_names[0]} belongs to a different MuJoCo model")
+        env = self._dm_env
+        mujoco.mj_copyData(env.physics.data.ptr, env.physics.model.ptr, pickle.loads(state["data"]))
+        env.task.__dict__.update(pickle.loads(state["task"]))
+        env._step_count = state["step_count"]
+        env._reset_next_step = state["reset_next_step"]
+
+    def _model_digest(self) -> str:
+        return hashlib.sha256(pickle.dumps(self._dm_env.physics.model.ptr)).hexdigest()
 
     def _render(self) -> np.ndarray:
         return self._dm_env.physics.render(height=self.size, width=self.size, camera_id=self.camera_id)

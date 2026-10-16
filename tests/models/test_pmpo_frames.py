@@ -280,8 +280,8 @@ def test_viewer_uses_stacked_beta_policy_and_records_final_observation(tmp_path,
     torch.testing.assert_close(episode.info["final_observation"], frame(.7)[0], rtol=0, atol=0)
     assert episode.act.shape == (2, 2) and episode.compute_metrics()["return"] == 1.5
     # Retained pre-action frame must survive in-place env observation mutation.
-    # Dataset serialization retains the original uint8 RGB quantization.
-    quantized_zero = torch.tensor(127).div(255).mul(2).sub(1).item()
+    # Dataset serialization stores the nearest uint8 RGB level (0.0 is 127.5 -> 128).
+    quantized_zero = torch.tensor(128).div(255).mul(2).sub(1).item()
     torch.testing.assert_close(episode.obs[0], frame(quantized_zero)[0], rtol=0, atol=0)
     viewer.print_controls()
     assert viewer.next_mode() is False and viewer.next_axis_2() is True

@@ -63,7 +63,9 @@ class Episode:
     def save(self, path: Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        d = {k: v.add(1).div(2).mul(255).byte() if k == "obs" else v for k, v in self.__dict__.items()}
+        # Round, not truncate: frames are uint8 levels, and truncation lowered some by one on
+        # every save, drifting the prefix of an extended episode.
+        d = {k: v.add(1).div(2).mul(255).round().byte() if k == "obs" else v for k, v in self.__dict__.items()}
         torch.save(d, path.with_suffix(".tmp"))
         path.with_suffix(".tmp").replace(path)
 

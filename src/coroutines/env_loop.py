@@ -1,5 +1,6 @@
+from dataclasses import dataclass
 import random
-from typing import Generator, Tuple, Union
+from typing import Generator, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -9,17 +10,34 @@ from .frame_history import FrameHistory
 from envs import TorchEnv, WorldModelEnv
 
 
+@dataclass
+class LoopState:
+    """Where an env loop stands between sends: the current observation and frame history.
+    Given to make_env_loop with obs set, the loop continues from it instead of resetting."""
+    obs: Optional[torch.Tensor] = None
+    history: Optional[torch.Tensor] = None
+
+
 @coroutine
 def make_env_loop(
     env: Union[TorchEnv, WorldModelEnv], model: nn.Module, epsilon: float = 0.0,
-    store_policy_observations: bool = False,
+    store_policy_observations: bool = False, state: Optional[LoopState] = None,
 ) -> Generator[Tuple[torch.Tensor, ...], int, None]:
     num_steps = yield
 
-    seed = random.randint(0, 2**31 - 1)
-    obs, info = env.reset(seed=[seed + i for i in range(env.num_envs)])
-    # WorldModelEnv supplies its replay prompt; real resets repeat the first frame.
-    history = FrameHistory(obs, model.frame_stack, info.get("prompt"))
+    if state is not None and state.obs is not None:
+        # Continue a restored loop: the env itself must already be restored.
+        obs = state.obs
+        history = FrameHistory(obs, model.frame_stack)
+        if state.history.shape != history.state.shape:
+            raise ValueError(f"Restored frame history has shape {tuple(state.history.shape)}, "
+                             f"expected {tuple(history.state.shape)}")
+        history.state = state.history
+    else:
+        seed = random.randint(0, 2**31 - 1)
+        obs, info = env.reset(seed=[seed + i for i in range(env.num_envs)])
+        # WorldModelEnv supplies its replay prompt; real resets repeat the first frame.
+        history = FrameHistory(obs, model.frame_stack, info.get("prompt"))
 
     while True:
         all_ = []
@@ -76,5 +94,7 @@ def make_env_loop(
         all_[-1][-1] = val_bootstrap
 
         all_obs, act, rew, end, trunc, logits_act, val, val_bootstrap = (torch.stack(x, dim=1) for x in zip(*all_))
+        if state is not None:
+            state.obs, state.history = obs, history.state
 
         num_steps = yield all_obs, act, rew, end, trunc, logits_act, val, val_bootstrap, infos

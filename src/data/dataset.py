@@ -2,7 +2,7 @@ from collections import Counter
 import multiprocessing as mp
 from pathlib import Path
 import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import torch
@@ -10,10 +10,15 @@ import torch
 from .episode import Episode
 from .segment import Segment, SegmentId
 from .utils import make_segment
-from utils import StateDictMixin
+from utils import file_sha256, StateDictMixin
 
 
 class Dataset(StateDictMixin, torch.utils.data.Dataset):
+    """Replay of episodes. Each saved episode file is an immutable version named by episode
+    id and length (`<id>_<length>.pt`): extending an unfinished episode writes a new version
+    and keeps the old one, so a saved index (this state dict) always reads exactly the
+    transitions it recorded, whatever was collected later."""
+
     def __init__(
         self,
         directory: Path,
@@ -32,6 +37,8 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self.lengths = None
         self.counter_end = None
         self.task_names = None  # task labels shared by every episode, None if unlabeled
+        self.versioned = True  # False for datasets saved before versions (`<id>.pt` files)
+        self.file_sha256 = None  # checksum of each episode's current version file, taken when written
 
         self._directory = Path(directory).expanduser()
         self._name = name if name is not None else self._directory.stem
@@ -66,6 +73,8 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self.lengths = np.array([], dtype=np.int64)
         self.counter_end = Counter()
         self.task_names = None
+        self.versioned = True
+        self.file_sha256 = []
         self._cache.clear()
 
     def clear(self) -> None:
@@ -112,8 +121,15 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
 
         self.counter_end.update(episode.end.tolist())
 
+        sha256 = None
         if self._save_on_disk:
-            episode.save(self._get_episode_path(episode_id))
+            path = self._get_episode_path(episode_id)
+            episode.save(path)
+            sha256 = file_sha256(path)  # once per immutable version
+        if episode_id == len(self.file_sha256):
+            self.file_sha256.append(sha256)
+        else:
+            self.file_sha256[episode_id] = sha256
 
         if self._cache_in_ram:
             self._cache[episode_id] = episode
@@ -121,16 +137,43 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         return episode_id
 
     def _get_episode_path(self, episode_id: int) -> Path:
+        """Path of the episode version this index refers to."""
         n = 3  # number of hierarchies
         powers = np.arange(n)
         subfolders = np.floor((episode_id % 10 ** (1 + powers)) / 10**powers) * 10**powers
         subfolders = [int(x) for x in subfolders[::-1]]
         subfolders = "/".join([f"{x:0{n - i}d}" for i, x in enumerate(subfolders)])
-        return self._directory / subfolders / f"{episode_id}.pt"
+        if not self.versioned:
+            return self._directory / subfolders / f"{episode_id}.pt"
+        return self._directory / subfolders / f"{episode_id}_{self.lengths[episode_id]}.pt"
+
+    @property
+    def directory(self) -> Path:
+        return self._directory
+
+    def episode_files(self) -> List[Path]:
+        """The episode versions this index refers to, in episode order."""
+        return [self._get_episode_path(i) for i in range(self.num_episodes)]
+
+    def prune_versions(self, keep: Set[Path]) -> int:
+        """Delete episode versions (and interrupted writes) not in keep; returns the count."""
+        self.assert_not_static()
+        if not self.versioned:
+            raise ValueError(f"{self.name} has unversioned episode files; nothing can be pruned safely")
+        keep = {Path(p).resolve() for p in keep}
+        removed = 0
+        for pattern in ("*.pt", "*.tmp"):
+            for path in self._directory.rglob(pattern):
+                if path != self._default_path and path.resolve() not in keep:
+                    path.unlink()
+                    removed += 1
+        return removed
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         state_dict = {k: v for k, v in state_dict.items() if k != "counter_rew"}
         state_dict.setdefault("task_names", None)  # datasets saved before task labels existed
+        state_dict.setdefault("versioned", False)  # datasets saved before episode versions
+        state_dict.setdefault("file_sha256", [None] * state_dict["num_episodes"])
         super().load_state_dict(state_dict)
         self._cache.clear()
 

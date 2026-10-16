@@ -3,7 +3,7 @@ from pathlib import Path
 import shutil
 import time
 import json
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from hydra.utils import instantiate
 import numpy as np
@@ -16,8 +16,9 @@ import wandb
 
 from agent import Agent, get_action_space_kwargs
 from utils import normalize_saved_config
-from coroutines.collector import COLLECTION_MODES, make_collector, NumToCollect
+from coroutines.collector import COLLECTION_MODES, CollectorState, make_collector, NumToCollect
 from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
+from data.milestone import milestone_name, publish_milestone, referenced_files
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from lcg import LCGLifecycle
 from models.pmpo_beta import PMPOOptimizers
@@ -25,6 +26,7 @@ from pmpo_diagnostic import PMPORunDiagnostic
 from utils import (
     broadcast_if_needed,
     build_ddp_wrapper,
+    check_same_packages,
     CommonTools,
     configure_opt,
     count_parameters,
@@ -32,9 +34,12 @@ from utils import (
     keep_agent_copies_every,
     Logs,
     process_confusion_matrices_if_any_and_compute_classification_metrics,
+    rng_state,
     save_info_for_import_script,
-    save_with_backup,
+    save_atomically,
+    set_rng_state,
     set_seed,
+    source_identity,
     StateDictMixin,
     try_until_no_except,
     wandb_log,
@@ -92,6 +97,9 @@ class ExplorationTrainer(StateDictMixin):
             raise ValueError("The uniform baseline trains no exploration policy; set intrinsic_reward.enabled=false")
         if not self._learned_exploration and cfg.get("pmpo_diagnostic") is not None:
             raise ValueError("pmpo_diagnostic needs PMPO updates; the uniform baseline has none")
+        keep_last = cfg.milestones.keep_last
+        if keep_last is not None and keep_last < 1:
+            raise ValueError(f"milestones.keep_last must be null or at least 1, got {keep_last}")
         # Imagined episodes never truly end, so real ones must not either.
         if cfg.env.train.domain_name not in TIME_LIMIT_ONLY_DOMAINS:
             raise ValueError(f"Domain {cfg.env.train.domain_name!r} is not verified to end only at its time limit")
@@ -150,10 +158,14 @@ class ExplorationTrainer(StateDictMixin):
         if cfg.initialization.path_to_ckpt is not None:
             self.agent.load(**cfg.initialization)
 
-        # Collectors
+        # Collectors. The train collector's state (unfinished episodes, env loop position)
+        # is kept here so checkpoints can save and restore it.
+        self._train_collector_state = CollectorState()
         if not self._is_static_dataset and self._rank == 0:
+            self._train_env = train_env
             self._train_collector = make_collector(
-                train_env, self.agent.actor_critic, self.train_dataset, cfg.collection.train.epsilon
+                train_env, self.agent.actor_critic, self.train_dataset, cfg.collection.train.epsilon,
+                state=self._train_collector_state,
             )
             self._test_collector = make_collector(
                 test_env, self.agent.actor_critic, self.test_dataset, cfg.collection.test.epsilon, reset_every_collect=True
@@ -243,9 +255,16 @@ class ExplorationTrainer(StateDictMixin):
         self.num_episodes_test = 0
         self.num_batch_train = CommonTools(0, None, 0)
         self.num_batch_test = CommonTools(0, None, 0)
+        self.source = source_identity(root_dir)  # replaced by the checkpoint's on resume
+        self.milestone_targets_done = []  # real-step targets already given a milestone
+        self.milestones = []  # dict(name, epoch, retired); retired ones are deleted by retention
 
+        self._path_milestones = Path("milestones")
+        self._start_logs = []
+        self._rng_to_restore = None
         if cfg.common.resume:
             self.load_state_checkpoint()
+            self._start_logs.append({"resume/from_epoch": self.epoch})
         else:
             self.save_checkpoint()
 
@@ -254,6 +273,12 @@ class ExplorationTrainer(StateDictMixin):
                 print(f"{count_parameters(getattr(self.agent, name))} parameters in {name}")
             print(self.train_dataset)
             print(self.test_dataset)
+
+        if cfg.common.resume:
+            # A crash between committing a checkpoint and publishing its milestone.
+            self.publish_pending_milestones()
+            # Last: nothing after this may consume random numbers before training resumes.
+            set_rng_state(self._rng_to_restore)
 
     def run(self) -> None:
         try:
@@ -267,7 +292,7 @@ class ExplorationTrainer(StateDictMixin):
             raise
 
     def _run(self) -> None:
-        to_log = []
+        to_log = list(self._start_logs)  # resumed runs log where they resumed from
 
         if self.epoch == 0:
             if self._is_static_dataset:
@@ -503,16 +528,59 @@ class ExplorationTrainer(StateDictMixin):
         state = super().state_dict()
         if self._pmpo_diagnostic is not None:
             state["pmpo_diagnostic"] = self._pmpo_diagnostic.state_dict()
+        state["resume_format"] = RESUME_FORMAT
+        state["collection"] = self.collection_state()
+        state["rng"] = rng_state()
         return state
 
     def load_state_dict(self, state_dict: dict) -> None:
         # Checkpoints saved without a diagnostic carry no "pmpo_diagnostic" entry.
         state_dict = dict(state_dict)
+        if state_dict.pop("resume_format", None) != RESUME_FORMAT:
+            raise ValueError("Checkpoint has no exploration resume state (saved before Step 4); "
+                             "it cannot be resumed faithfully. Start a new run.")
+        collection = state_dict.pop("collection")
+        self._rng_to_restore = state_dict.pop("rng")
         diagnostic_state = state_dict.pop("pmpo_diagnostic", None)
+        check_same_packages(state_dict["source"])
         super().load_state_dict(state_dict)
+        self.restore_collection_state(collection)
         if self._pmpo_diagnostic is not None:
             # After the agent: the history is validated against the restored PMPOBeta.updates.
             self._pmpo_diagnostic.load_state_dict(diagnostic_state)
+
+    def collection_state(self) -> Optional[Dict[str, Any]]:
+        """The train collector at this epoch boundary: unfinished episode ids, the current
+        observation and frame history, and each real env's full state."""
+        if self._is_static_dataset or self._rank != 0:
+            return None
+        state = self._train_collector_state
+        started = state.loop.obs is not None
+        return dict(
+            env_config=OmegaConf.to_container(self._cfg.env.train),
+            episode_ids=list(state.episode_ids),
+            obs=state.loop.obs.cpu() if started else None,
+            history=state.loop.history.cpu() if started else None,
+            envs=self._train_env.get_env_states() if started else None,
+        )
+
+    def restore_collection_state(self, saved: Optional[Dict[str, Any]]) -> None:
+        if self._is_static_dataset or self._rank != 0:
+            return
+        if saved is None:
+            raise ValueError("Checkpoint has no collection state; it cannot resume collection")
+        if saved["env_config"] != OmegaConf.to_container(self._cfg.env.train):
+            raise ValueError("Checkpoint was collected with a different env.train config")
+        for episode_id in saved["episode_ids"]:
+            if episode_id is not None and (episode_id >= self.train_dataset.num_episodes
+                                           or self.train_dataset.load_episode(episode_id).dead[-1]):
+                raise ValueError(f"Checkpoint's unfinished episode {episode_id} is not an unfinished episode of its dataset")
+        state = self._train_collector_state
+        state.episode_ids[:] = saved["episode_ids"]  # in place: the collector holds this list
+        if saved["obs"] is not None:
+            self._train_env.set_env_states(saved["envs"])
+            state.loop.obs = saved["obs"].to(self._device)
+            state.loop.history = saved["history"].to(self._device)
 
     def load_state_checkpoint(self) -> None:
         # Trusted, locally generated DIAMOND state (includes Dataset state: numpy arrays, Counters,
@@ -521,9 +589,88 @@ class ExplorationTrainer(StateDictMixin):
         self.load_state_dict(torch.load(self._path_state_ckpt, map_location=self._device, weights_only=False))
 
     def save_checkpoint(self) -> None:
-        if self._rank == 0:
-            save_with_backup(self.state_dict(), self._path_state_ckpt)
+        """Commit point: state.pt, which includes the replay index and collection state, is
+        replaced atomically. Episode versions it refers to were written before; milestones
+        are published and unreferenced versions pruned only after the commit."""
+        if self._rank != 0:
+            return
+        self.mark_due_milestone()
+        save_atomically(self.state_dict(), self._path_state_ckpt)
+        if not self._is_static_dataset:  # never write into a static dataset
             self.train_dataset.save_to_default_path()
             self.test_dataset.save_to_default_path()
-            self._keep_agent_copies(self.agent.state_dict(), self.epoch)
-            self._save_info_for_import_script(self.epoch)
+        self._keep_agent_copies(self.agent.state_dict(), self.epoch)
+        self._save_info_for_import_script(self.epoch)
+        self.publish_pending_milestones()
+        if not self._is_static_dataset:
+            self.prune_episode_versions()
+
+    def mark_due_milestone(self) -> None:
+        """Before the commit: record a milestone for this boundary if a real-step target was
+        reached, and mark the ones retention will delete."""
+        c = self._cfg.milestones
+        num_steps = self.train_dataset.num_steps
+        targets = set(c.at_steps)
+        if c.every_steps:
+            targets.update(range(c.every_steps, num_steps + 1, c.every_steps))
+        due = sorted(t for t in targets if t <= num_steps and t not in self.milestone_targets_done)
+        if due:
+            self.milestone_targets_done += due
+            self.milestones.append(dict(name=milestone_name(num_steps), epoch=self.epoch, retired=False))
+        if c.keep_last is not None:
+            active = [m for m in self.milestones if not m["retired"]]
+            for milestone in active[:-c.keep_last]:
+                milestone["retired"] = True
+
+    def publish_pending_milestones(self) -> None:
+        """After the commit (or on resume): publish this boundary's milestone, then delete
+        retired ones. Both steps can be repeated after an interruption."""
+        for milestone in self.milestones:
+            path = self._path_milestones / milestone["name"]
+            if milestone["retired"] or path.exists():
+                continue
+            if milestone["epoch"] != self.epoch:
+                raise RuntimeError(f"Milestone {milestone['name']} is missing but was not retired")
+            self.publish_milestone(milestone["name"])
+        for milestone in self.milestones:
+            path = self._path_milestones / milestone["name"]
+            if milestone["retired"] and path.exists():
+                shutil.rmtree(path)
+
+    def publish_milestone(self, name: str) -> Path:
+        cfg = self._cfg
+        state = self._train_collector_state
+        successors = {}
+        if state.loop.obs is not None:
+            for i, episode_id in enumerate(state.episode_ids):
+                if episode_id is not None:
+                    successors[episode_id] = state.loop.obs[i]
+        manifest = dict(
+            created_by="ExplorationTrainer",
+            domain=cfg.env.train.domain_name,
+            task_names=list(cfg.env.train.task_names),
+            collected_steps=int(self.train_dataset.num_steps),
+            num_episodes=int(self.train_dataset.num_episodes),
+            epoch=int(self.epoch),
+            counters=dict(denoiser_batches=int(self.num_batch_train.denoiser),
+                          pmpo_updates=int(self.agent.actor_critic.updates.item())),
+            exploration=dict(collection_mode=cfg.collection.train.mode,
+                             intrinsic_reward_enabled=bool(cfg.intrinsic_reward.enabled)),
+            model=dict(denoiser=OmegaConf.to_container(cfg.agent.denoiser),
+                       env=OmegaConf.to_container(cfg.env.train)),
+            run_config="../../config/trainer.yaml",
+            source=self.source,
+        )
+        return publish_milestone(self._path_milestones, name, self.agent.denoiser.state_dict(),
+                                 self.train_dataset, successors, manifest)
+
+    def prune_episode_versions(self) -> None:
+        """Delete replay versions no longer referenced by this checkpoint or any milestone."""
+        keep = set(self.train_dataset.episode_files())
+        for path in self._path_milestones.glob("steps_*"):
+            keep.update(referenced_files(path))
+        self.train_dataset.prune_versions(keep)
+
+
+# Bumped when the checkpoint contents needed for faithful resume change.
+RESUME_FORMAT = 1

@@ -134,6 +134,7 @@ def test_trainer_passes_initial_and_later_collection_modes(monkeypatch):
                                    first_epoch=dict(min=20, mode="uniform"))),
         training=dict(should=False, num_final_epochs=0), evaluation=dict(should=False, every=1)))
     t._rank, t._is_static_dataset, t._pmpo_diagnostic, t.epoch, t.num_epochs_collect = 0, False, None, 0, None
+    t._start_logs = []
     t.train_dataset = Data()
     t._train_collector = Collector(t.train_dataset)
     t.save_checkpoint = lambda: None

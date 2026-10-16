@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import gymnasium
 from gymnasium.vector import AsyncVectorEnv
@@ -60,6 +60,15 @@ class TorchEnv(gymnasium.Wrapper):
     def reset(self, *args, **kwargs) -> Tuple[Tensor, Dict[str, Any]]:
         obs, info = self.env.reset(*args, **kwargs)
         return self._to_tensor(obs), info
+
+    def get_env_states(self) -> List[Dict[str, Any]]:
+        """Each sub-environment's DMControlEnv.collection_state."""
+        return list(self.env.get_attr("collection_state"))
+
+    def set_env_states(self, states: List[Dict[str, Any]]) -> None:
+        if len(states) != self.num_envs:
+            raise ValueError(f"Got {len(states)} saved env states for {self.num_envs} envs")
+        self.env.set_attr("collection_state", list(states))
 
     def step(self, actions: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]:
         obs, rew, end, trunc, info = self.env.step(actions.cpu().numpy())

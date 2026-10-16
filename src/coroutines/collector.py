@@ -1,6 +1,6 @@
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Generator, Optional
+from dataclasses import dataclass, field
+from typing import Generator, List, Optional
 
 import torch
 import torch.nn as nn
@@ -9,7 +9,7 @@ from tqdm import tqdm
 from . import coroutine
 from data import Episode, Dataset
 from envs import TorchEnv
-from .env_loop import make_env_loop
+from .env_loop import LoopState, make_env_loop
 from utils import Logs
 
 
@@ -40,6 +40,14 @@ class ActionSource:
         return self.env.action_low + unit * (self.env.action_high - self.env.action_low)
 
 
+@dataclass
+class CollectorState:
+    """Collector bookkeeping that persists between collects: the dataset id of each env's
+    unfinished episode (None if none) and the env loop position. Saved at checkpoints."""
+    episode_ids: List[Optional[int]] = field(default_factory=list)
+    loop: LoopState = field(default_factory=LoopState)
+
+
 @coroutine
 def make_collector(
     env: TorchEnv,
@@ -48,12 +56,20 @@ def make_collector(
     epsilon: float = 0.0,
     reset_every_collect: bool = False,
     verbose: bool = True,
+    state: Optional[CollectorState] = None,
 ) -> Generator[Logs, int, None]:
     num_envs = env.num_envs
     task_names = getattr(env, "task_names", None)  # None: env records no task rewards
     action_source = ActionSource(env, model)
+    # The caller may keep (and restore) this state; a restored one continues its episodes.
+    state = CollectorState() if state is None else state
+    if not state.episode_ids:
+        state.episode_ids = [None] * num_envs
+    if len(state.episode_ids) != num_envs:
+        raise ValueError(f"Collector state has {len(state.episode_ids)} envs, the env has {num_envs}")
+    episode_ids = state.episode_ids
 
-    env_loop, buffer, episode_ids, dead = (None,) * 4
+    env_loop, buffer, dead = (None,) * 3
     num_steps, num_episodes, to_log, pbar = (None,) * 4
 
     def setup_new_collect():
@@ -70,10 +86,14 @@ def make_collector(
         )
 
     def reset():
-        nonlocal env_loop, episode_ids, dead
-        env_loop = make_env_loop(env, action_source, epsilon)
-        episode_ids = defaultdict(lambda: None)
+        nonlocal env_loop, dead
+        env_loop = make_env_loop(env, action_source, epsilon, state=state.loop)
         dead = [None] * num_envs
+
+    def forget_episodes():
+        # Test collection: the next collect resets the env and starts new episodes.
+        episode_ids[:] = [None] * num_envs
+        state.loop = LoopState()
 
     num_to_collect = yield
     setup_new_collect()
@@ -135,6 +155,7 @@ def make_collector(
             num_to_collect = yield to_log
             setup_new_collect()
             if reset_every_collect:
+                forget_episodes()
                 reset()
             action_source.uniform = num_to_collect.mode == "uniform"
 

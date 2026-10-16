@@ -73,6 +73,12 @@ class FakeEnv:
         self.t = 0
         return self.frame(), {}
 
+    def get_env_states(self):
+        return [dict(t=self.t)]
+
+    def set_env_states(self, states):
+        self.t = states[0]["t"]
+
     def step(self, action):
         self.t += 1
         obs = self.frame(action)
