@@ -1,0 +1,66 @@
+# Downstream training on a frozen exploration milestone (Step 5, first increment):
+#   python src/downstream_main.py initialization.milestone_path=<run>/milestones/steps_N \
+#       downstream.task_name=walk downstream.seed=0
+# Outputs: <run>/downstream/steps_N/<task>/seed_<seed>/ (never overwritten).
+# Budgets below are placeholders; final values are undecided.
+defaults:
+  - _self_
+  - env: dm_control  # env.train is replaced by the milestone's
+  - agent: pmpo_beta  # agent.denoiser is replaced by the milestone's; reward model and PMPO are fresh
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: False
+
+initialization:
+  milestone_path: ???
+
+downstream:
+  task_name: ???
+  seed: 0
+
+common:
+  devices: 0  # GPU index or cpu
+  seed: ${downstream.seed}  # read by agent.actor_critic.seed
+
+world_model_env:
+  _target_: envs.WorldModelEnvConfig
+  horizon: 15
+  num_batches_to_preload: 256
+  diffusion_sampler:
+    _target_: models.diffusion.DiffusionSamplerConfig
+    num_steps_denoising: 3
+    sigma_min: 2e-3
+    sigma_max: 5.0
+    rho: 7
+    order: 1
+    s_churn: 0.0
+    s_tmin: 0.0
+    s_tmax: ${eval:'float("inf")'}
+    s_noise: 1.0
+
+# Phase 1: reward/end model on the selected task's recorded rewards.
+rew_end_model:
+  training:
+    steps: 1000
+    batch_size: 32
+    seq_length: ${eval:'${world_model_env.horizon} + ${agent.denoiser.inner_model.num_steps_conditioning}'}
+    sample_weights: null  # episodes by length, anchor step uniform within the episode
+    lr_warmup_steps: 100
+    max_grad_norm: 100.0
+  optimizer:
+    lr: 1e-4
+    weight_decay: 1e-2
+    eps: 1e-8
+
+# Phase 2: PMPO in imagination on predicted task reward (reward model frozen).
+actor_critic:
+  training:
+    steps: 1000
+    batch_size: 32
+    sample_weights: null
+    lr_warmup_steps: 100

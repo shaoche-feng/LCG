@@ -138,7 +138,8 @@ class Milestone:
     successor_observations: Dict[int, torch.Tensor]
 
 
-def load_milestone(milestone_path: Path, task_name: str, map_location: Optional[torch.device] = None) -> Milestone:
+def load_milestone(milestone_path: Path, task_name: str, map_location: Optional[torch.device] = None,
+                   cache_in_ram: bool = False) -> Milestone:
     """Resolve and validate a milestone for downstream training on task_name."""
     path = Path(milestone_path)
     manifest = read_manifest(path)
@@ -151,7 +152,7 @@ def load_milestone(milestone_path: Path, task_name: str, map_location: Optional[
 
     # Trusted, locally generated index (numpy arrays, Counter): weights_only=False.
     saved = torch.load(path / manifest["files"]["dataset"]["path"], weights_only=False)
-    dataset = Dataset(path / saved["directory"], "milestone_dataset", cache_in_ram=False, save_on_disk=False)
+    dataset = Dataset(path / saved["directory"], "milestone_dataset", cache_in_ram=cache_in_ram, save_on_disk=False)
     dataset.load_state_dict(saved["index"])
     dataset.is_static = True  # reads only; never written
 

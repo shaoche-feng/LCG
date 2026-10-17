@@ -7,6 +7,7 @@ from functools import partial
 import hashlib
 from importlib.metadata import version as package_version
 import json
+import os
 from pathlib import Path
 import random
 import subprocess
@@ -401,3 +402,15 @@ def set_rng_state(state: Dict[str, Any]) -> None:
         if not torch.cuda.is_available() or torch.cuda.device_count() != len(state["cuda"]):
             raise ValueError("Checkpoint CUDA RNG state needs the same number of visible GPUs")
         torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+
+
+def setup_visible_cuda_devices(devices: Union[str, int, List[int]]) -> None:
+    if isinstance(devices, str):
+        if devices == "cpu":
+            devices = []
+        else:
+            assert devices == "all"
+            return
+    elif isinstance(devices, int):
+        devices = [devices]
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))

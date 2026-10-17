@@ -1,5 +1,5 @@
 import math
-from typing import Generator, List
+from typing import Callable, Dict, Generator, List
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +20,34 @@ def collate_segments_to_batch(segments: List[Segment]) -> Batch:
     else:
         raise ValueError("Cannot batch segments with and without task reward labels")
     return Batch(*stack, [s.info for s in segments], [s.id for s in segments], task_rew)
+
+
+def make_task_reward_collate(task_index: int, successor_observations: Dict[int, torch.Tensor]) -> Callable:
+    """Reward-model batches for one task: rew is that task's recorded reward (other labels
+    dropped), and the observation after an episode's last stored step (its final
+    observation, or the successor recorded at a milestone cut) fills the first right
+    padding, so that step keeps its true next frame. Source episodes are not modified."""
+
+    def collate(segments: List[Segment]) -> Batch:
+        batch = collate_segments_to_batch(segments)  # stacked copies
+        if batch.task_rew is None:
+            raise ValueError("Replay has no task reward labels")
+        batch.rew = batch.task_rew[..., task_index].clone()
+        batch.task_rew = None
+        for i, segment in enumerate(segments):
+            last = int(segment.mask_padding.nonzero().max())
+            if last + 1 == len(segment.mask_padding):
+                continue  # no right padding: the next frame is in the segment
+            if "final_observation" in segment.info:
+                batch.obs[i, last + 1] = segment.info["final_observation"]
+            elif segment.id.episode_id in successor_observations:
+                batch.obs[i, last + 1] = successor_observations[segment.id.episode_id]
+            else:
+                raise ValueError(f"No next observation for the last step of episode {segment.id.episode_id}")
+        batch.info = [{} for _ in segments]
+        return batch
+
+    return collate
 
 
 def collate_segments_without_rewards(segments: List[Segment]) -> Batch:

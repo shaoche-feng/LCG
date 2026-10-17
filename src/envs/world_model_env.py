@@ -49,9 +49,12 @@ class WorldModelEnv:
         cfg: WorldModelEnvConfig,
         return_denoising_trajectory: bool = False,
         return_imagined_candidate: bool = False,
+        sample_ends: bool = True,
     ) -> None:
         self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
         self.rew_end_model = rew_end_model
+        # False: use only the reward head; imagined episodes end by horizon truncation.
+        self.sample_ends = sample_ends
         self.horizon = cfg.horizon
         self.return_denoising_trajectory = return_denoising_trajectory
         self.return_imagined_candidate = return_imagined_candidate
@@ -151,6 +154,8 @@ class WorldModelEnv:
             (self.hx_rew_end, self.cx_rew_end),
         )
         rew = rew_out.squeeze(1)  # Predicted scalar reward used directly.
+        if not self.sample_ends:
+            return rew, torch.zeros(rew.shape, dtype=torch.long, device=rew.device)
         end = Categorical(logits=logits_end).sample().squeeze(1)
         return rew, end
 
