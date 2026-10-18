@@ -164,6 +164,9 @@ class DMControlEnv(gymnasium.Env):
     def _model_digest(self) -> str:
         return hashlib.sha256(pickle.dumps(self._dm_env.physics.model.ptr)).hexdigest()
 
+    def close(self) -> None:
+        self._dm_env.close()
+
     def _render(self) -> np.ndarray:
         return self._dm_env.physics.render(height=self.size, width=self.size, camera_id=self.camera_id)
 

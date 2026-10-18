@@ -34,7 +34,7 @@ TINY_DOWNSTREAM = [
     "agent.actor_critic.value_hidden_dims=[16]", "world_model_env.horizon=2", "world_model_env.num_batches_to_preload=1",
     "world_model_env.diffusion_sampler.num_steps_denoising=2", "rew_end_model.training.steps=4",
     "rew_end_model.training.batch_size=3", "rew_end_model.training.lr_warmup_steps=0",
-    "actor_critic.training.steps=3", "actor_critic.training.batch_size=2",
+    "actor_critic.training.steps=3", "actor_critic.training.batch_size=2", "evaluation.after_training=false",
 ]
 
 

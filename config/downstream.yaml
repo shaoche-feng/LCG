@@ -1,8 +1,10 @@
-# Downstream training on a frozen exploration milestone (Step 5, first increment):
-#   python src/downstream_main.py initialization.milestone_path=<run>/milestones/steps_N \
-#       downstream.task_name=walk downstream.seed=0
-# Outputs: <run>/downstream/steps_N/<task>/seed_<seed>/ (never overwritten).
-# Budgets below are placeholders; final values are undecided.
+# Downstream training on a frozen exploration milestone (Step 5):
+#   train:    python src/downstream_main.py initialization.milestone_path=<run>/milestones/steps_N \
+#                 downstream.task_name=walk downstream.seed=0
+#   resume:   the same command with downstream.mode=resume (same settings; the run folder may move)
+#   evaluate: the same command with downstream.mode=evaluate (a completed output's final policy)
+# Outputs: <run>/downstream/steps_N/<task>/seed_<seed>/ (never overwritten); training runs in
+# .seed_<seed>.tmp/ beside it. Budgets below are placeholders; final values are undecided.
 defaults:
   - _self_
   - env: dm_control  # env.train is replaced by the milestone's
@@ -22,6 +24,7 @@ initialization:
 downstream:
   task_name: ???
   seed: 0
+  mode: train  # train | resume | evaluate
 
 common:
   devices: 0  # GPU index or cpu
@@ -42,6 +45,17 @@ world_model_env:
     s_tmin: 0.0
     s_tmax: ${eval:'float("inf")'}
     s_noise: 1.0
+
+# Resumable checkpoints at completed updates, at the phase transition and at the end.
+checkpointing:
+  every: 100  # updates within a phase (null: only at the phase transition and the end)
+
+# Real-task evaluation of the final policy (deterministic actions; never trains or stores).
+evaluation:
+  after_training: True
+  seeds: [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010, 3011, 3012, 3013, 3014, 3015,
+          3016, 3017, 3018, 3019, 3020, 3021, 3022, 3023, 3024, 3025, 3026, 3027, 3028, 3029, 3030]  # 30-seed protocol
+  max_steps: 500  # environment steps per episode (x action_repeat control steps)
 
 # Phase 1: reward/end model on the selected task's recorded rewards.
 rew_end_model:
