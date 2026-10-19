@@ -388,7 +388,7 @@ def test_missing_milestones_republish_or_fail(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- incompatible restoration
 
 @pytest.mark.parametrize("change,match", [
-    (lambda s: s.pop("resume_format"), "saved before Step 4"),
+    (lambda s: s.pop("resume_format"), "resume state of format 2"),
     (lambda s: s["source"]["packages"].update(mujoco="0.0"), "package versions changed"),
     (lambda s: s["collection"]["env_config"].update(action_repeat=3), "different env.train config"),
     (lambda s: s["collection"].update(episode_ids=[0]), "not an unfinished episode"),

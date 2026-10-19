@@ -148,6 +148,7 @@ def make_collector(
             pbar.close()
             metrics = {
                 "num_steps": dataset.num_steps,
+                "new_env_steps": num_steps,  # env steps this collect, incl. discarded unfinished episodes
                 "counts/end_0": dataset.counts_end[0],
                 "counts/end_1": dataset.counts_end[1],
             }

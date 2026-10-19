@@ -39,6 +39,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self.task_names = None  # task labels shared by every episode, None if unlabeled
         self.versioned = True  # False for datasets saved before versions (`<id>.pt` files)
         self.file_sha256 = None  # checksum of each episode's current version file, taken when written
+        self.generation = 0  # clear(keep_files=True) count: new episode files go to a new folder
 
         self._directory = Path(directory).expanduser()
         self._name = name if name is not None else self._directory.stem
@@ -77,11 +78,15 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self.file_sha256 = []
         self._cache.clear()
 
-    def clear(self) -> None:
+    def clear(self, keep_files: bool = False) -> None:
+        """Empty the index. keep_files: leave the episode files (a saved index may still need
+        them; prune_versions removes them later) and write new ones to a new generation folder."""
         self.assert_not_static()
-        if self._directory.is_dir():
+        generation = self.generation + 1 if keep_files else 0
+        if not keep_files and self._directory.is_dir():
             shutil.rmtree(self._directory)
         self._reset()
+        self.generation = generation
 
     def load_episode(self, episode_id: int) -> Episode:
         if self._cache_in_ram and episode_id in self._cache:
@@ -145,6 +150,8 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         subfolders = "/".join([f"{x:0{n - i}d}" for i, x in enumerate(subfolders)])
         if not self.versioned:
             return self._directory / subfolders / f"{episode_id}.pt"
+        if self.generation:
+            subfolders = f"generation_{self.generation}/{subfolders}"
         return self._directory / subfolders / f"{episode_id}_{self.lengths[episode_id]}.pt"
 
     @property
@@ -174,6 +181,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         state_dict.setdefault("task_names", None)  # datasets saved before task labels existed
         state_dict.setdefault("versioned", False)  # datasets saved before episode versions
         state_dict.setdefault("file_sha256", [None] * state_dict["num_episodes"])
+        state_dict.setdefault("generation", 0)  # datasets saved before generations
         super().load_state_dict(state_dict)
         self._cache.clear()
 

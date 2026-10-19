@@ -54,6 +54,7 @@ class ExplorationTrainer(StateDictMixin):
     needs intrinsic_reward.enabled; "uniform" is the uniform-random baseline, which trains
     the denoiser only. Recorded task rewards stay in the dataset for downstream training;
     every exploration learner input has them removed (collate_segments_without_rewards).
+    Test diagnostics (evaluation.*, see test_diagnostics) only read them for return summaries.
     """
 
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
@@ -67,6 +68,11 @@ class ExplorationTrainer(StateDictMixin):
         if self._world_size != 1 or cfg.actor_critic.training.grad_acc_steps != 1:
             raise ValueError("Minimal PMPO supports one device and grad_acc_steps=1")
         seed = cfg.common.seed if cfg.common.seed is not None else torch.seed() % 10 ** 9
+        set_seed(seed)
+        # Test collection and diagnostics draw from their own RNG stream (saved in checkpoints),
+        # so they never shift the random numbers of training sampling and collection.
+        set_seed(int(np.random.SeedSequence([seed, 1]).generate_state(1)[0]))
+        self.test_rng = rng_state()
         set_seed(seed)
         torch.backends.cudnn.deterministic = True
 
@@ -101,6 +107,11 @@ class ExplorationTrainer(StateDictMixin):
         if keep_last is not None and keep_last < 1:
             raise ValueError(f"milestones.keep_last must be null or at least 1, got {keep_last}")
         check_collection_budget(cfg.collection.train)
+        self._should_test, collect_test = check_evaluation_config(cfg.evaluation)
+        self._collect_test = collect_test and not self._is_static_dataset  # static datasets never collect
+        if self._should_test and not collect_test and not self._is_static_dataset and not cfg.common.resume:
+            raise ValueError("evaluation.collect_test=false reuses the run's test dataset, but a new run has none; "
+                             "set evaluation.collect_test=true or evaluation.should=false")
         # Imagined episodes never truly end, so real ones must not either.
         if cfg.env.train.domain_name not in TIME_LIMIT_ONLY_DOMAINS:
             raise ValueError(f"Domain {cfg.env.train.domain_name!r} is not verified to end only at its time limit")
@@ -254,6 +265,8 @@ class ExplorationTrainer(StateDictMixin):
         self.epoch = 0
         self.num_epochs_collect = None
         self.num_episodes_test = 0
+        self.num_test_steps = 0  # environment steps of all fresh test collection, final included
+        self.final_test_done = False
         self.num_batch_train = CommonTools(0, None, 0)
         self.num_batch_test = CommonTools(0, None, 0)
         self.source = source_identity(root_dir)  # replaced by the checkpoint's on resume
@@ -266,7 +279,9 @@ class ExplorationTrainer(StateDictMixin):
         if cfg.common.resume:
             self.load_state_checkpoint()
             self._start_logs.append({"resume/from_epoch": self.epoch})
-        else:
+        if self._should_test and not self._collect_test:
+            self.check_reusable_test_dataset()
+        if not cfg.common.resume:
             self.save_checkpoint()
 
         if self._rank == 0:
@@ -333,15 +348,9 @@ class ExplorationTrainer(StateDictMixin):
             if self._pmpo_diagnostic is not None:
                 self._pmpo_diagnostic.finish_epoch(self.epoch, to_log, self.train_dataset.num_steps)
 
-            # Evaluation
-            should_test = self._rank == 0 and self._cfg.evaluation.should and (self.epoch % self._cfg.evaluation.every == 0)
-            should_collect_test = should_test and not self._is_static_dataset
-
-            if should_collect_test:
-                to_log += self.collect_test()
-
-            if should_test:
-                to_log += self.test_agent()
+            # Evaluation (test diagnostics)
+            if self._rank == 0 and self._should_test and self.epoch % self._cfg.evaluation.every == 0:
+                to_log += self.test_diagnostics()
 
             # Logging
             to_log.append({"duration": (time.time() - start_time) / 3600})
@@ -355,9 +364,11 @@ class ExplorationTrainer(StateDictMixin):
             if dist.is_initialized():
                 dist.barrier()
 
-        # Last collect
-        if self._rank == 0 and not self._is_static_dataset and self._pmpo_diagnostic is None:
-            wandb_log(self.collect_test(final=True), self.epoch)
+        # Final diagnostics, committed once: a resumed finished run does not repeat them.
+        if self._rank == 0 and self._should_test and self._pmpo_diagnostic is None and not self.final_test_done:
+            wandb_log(self.test_diagnostics(final=True), self.epoch)
+            self.final_test_done = True
+            self.save_checkpoint()
 
     def collect_initial_dataset(self) -> Tuple[int, Logs]:
         print("\nInitial collect\n")
@@ -392,7 +403,7 @@ class ExplorationTrainer(StateDictMixin):
         c = self._cfg.collection.test
         episodes = c.num_final_episodes if final else c.num_episodes
         td = self.test_dataset
-        td.clear()
+        td.clear(keep_files=True)  # the last checkpoint's test files are pruned after the next commit
         # Same action source as training collection: the baseline has no trained policy.
         mode = self._cfg.collection.train.mode
         to_log = self._test_collector.send(NumToCollect(episodes=episodes, mode=mode))
@@ -434,6 +445,45 @@ class ExplorationTrainer(StateDictMixin):
                 to_log += self.train_component(name, steps)
                 print(f"[TIMING] epoch={self.epoch} component={name} time={time.time() - t0:.2f}s", flush=True)
         return to_log
+
+    def test_diagnostics(self, final: bool = False) -> Logs:
+        """A scheduled (or the final) test diagnostic: collect fresh test episodes if
+        evaluation.collect_test, else reuse the test dataset; then the denoiser test loss on
+        reward-free batches, and per-task return summaries from the test episodes' recorded
+        task rewards. Uses the test RNG stream and restores module modes; no weights,
+        optimizers, schedules or training data change."""
+        td = self.test_dataset
+        training_rng = rng_state()
+        modes = {name: module.training for name, module in self.agent.named_modules()}
+        set_rng_state(self.test_rng)
+        try:
+            to_log, new_steps = [], 0
+            if self._collect_test:
+                to_log = self.collect_test(final)
+                new_steps = next(x[f"{td.name}/new_env_steps"] for x in to_log if f"{td.name}/new_env_steps" in x)
+            self.num_test_steps += new_steps
+            to_log += self.test_agent()
+            summary = dict(fresh=int(self._collect_test), num_episodes=td.num_episodes, num_steps=td.num_steps,
+                           new_env_steps=new_steps, total_new_env_steps=self.num_test_steps,
+                           **task_return_summary(td))
+            prefix = "final_test" if final else "test"
+            to_log.append({f"{prefix}/{k}": v for k, v in summary.items()})
+            print(f"{prefix}: {'fresh' if self._collect_test else 'reused'} test data, {summary}")
+        finally:
+            self.test_rng = rng_state()
+            set_rng_state(training_rng)
+            for name, module in self.agent.named_modules():
+                module.training = modes[name]
+        return to_log
+
+    def check_reusable_test_dataset(self) -> None:
+        """Reuse-only diagnostics need test episodes on disk; training replay is never used."""
+        td = self.test_dataset
+        if td.num_episodes == 0:
+            raise ValueError(f"evaluation.collect_test=false needs an existing test dataset, but {td.directory} is empty")
+        for path in td.episode_files():
+            if not path.is_file():
+                raise FileNotFoundError(f"Test dataset episode file {path} is missing")
 
     @torch.no_grad()
     def test_agent(self) -> Logs:
@@ -538,8 +588,8 @@ class ExplorationTrainer(StateDictMixin):
         # Checkpoints saved without a diagnostic carry no "pmpo_diagnostic" entry.
         state_dict = dict(state_dict)
         if state_dict.pop("resume_format", None) != RESUME_FORMAT:
-            raise ValueError("Checkpoint has no exploration resume state (saved before Step 4); "
-                             "it cannot be resumed faithfully. Start a new run.")
+            raise ValueError(f"Checkpoint has no exploration resume state of format {RESUME_FORMAT} (saved by "
+                             "older code); it cannot be resumed faithfully. Start a new run.")
         collection = state_dict.pop("collection")
         self._rng_to_restore = state_dict.pop("rng")
         diagnostic_state = state_dict.pop("pmpo_diagnostic", None)
@@ -671,10 +721,37 @@ class ExplorationTrainer(StateDictMixin):
         for path in self._path_milestones.glob("steps_*"):
             keep.update(referenced_files(path))
         self.train_dataset.prune_versions(keep)
+        # Earlier test collections' files: deleted only once this checkpoint no longer needs them.
+        self.test_dataset.prune_versions(set(self.test_dataset.episode_files()))
 
 
-# Bumped when the checkpoint contents needed for faithful resume change.
-RESUME_FORMAT = 1
+# Bumped when the checkpoint contents needed for faithful resume change (2: test RNG and counts).
+RESUME_FORMAT = 2
+
+
+def check_evaluation_config(e: DictConfig) -> Tuple[bool, bool]:
+    """Returns (diagnostics enabled, collect fresh test data). A missing collect_test means
+    True, the behaviour before the flag existed."""
+    should, collect = e.should, OmegaConf.select(e, "collect_test", default=True)
+    for name, value in (("should", should), ("collect_test", collect)):
+        if not isinstance(value, bool):
+            raise ValueError(f"evaluation.{name} must be true or false, got {value!r}")
+    if should and (isinstance(e.every, bool) or not isinstance(e.every, int) or e.every < 1):
+        raise ValueError(f"evaluation.every must be a positive integer, got {e.every!r}")
+    return should, collect
+
+
+def task_return_summary(dataset: Dataset) -> Dict[str, float]:
+    """Per-task episode returns (sum of each recorded task-reward column) of a test dataset:
+    mean, std, min, max. Read only for logging; never a learner input."""
+    if dataset.task_names is None or dataset.num_episodes == 0:
+        return {}
+    returns = np.stack([dataset.load_episode(i).task_rew.double().sum(0).numpy() for i in range(dataset.num_episodes)])
+    summary = {}
+    for task, r in zip(dataset.task_names, returns.T):
+        summary.update({f"return_{task}/mean": r.mean(), f"return_{task}/std": r.std(),
+                        f"return_{task}/min": r.min(), f"return_{task}/max": r.max()})
+    return {k: float(v) for k, v in summary.items()}
 
 
 def check_collection_budget(c: DictConfig) -> None:

@@ -154,7 +154,13 @@ def test_changing_task_rewards_does_not_change_exploration(tmp_path, monkeypatch
     rows = numeric_logs(logs_a)
     assert any("actor_critic/train/loss_actor" in row and "actor_critic/train/action_mean_0" in row for row in rows)
     assert any("denoiser/test/loss_denoising" in row for row in rows)
-    assert rows == numeric_logs(logs_b)  # losses, PMPO metrics, sampled actions
+    # Only the test return summaries (read from the labels for logging) may differ.
+    def without_returns(rows):
+        return [{k: v for k, v in row.items() if "/return_" not in k} for row in rows]
+    assert without_returns(rows) == without_returns(numeric_logs(logs_b))  # losses, PMPO metrics, sampled actions
+    returns = [[row["test/return_walk/mean"] for row in numeric_logs(logs) if "test/return_walk/mean" in row]
+               for logs in (logs_a, logs_b)]
+    assert returns[0] and returns[0] != returns[1]
 
 
 def test_exploration_learner_inputs_have_no_task_rewards(tmp_path, monkeypatch):

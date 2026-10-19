@@ -69,9 +69,14 @@ training:
   num_workers_data_loaders: 0
   compile_wm: True
 
+# Exploration test diagnostics (denoiser test loss, per-task test returns, test counts).
 evaluation:
-  should: True
-  every: 10
+  should: True  # False: no periodic or final test collection or diagnostics
+  every: 10  # epochs between diagnostics (positive integer); a final one follows training
+  # True: collect fresh test episodes (collection.test) before each diagnostic.
+  # False: reuse the existing test dataset, collecting nothing (it must be non-empty).
+  # Configs without this key use True (the earlier behaviour). Static datasets never collect.
+  collect_test: True
 
 world_model_env:
   _target_: envs.WorldModelEnvConfig
