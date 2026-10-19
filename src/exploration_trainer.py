@@ -100,6 +100,7 @@ class ExplorationTrainer(StateDictMixin):
         keep_last = cfg.milestones.keep_last
         if keep_last is not None and keep_last < 1:
             raise ValueError(f"milestones.keep_last must be null or at least 1, got {keep_last}")
+        check_collection_budget(cfg.collection.train)
         # Imagined episodes never truly end, so real ones must not either.
         if cfg.env.train.domain_name not in TIME_LIMIT_ONLY_DOMAINS:
             raise ValueError(f"Domain {cfg.env.train.domain_name!r} is not verified to end only at its time limit")
@@ -674,3 +675,18 @@ class ExplorationTrainer(StateDictMixin):
 
 # Bumped when the checkpoint contents needed for faithful resume change.
 RESUME_FORMAT = 1
+
+
+def check_collection_budget(c: DictConfig) -> None:
+    """The training-data budget (environment steps) must end exactly at num_steps_total:
+    first_epoch.min initial steps plus whole epochs of steps_per_epoch, each a multiple of
+    num_envs (a collect stops at the first multiple of num_envs reaching its target)."""
+    if not 0 < c.first_epoch.min <= c.num_steps_total:
+        raise ValueError(f"collection.train.first_epoch.min must be in (0, num_steps_total], got {c.first_epoch.min}")
+    for name, steps in (("first_epoch.min", c.first_epoch.min), ("steps_per_epoch", c.steps_per_epoch)):
+        if steps % c.steps_per_epoch or steps % c.num_envs:
+            raise ValueError(f"collection.train.{name}={steps} must be a multiple of steps_per_epoch "
+                             f"({c.steps_per_epoch}) and num_envs ({c.num_envs})")
+    if (c.num_steps_total - c.first_epoch.min) % c.steps_per_epoch:
+        raise ValueError(f"collection.train.num_steps_total={c.num_steps_total} minus first_epoch.min "
+                         f"must be a multiple of steps_per_epoch ({c.steps_per_epoch})")

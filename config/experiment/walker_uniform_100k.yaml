@@ -1,0 +1,39 @@
+# @package _global_
+# Step 6 uniform-random exploration baseline (ExplorationTrainer, no new code path).
+#
+#   python src/main.py +experiment=walker_uniform_100k common.devices=0 common.seed=0 \
+#       hydra.run.dir=outputs/<run name>
+# On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
+# scripts/resume.sh <run folder>. Any value below can be overridden on the command line.
+#
+# Training-data budget: 100,000 environment steps (policy actions), i.e. 200,000 simulator
+# control steps at action_repeat=2: 5,000 uniform initial steps, then 190 epochs of 500
+# uniform steps. Test collection (evaluation.*, collection.test.*) is extra and separate.
+# Denoiser schedule and milestones keep the repository defaults; they must be identical
+# across exploration methods once agreed.
+
+env:
+  train:
+    domain_name: walker
+    task_names: [stand, walk, run]
+
+collection:
+  train:
+    num_envs: 1
+    first_epoch:
+      min: 5000
+      mode: uniform  # independent uniform actions; the policy is never evaluated
+    mode: uniform
+    steps_per_epoch: 500
+    num_steps_total: 100000
+
+intrinsic_reward:
+  enabled: false  # no LCG scorer, no PMPO updates (uniform baseline)
+
+common:
+  seed: 0
+
+wandb:
+  mode: online
+  project: lcg-reward-free
+  name: walker-uniform-100k
