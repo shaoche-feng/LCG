@@ -262,7 +262,10 @@ class PMPORunDiagnostic:
     def observe(self, row):
         """Fold one finite row into the stop-rule history; return the stop reason, if any."""
         reason = None
-        if max(row["alpha_max"], row["beta_max"]) > 1e4:
+        # Beta-concentration rules apply only to the Beta actor (the tanh-Gaussian experiment logs
+        # pretanh_* parameters instead); every other stop rule applies to both.
+        beta_actor = "alpha_max" in row
+        if beta_actor and max(row["alpha_max"], row["beta_max"]) > 1e4:
             reason = "Beta concentration exceeded 10000"
         if row["kl_prior"] > 10:
             reason = "Policy KL exceeded 10 nats"
@@ -282,7 +285,7 @@ class PMPORunDiagnostic:
         entropy = (row["policy_entropy"] - width_log) / len(self.model.action_low)
         if entropy < -5:
             reason = "Canonical differential entropy per dimension below -5 nats"
-        if (self.previous_entropy_per_dim is not None and entropy < self.previous_entropy_per_dim - 2
+        if (beta_actor and self.previous_entropy_per_dim is not None and entropy < self.previous_entropy_per_dim - 2
                 and max(row["alpha_mean"], row["beta_mean"]) > 100):
             reason = "Abrupt entropy collapse with mean concentration above 100"
         self.boundary_streak, self.constant_streak = boundary_streak, constant_streak
@@ -365,7 +368,10 @@ class PMPORunDiagnostic:
         if not rows:
             raise DiagnosticStop("Epoch had no PMPO updates")
         aggregate = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
-        for name in ("alpha", "beta"):
+        # Epoch extremes of the actor's distribution parameters: Beta (alpha, beta) or, for the
+        # tanh-Gaussian experiment, the pre-tanh mean and std.
+        parameters = ("alpha", "beta") if "alpha_min" in rows[0] else ("pretanh_mean", "pretanh_std")
+        for name in parameters:
             aggregate[f"{name}_min"] = min(r[f"{name}_min"] for r in rows)
             aggregate[f"{name}_max"] = max(r[f"{name}_max"] for r in rows)
         global_update = self.model.updates.item()

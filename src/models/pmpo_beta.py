@@ -2,13 +2,14 @@
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from contextlib import contextmanager
+import math
 import random
 from typing import List, Optional
 
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import Beta, kl_divergence
+from torch.distributions import Beta, Normal, kl_divergence
 from torch.nn import functional as F
 
 from .actor_critic import ActorCriticEncoder, ActorCriticOutput, compute_lambda_returns
@@ -39,6 +40,13 @@ class PMPOBetaConfig:
     # L_PMPO + beta_kl * KL - entropy_coef * H(pi). 0.0 (default) exactly
     # reproduces the frozen 100k baseline; no other term changes with it.
     entropy_coef: float = 0.0
+    # Experiment (stage3-gaussian-seed1): actor distribution. "beta" (default) is the unchanged
+    # Beta actor. "tanh_gaussian" is the Gaussian-PMPO experiment (not an exact DreamerV3
+    # implementation): a diagonal Gaussian over pre-tanh actions with
+    # std = 0.1 + 0.9 * sigmoid(raw_std), squashed by tanh and mapped affinely to the action
+    # bounds. The std floor applies before tanh; it does not guarantee a minimum spread of
+    # environment actions. The sign-only PMPO objective is unchanged.
+    actor_distribution: str = "beta"
     # Matches config/agent/pmpo_beta.yaml; saved configs always state their own value.
     prior_refresh_interval: int = 500
     # Diagnosis-only knob (see docs/pmpo_beta/k4_implementation.md): when True, the prior is
@@ -51,6 +59,20 @@ class PMPOBetaConfig:
     max_grad_norm: float = 10.0
     seed: int = 0
     log_diagnostics: bool = False
+
+
+GAUSSIAN_STD_MIN, GAUSSIAN_STD_SPAN = 0.1, 0.9
+# Actions are stored as float32 in environment units, so tanh values closer to +-1 than this
+# cannot be inverted faithfully (|pre-tanh| > ~8.4). Scoring evaluates such actions at the
+# nearest invertible pre-image -- still with the full transformed density, never as an
+# untransformed Gaussian -- and diagnostics log how often this happens.
+TANH_INVERSE_LIMIT = 1 - 1e-7
+GAUSS_HERMITE_NODES = 32
+
+
+def log1m_tanh_sq(x):
+    """log(1 - tanh(x)^2), numerically stable for large |x|."""
+    return 2 * (math.log(2) - x - F.softplus(-2 * x))
 
 
 def require_finite(**tensors):
@@ -125,6 +147,14 @@ class PMPOBeta(nn.Module):
             raise ValueError("Concentration floor, learning rates and gradient clip must be positive")
         if cfg.beta_kl < 0 or cfg.entropy_coef < 0 or cfg.prior_refresh_interval < 1 or cfg.imagination_horizon < 1:
             raise ValueError("Invalid KL/entropy coefficient or rollout/block length")
+        if cfg.actor_distribution not in ("beta", "tanh_gaussian"):
+            raise ValueError(f"Unknown actor distribution {cfg.actor_distribution!r}")
+        # Gauss-Hermite rule for expectations under the pre-tanh Gaussian (entropy Jacobian term,
+        # transformed action spread): deterministic, differentiable, consumes no RNG. Non-persistent,
+        # so state_dicts and checkpoints are unchanged.
+        nodes, weights = np.polynomial.hermite.hermgauss(GAUSS_HERMITE_NODES)
+        self.register_buffer("_gh_nodes", torch.tensor(nodes * math.sqrt(2), dtype=torch.float32), persistent=False)
+        self.register_buffer("_gh_weights", torch.tensor(weights / math.sqrt(math.pi), dtype=torch.float32), persistent=False)
         self.register_buffer("action_low", low.float())
         self.register_buffer("action_high", high.float())
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
@@ -177,8 +207,16 @@ class PMPOBeta(nn.Module):
                 random.setstate(py_state)
                 np.random.set_state(np_state)
 
+    @property
+    def gaussian(self):
+        return self.cfg.actor_distribution == "tanh_gaussian"
+
     def distribution(self, raw):
+        """Beta over unit actions, or (tanh_gaussian) the Normal over PRE-tanh actions."""
         require_finite(raw_parameters=raw)
+        if self.gaussian:
+            mu, raw_std = raw.chunk(2, dim=-1)
+            return Normal(mu, GAUSSIAN_STD_MIN + GAUSSIAN_STD_SPAN * torch.sigmoid(raw_std))
         a, b = (F.softplus(raw) + self.cfg.concentration_min).chunk(2, dim=-1)
         return Beta(a, b)
 
@@ -188,14 +226,46 @@ class PMPOBeta(nn.Module):
 
     def sample_action(self, raw, deterministic=False):
         dist = self.distribution(raw)
-        unit = dist.mean if deterministic else dist.sample()
+        if self.gaussian:
+            # Deterministic evaluation rule: tanh(mu), the transformed Gaussian MEAN, mapped to the
+            # bounds. This is a rule, not the expectation of the transformed distribution.
+            pre_tanh = dist.mean if deterministic else dist.sample()
+            unit = (torch.tanh(pre_tanh) + 1) / 2
+        else:
+            unit = dist.mean if deterministic else dist.sample()
         return self.to_environment(unit).detach()
+
+    def pre_tanh_from_unit(self, unit):
+        """Invert unit = (tanh(x) + 1) / 2 in float64 (see TANH_INVERSE_LIMIT)."""
+        canonical = (2 * unit.double() - 1).clamp(-TANH_INVERSE_LIMIT, TANH_INVERSE_LIMIT)
+        return torch.atanh(canonical).to(unit.dtype)
+
+    def gauss_hermite_expectation(self, dist, fn):
+        """E[fn(X)] per element for X ~ dist (Normal), by Gauss-Hermite quadrature; differentiable."""
+        x = dist.mean.unsqueeze(-1) + dist.stddev.unsqueeze(-1) * self._gh_nodes
+        return (fn(x) * self._gh_weights).sum(-1)
+
+    def entropy_per_dim(self, dist):
+        """Differential entropy of the ENVIRONMENT action, per dimension."""
+        width = self.action_high - self.action_low
+        if self.gaussian:
+            # H(a) = H(x) + E[log |da/dx|], da/dx = (1 - tanh(x)^2) * width / 2.
+            return dist.entropy() + self.gauss_hermite_expectation(dist, log1m_tanh_sq) + (width / 2).log()
+        return dist.entropy() + width.log()
 
     def log_prob_and_entropy(self, raw, action):
         width = self.action_high - self.action_low
         unit = (action.detach() - self.action_low) / width
         if ((unit < 0) | (unit > 1)).any():
             raise ValueError("Stored action outside environment bounds")
+        if self.gaussian:
+            dist = self.distribution(raw)
+            pre_tanh = self.pre_tanh_from_unit(unit)
+            # Change of variables: log p(a) = log N(x) - log(1 - tanh(x)^2) - log(width / 2).
+            logp = (dist.log_prob(pre_tanh) - log1m_tanh_sq(pre_tanh) - (width / 2).log()).sum(-1)
+            entropy = self.entropy_per_dim(dist).sum(-1)
+            require_finite(log_probability=logp, entropy=entropy)
+            return logp, entropy
         # Affine float32 roundoff can land exactly on an endpoint. Only move the
         # argument inside numerical support; never clamp log probabilities.
         eps = torch.finfo(unit.dtype).eps
@@ -289,8 +359,7 @@ class PMPOBeta(nn.Module):
                            value_target_correlation=correlation,
                            value_bias=(values.detach() - targets.flatten()).mean(),
                            value_abs_max=values.detach().abs().max(), return_abs_max=targets.abs().max())
-            width = self.action_high - self.action_low
-            per_dim_entropy = dist.entropy().detach() + width.log()
+            per_dim_entropy = self.entropy_per_dim(dist).detach()
             for d in range(per_dim_entropy.shape[-1]):
                 metrics[f"policy_entropy_dim_{d}"] = per_dim_entropy[:, d].mean()
             frames = flat_obs.reshape(-1, self.frame_stack, self.cfg.img_channels, self.cfg.img_size, self.cfg.img_size)
@@ -311,12 +380,32 @@ class PMPOBeta(nn.Module):
     @torch.no_grad()
     def diagnostics(self, raw, actions, logp=None, entropy=None):
         dist = self.distribution(raw)
-        unit = (actions - self.action_low) / (self.action_high - self.action_low)
+        width = self.action_high - self.action_low
+        unit = (actions - self.action_low) / width
         metrics = {}
-        for name, param in (("alpha", dist.concentration1), ("beta", dist.concentration0)):
-            metrics.update(summary_statistics(param, name))
-            metrics[f"{name}_near_floor_fraction"] = (param < self.cfg.concentration_min + 0.01).float().mean()
-        means = self.to_environment(dist.mean)
+        # Per-state stochastic spread (instrumentation; analytic or quadrature, consumes no RNG):
+        # each state's conditional action variance in environment units, averaged over states
+        # before the square root. Distinct from policy_mean_state_std_* (variation of mean actions
+        # across states) and action_std_* (spread of sampled actions overall).
+        if self.gaussian:
+            metrics.update(summary_statistics(dist.mean, "pretanh_mean"))
+            metrics.update(summary_statistics(dist.stddev, "pretanh_std"))
+            metrics["pretanh_std_near_floor_fraction"] = (dist.stddev < GAUSSIAN_STD_MIN + 0.01).float().mean()
+            metrics["pretanh_mean_abs_gt_3_fraction"] = (dist.mean.abs() > 3).float().mean()
+            metrics["tanh_inverse_limited_fraction"] = ((2 * unit.double() - 1).abs() > TANH_INVERSE_LIMIT).float().mean()
+            m1 = self.gauss_hermite_expectation(dist, torch.tanh)
+            m2 = self.gauss_hermite_expectation(dist, lambda x: torch.tanh(x) ** 2)
+            conditional_var = (m2 - m1 ** 2).clamp_min(0) * (width / 2) ** 2
+            means = self.to_environment((torch.tanh(dist.mean) + 1) / 2)  # deterministic evaluation actions
+        else:
+            for name, param in (("alpha", dist.concentration1), ("beta", dist.concentration0)):
+                metrics.update(summary_statistics(param, name))
+                metrics[f"{name}_near_floor_fraction"] = (param < self.cfg.concentration_min + 0.01).float().mean()
+            a, b = dist.concentration1, dist.concentration0
+            conditional_var = a * b / ((a + b) ** 2 * (a + b + 1)) * width ** 2
+            means = self.to_environment(dist.mean)
+        for d in range(actions.shape[-1]):
+            metrics[f"policy_conditional_std_{d}"] = conditional_var[:, d].mean().sqrt()
         for d in range(actions.shape[-1]):
             metrics[f"action_mean_{d}"] = actions[:, d].mean()
             metrics[f"action_std_{d}"] = actions[:, d].std(unbiased=False)
