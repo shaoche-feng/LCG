@@ -31,11 +31,20 @@ theta_s:
     - "norm_out.*"
     - "conv_out.*"
   exclude: []
+  # Optional guards: fail if the selection does not have exactly this many tensors/scalars.
+  expected_num_tensors: null
+  expected_dim: null
 
 precision_reference_size: 320
 precision_num_mc: 3
 damping: 1e-4
 beta: 1.0
+
+# Policy reward from raw LCG scores: rms (RunningRMS below), fixed (raw / fixed_divisor, no
+# running statistics, centering or clipping) or none. Must agree with rms_enabled (true only
+# for rms); a config without reward_scaling means rms if rms_enabled else none.
+reward_scaling: rms
+fixed_divisor: null
 
 rms_enabled: True
 rms_alpha: 1.0

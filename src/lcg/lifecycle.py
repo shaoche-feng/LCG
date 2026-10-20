@@ -1,4 +1,6 @@
 from dataclasses import dataclass, field
+import math
+import time
 from typing import Dict, Optional
 
 import torch
@@ -27,9 +29,28 @@ class LCGConfig:
     rms_alpha: float = 1.0
     rms_ema_decay: float = 0.99
     rms_eps: float = 1e-8
+    # Policy reward from the raw LCG score: "rms" (RunningRMS), "fixed" (raw / fixed_divisor,
+    # nothing else) or "none" (raw). None: the meaning before this field existed, i.e. "rms"
+    # if rms_enabled else "none". An explicit mode must agree with rms_enabled.
+    reward_scaling: Optional[str] = None
+    fixed_divisor: Optional[float] = None
     theta_s: ThetaSConfig = field(kw_only=True)  # which parameters belong to theta_S -- see config/intrinsic_reward/lcg.yaml
 
     def __post_init__(self) -> None:
+        legacy = "rms" if self.rms_enabled else "none"
+        if self.reward_scaling is None:
+            self.reward_scaling = legacy
+        if self.reward_scaling not in REWARD_SCALINGS:
+            raise ValueError(f"reward_scaling must be one of {REWARD_SCALINGS}, got {self.reward_scaling!r}")
+        if (self.reward_scaling == "rms") != bool(self.rms_enabled):
+            raise ValueError(f"reward_scaling={self.reward_scaling} conflicts with rms_enabled={self.rms_enabled}; "
+                             f"set rms_enabled={self.reward_scaling == 'rms'}")
+        if self.reward_scaling == "fixed":
+            d = self.fixed_divisor
+            if isinstance(d, bool) or not isinstance(d, (int, float)) or not math.isfinite(d) or d <= 0:
+                raise ValueError(f"fixed_divisor must be a finite positive number, got {d!r}")
+        elif self.fixed_divisor is not None:
+            raise ValueError(f"fixed_divisor is used only with reward_scaling=fixed, got {self.fixed_divisor!r}")
         assert self.precision_reference_size > 0, (
             f"precision_reference_size must be > 0, got {self.precision_reference_size}"
         )
@@ -44,6 +65,18 @@ class LCGConfig:
             assert self.rms_alpha > 0, f"rms_alpha must be > 0, got {self.rms_alpha}"
             assert 0.0 <= self.rms_ema_decay < 1.0, f"rms_ema_decay must be in [0, 1), got {self.rms_ema_decay}"
             assert self.rms_eps > 0, f"rms_eps must be > 0, got {self.rms_eps}"
+
+    def reward_scaling_settings(self) -> Dict:
+        """What turns raw LCG scores into policy reward; a resume must not change it."""
+        settings = dict(mode=self.reward_scaling)
+        if self.reward_scaling == "fixed":
+            settings["fixed_divisor"] = float(self.fixed_divisor)
+        if self.reward_scaling == "rms":
+            settings.update(alpha=self.rms_alpha, ema_decay=self.rms_ema_decay, eps=self.rms_eps)
+        return settings
+
+
+REWARD_SCALINGS = ("rms", "fixed", "none")
 
 
 class LCGLifecycle:
@@ -76,6 +109,11 @@ class LCGLifecycle:
         self.bank = None
         self.rms: Optional[RunningRMS] = None
         self.intrinsic_reward_fn = None
+        # Monitoring only: the last scored batch (raw and policy reward) and timings.
+        self.last_raw: Optional[Tensor] = None
+        self.last_scaled: Optional[Tensor] = None
+        self.precision_seconds = 0.0
+        self.scoring_seconds = 0.0
 
     def refresh(self, denoiser: Denoiser, dataset: Dataset, round_identifier: int) -> None:
         assert self.cfg.enabled
@@ -110,11 +148,14 @@ class LCGLifecycle:
         frozen_named = self._frozen_named
         params = list(theta_s_named.values())
 
+        start = _synchronized_time(self.device)
         self.h_D = historical_precision(
             denoiser, params, dataset, self.sigma_cfg,
             B=self.cfg.precision_reference_size, N=dataset.num_steps, num_mc=self.cfg.precision_num_mc,
             beta=self.cfg.beta, damping=self.cfg.damping, seed=seed,
         )
+        self.precision_seconds = _synchronized_time(self.device) - start
+        self.scoring_seconds = 0.0
         assert_setup_valid(theta_s_named, self.h_D, d_S=self._theta_s_dim)
         self.h_D_inv_sqrt = self.h_D.rsqrt()  # fixed for the whole round -- computed once, not per AC scoring call
 
@@ -127,10 +168,12 @@ class LCGLifecycle:
             denoiser, theta_s_named, frozen_named, self.h_D_inv_sqrt, self.bank, chunk_size=self.cfg.candidate_chunk_size,
         )
 
-        self.rms = RunningRMS(RunningRMSConfig(
-            enabled=self.cfg.rms_enabled, alpha=self.cfg.rms_alpha,
-            ema_decay=self.cfg.rms_ema_decay, eps=self.cfg.rms_eps,
-        ))
+        self.rms = None
+        if self.cfg.reward_scaling == "rms":
+            self.rms = RunningRMS(RunningRMSConfig(
+                enabled=True, alpha=self.cfg.rms_alpha,
+                ema_decay=self.cfg.rms_ema_decay, eps=self.cfg.rms_eps,
+            ))
 
         print(
             f"[LCG] round={self.round_id} refresh: N={dataset.num_steps} "
@@ -139,7 +182,26 @@ class LCGLifecycle:
         )
 
         def hook(infos, env_rew):
+            start = _synchronized_time(self.device)
             raw = base_hook(infos, env_rew)
-            return self.rms(raw)
+            self.scoring_seconds += _synchronized_time(self.device) - start
+            reward = self.scale(raw)
+            self.last_raw, self.last_scaled = raw.detach(), reward.detach()
+            return reward
 
         self.intrinsic_reward_fn = hook
+
+    def scale(self, raw: Tensor) -> Tensor:
+        """Policy reward from raw LCG scores. fixed: raw / fixed_divisor only -- no running
+        statistics, centering or clipping; the same divisor for every batch and epoch."""
+        if self.cfg.reward_scaling == "fixed":
+            return raw / self.cfg.fixed_divisor
+        if self.cfg.reward_scaling == "rms":
+            return self.rms(raw)
+        return raw
+
+
+def _synchronized_time(device: torch.device) -> float:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()

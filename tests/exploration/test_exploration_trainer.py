@@ -129,7 +129,8 @@ def write_static_dataset(root, reward_scale):
 def numeric_logs(logs):
     rows = []
     for row in logs:
-        rows.append({k: float(v) for k, v in row.items() if k != "duration" and np.ndim(v) == 0})
+        rows.append({k: float(v) for k, v in row.items()
+                     if k != "duration" and not k.startswith("timing/") and np.ndim(v) == 0})
     return rows
 
 

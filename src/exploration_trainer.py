@@ -20,8 +20,8 @@ from coroutines.collector import COLLECTION_MODES, CollectorState, make_collecto
 from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
 from data.milestone import milestone_name, publish_milestone, referenced_files
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
-from lcg import LCGLifecycle
-from models.pmpo_beta import PMPOOptimizers
+from lcg import LCGLifecycle, selected_named_parameters
+from models.pmpo_beta import PMPOOptimizers, summary_statistics
 from pmpo_diagnostic import PMPORunDiagnostic
 from utils import (
     broadcast_if_needed,
@@ -252,8 +252,11 @@ class ExplorationTrainer(StateDictMixin):
 
         # LCG intrinsic-reward lifecycle, the only exploration scorer (learned exploration).
         self._lcg_lifecycle = None
+        self._lcg_reward_scaling = None
         if self._learned_exploration:
             lcg_cfg = instantiate(cfg.intrinsic_reward)
+            selected_named_parameters(self.agent.denoiser, lcg_cfg.theta_s)  # fail now on a wrong theta_S, not at epoch 1
+            self._lcg_reward_scaling = lcg_cfg.reward_scaling_settings()
             self._lcg_lifecycle = LCGLifecycle(
                 lcg_cfg, sigma_distribution_cfg,
                 img_channels=cfg.agent.denoiser.inner_model.img_channels,
@@ -435,16 +438,45 @@ class ExplorationTrainer(StateDictMixin):
             cfg = getattr(self._cfg, name).training
             if self.epoch > cfg.start_after_epochs:
                 if name == "actor_critic":
+                    if self._use_cuda:
+                        torch.cuda.reset_peak_memory_stats(self._device)
+                    t_refresh = time.time()
                     # Refresh the intrinsic scorer on this epoch's denoiser, then rewire the
                     # PMPO hook. The round seed is the checkpointed epoch, so a resumed run
                     # continues the seed sequence (the lifecycle itself is not checkpointed).
                     self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
                     self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
+                    t_refresh = time.time() - t_refresh
                 steps = cfg.steps_first_epoch if self.epoch == 1 else cfg.steps_per_epoch
                 t0 = time.time()
                 to_log += self.train_component(name, steps)
+                if self._use_cuda:
+                    torch.cuda.synchronize(self._device)
                 print(f"[TIMING] epoch={self.epoch} component={name} time={time.time() - t0:.2f}s", flush=True)
+                if name == "actor_critic":
+                    lcg = self._lcg_lifecycle
+                    # Wall-clock monitoring (timing/*), not compared between runs.
+                    timing = {"timing/lcg_refresh_seconds": t_refresh, "timing/lcg_precision_seconds": lcg.precision_seconds,
+                              "timing/lcg_scoring_seconds": lcg.scoring_seconds,
+                              "timing/pmpo_update_seconds": time.time() - t0, "timing/pmpo_updates": steps}
+                    if self._use_cuda:
+                        timing["timing/gpu_peak_allocated_gb"] = torch.cuda.max_memory_allocated(self._device) / 2 ** 30
+                        timing["timing/gpu_peak_reserved_gb"] = torch.cuda.max_memory_reserved(self._device) / 2 ** 30
+                    print(f"[TIMING] epoch={self.epoch} {timing}", flush=True)
+                    to_log.append(timing)
         return to_log
+
+    def lcg_reward_metrics(self) -> Dict[str, Any]:
+        """Raw LCG scores and the policy reward (after scaling) of the last PMPO update."""
+        lcg = self._lcg_lifecycle
+        if lcg is None or lcg.last_raw is None:
+            return {}
+        metrics = {}
+        for prefix, values in (("lcg_raw_reward", lcg.last_raw), ("lcg_policy_reward", lcg.last_scaled)):
+            values = values.float()
+            metrics.update(summary_statistics(values, prefix))
+            metrics[f"{prefix}_p99"] = torch.quantile(values.flatten(), 0.99)
+        return metrics
 
     def test_diagnostics(self, final: bool = False) -> Logs:
         """A scheduled (or the final) test diagnostic: collect fresh test episodes if
@@ -510,6 +542,7 @@ class ExplorationTrainer(StateDictMixin):
                 loss, metrics = model()
                 loss.backward()
                 metrics.update(opt.step())
+                metrics.update(self.lcg_reward_metrics())
                 if self._pmpo_diagnostic is not None:
                     self._pmpo_diagnostic.check_update(metrics, self.epoch, self.num_batch_train.actor_critic,
                                                        real_steps=self.train_dataset.num_steps)
@@ -580,6 +613,7 @@ class ExplorationTrainer(StateDictMixin):
         if self._pmpo_diagnostic is not None:
             state["pmpo_diagnostic"] = self._pmpo_diagnostic.state_dict()
         state["resume_format"] = RESUME_FORMAT
+        state["lcg_reward_scaling"] = self._lcg_reward_scaling
         state["collection"] = self.collection_state()
         state["rng"] = rng_state()
         return state
@@ -591,6 +625,10 @@ class ExplorationTrainer(StateDictMixin):
             raise ValueError(f"Checkpoint has no exploration resume state of format {RESUME_FORMAT} (saved by "
                              "older code); it cannot be resumed faithfully. Start a new run.")
         collection = state_dict.pop("collection")
+        scaling = state_dict.pop("lcg_reward_scaling")
+        if scaling != self._lcg_reward_scaling:
+            raise ValueError(f"Checkpoint was trained with LCG reward scaling {scaling}, the config now gives "
+                             f"{self._lcg_reward_scaling}; a resume must not switch it")
         self._rng_to_restore = state_dict.pop("rng")
         diagnostic_state = state_dict.pop("pmpo_diagnostic", None)
         check_same_packages(state_dict["source"])
@@ -725,8 +763,9 @@ class ExplorationTrainer(StateDictMixin):
         self.test_dataset.prune_versions(set(self.test_dataset.episode_files()))
 
 
-# Bumped when the checkpoint contents needed for faithful resume change (2: test RNG and counts).
-RESUME_FORMAT = 2
+# Bumped when the checkpoint contents needed for faithful resume change (2: test RNG and
+# counts; 3: LCG reward scaling settings).
+RESUME_FORMAT = 3
 
 
 def check_evaluation_config(e: DictConfig) -> Tuple[bool, bool]:

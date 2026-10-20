@@ -349,7 +349,8 @@ def test_fresh_resume_matches_uninterrupted_and_keeps_committed_test_files(tmp_p
         assert torch.equal(x.obs, y.obs) and torch.equal(x.task_rew, y.task_rew)
 
     def after_1(logs):
-        return [(e, {k: v for k, v in r.items() if k != "duration" and np.ndim(v) == 0}) for e, r in logs
+        return [(e, {k: v for k, v in r.items() if k != "duration" and not k.startswith("timing/") and np.ndim(v) == 0})
+                for e, r in logs
                 if e > 1 and not any(k.startswith("resume/") for k in r)]
 
     assert repr(after_1(logs_full)) == repr(after_1(logs_resumed))

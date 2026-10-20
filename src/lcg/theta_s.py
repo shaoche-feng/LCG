@@ -1,6 +1,6 @@
 import fnmatch
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,9 @@ from models.diffusion.denoiser import Denoiser
 class ThetaSConfig:
     include: Tuple[str, ...]
     exclude: Tuple[str, ...] = ()
+    # Optional guards: the selection must have exactly this many tensors / scalars.
+    expected_num_tensors: Optional[int] = None
+    expected_dim: Optional[int] = None
 
 
 def selected_named_parameters(denoiser: Denoiser, cfg: ThetaSConfig) -> Dict[str, nn.Parameter]:
@@ -33,6 +36,13 @@ def selected_named_parameters(denoiser: Denoiser, cfg: ThetaSConfig) -> Dict[str
         raise ValueError(
             "Theta-S selection is empty after applying include/exclude patterns "
             f"(include={cfg.include!r}, exclude={cfg.exclude!r})."
+        )
+    num_tensors, dim = len(selected), sum(p.numel() for p in selected.values())
+    expected = (cfg.expected_num_tensors, cfg.expected_dim)
+    if expected[0] is not None and num_tensors != expected[0] or expected[1] is not None and dim != expected[1]:
+        raise ValueError(
+            f"Theta-S selection (include={list(cfg.include)!r}) has {num_tensors} tensors and {dim} scalars, "
+            f"expected {expected[0]} tensors and {expected[1]} scalars: {list(selected)}"
         )
     return selected
 
