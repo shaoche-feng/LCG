@@ -23,6 +23,9 @@ actor_critic:
   # term at all -- see the plateau/over-concentration investigation on
   # branch pmpo-beta-continuous). 0.0 is bit-identical to the baseline actor loss.
   entropy_coef: 0.01
+  # Experiment (stage3-weighted-beta-seed1): "sign" (default) is the original sign-only raw
+  # PMPO loss; "abs_advantage" weights log-probabilities by |advantage| (see pmpo_loss).
+  pmpo_weighting: sign
   # Snapshot before updates 0,500,1000,...; held fixed for 500 fresh-rollout updates.
   # A moving prior refreshed every 10 updates was validated to collapse (beta
   # concentration runaway, entropy collapse, action-boundary drift, near-state-

@@ -39,6 +39,12 @@ class PMPOBetaConfig:
     # L_PMPO + beta_kl * KL - entropy_coef * H(pi). 0.0 (default) exactly
     # reproduces the frozen 100k baseline; no other term changes with it.
     entropy_coef: float = 0.0
+    # Experiment (stage3-weighted-beta-seed1): raw PMPO loss weighting. "sign" (default) is the
+    # original sign-only loss, unchanged. "abs_advantage" multiplies each log-probability by
+    # |detached advantage| and keeps the original per-group sample-count denominators: no
+    # normalization by the weight sum or batch std, no clipping, no dead zone. KL and entropy
+    # coefficients are unchanged, so this also changes PMPO's strength relative to those terms.
+    pmpo_weighting: str = "sign"
     # Matches config/agent/pmpo_beta.yaml; saved configs always state their own value.
     prior_refresh_interval: int = 500
     # Diagnosis-only knob (see docs/pmpo_beta/k4_implementation.md): when True, the prior is
@@ -67,17 +73,24 @@ def summary_statistics(values, prefix):
                 (values.mean(), values.std(unbiased=False), values.min(), values.max(), *quantiles))}
 
 
-def pmpo_loss(log_prob, advantage, alpha=0.5):
+def pmpo_loss(log_prob, advantage, alpha=0.5, weighting="sign"):
     """Eq. 11: (1-alpha) mean_negative(log pi) - alpha mean_positive(log pi).
 
     Empty groups contribute zero, without renormalizing the surviving weight.
-    Exactly zero belongs to the positive group. No magnitude weighting.
+    Exactly zero belongs to the positive group. weighting="sign": no magnitude weighting
+    (original). weighting="abs_advantage" (experiment): each log-probability is multiplied
+    by |detached advantage| before the same per-group sums and sample-count denominators,
+    so exactly zero advantages contribute zero.
     """
     if log_prob.shape != advantage.shape or not 0 <= alpha <= 1 or not log_prob.numel():
         raise ValueError("Invalid PMPO shapes, empty batch, or mixing coefficient")
+    if weighting not in ("sign", "abs_advantage"):
+        raise ValueError(f"Unknown PMPO weighting {weighting!r}")
     require_finite(log_prob=log_prob, advantage=advantage)
     positive = advantage.detach() >= 0
     negative = ~positive
+    if weighting == "abs_advantage":
+        log_prob = advantage.detach().abs() * log_prob
     pos = log_prob.masked_fill(~positive, 0).sum() / positive.sum().clamp_min(1)
     neg = log_prob.masked_fill(~negative, 0).sum() / negative.sum().clamp_min(1)
     return (1 - alpha) * neg - alpha * pos
@@ -125,6 +138,8 @@ class PMPOBeta(nn.Module):
             raise ValueError("Concentration floor, learning rates and gradient clip must be positive")
         if cfg.beta_kl < 0 or cfg.entropy_coef < 0 or cfg.prior_refresh_interval < 1 or cfg.imagination_horizon < 1:
             raise ValueError("Invalid KL/entropy coefficient or rollout/block length")
+        if cfg.pmpo_weighting not in ("sign", "abs_advantage"):
+            raise ValueError(f"Unknown PMPO weighting {cfg.pmpo_weighting!r}")
         self.register_buffer("action_low", low.float())
         self.register_buffer("action_high", high.float())
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
@@ -256,7 +271,7 @@ class PMPOBeta(nn.Module):
             # actor_loss, computed fully detached so it cannot perturb the main graph.
             kl_initial = kl_divergence(self.distribution(raw.detach()), self.distribution(self.initial_actor(flat_obs))).sum(-1)
         kl = kl_divergence(dist, prior).sum(-1)
-        pmpo_raw_loss = pmpo_loss(logp, advantage.flatten(), c.alpha_pmpo)
+        pmpo_raw_loss = pmpo_loss(logp, advantage.flatten(), c.alpha_pmpo, c.pmpo_weighting)
         kl_loss = c.beta_kl * kl.mean()
         entropy_loss = -c.entropy_coef * entropy.mean()
         actor_loss = pmpo_raw_loss + kl_loss + entropy_loss
@@ -317,6 +332,14 @@ class PMPOBeta(nn.Module):
             metrics.update(summary_statistics(param, name))
             metrics[f"{name}_near_floor_fraction"] = (param < self.cfg.concentration_min + 0.01).float().mean()
         means = self.to_environment(dist.mean)
+        # Per-state stochastic spread (instrumentation; analytic, consumes no RNG): each sample's
+        # conditional Beta variance from its own (alpha, beta), in environment units, averaged
+        # over states before the square root. Distinct from policy_mean_state_std_* (variation
+        # of mean actions across states) and action_std_* (spread of sampled actions overall).
+        a, b = dist.concentration1, dist.concentration0
+        conditional_var = a * b / ((a + b) ** 2 * (a + b + 1)) * (self.action_high - self.action_low) ** 2
+        for d in range(actions.shape[-1]):
+            metrics[f"policy_conditional_std_{d}"] = conditional_var[:, d].mean().sqrt()
         for d in range(actions.shape[-1]):
             metrics[f"action_mean_{d}"] = actions[:, d].mean()
             metrics[f"action_std_{d}"] = actions[:, d].std(unbiased=False)
