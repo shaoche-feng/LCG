@@ -39,6 +39,11 @@ class PMPOBetaConfig:
     # L_PMPO + beta_kl * KL - entropy_coef * H(pi). 0.0 (default) exactly
     # reproduces the frozen 100k baseline; no other term changes with it.
     entropy_coef: float = 0.0
+    # Actor objective: "sign" (default, Eq. 11 without magnitude weighting) or
+    # "advantage_weighted" (each log-probability weighted by min(cap, |A| / mean_group |A|)
+    # within its sign group; see actor_sample_weights). KL, entropy and critic are unchanged.
+    actor_objective: str = "sign"
+    advantage_weight_cap: float = 5.0  # used only by advantage_weighted; 5 is not a validated optimum
     # Matches config/agent/pmpo_beta.yaml; saved configs always state their own value.
     prior_refresh_interval: int = 500
     # Diagnosis-only knob (see docs/pmpo_beta/k4_implementation.md): when True, the prior is
@@ -67,20 +72,43 @@ def summary_statistics(values, prefix):
                 (values.mean(), values.std(unbiased=False), values.min(), values.max(), *quantiles))}
 
 
-def pmpo_loss(log_prob, advantage, alpha=0.5):
+ACTOR_OBJECTIVES = ("sign", "advantage_weighted")
+
+
+def pmpo_loss(log_prob, advantage, alpha=0.5, objective="sign", weight_cap=5.0):
     """Eq. 11: (1-alpha) mean_negative(log pi) - alpha mean_positive(log pi).
 
     Empty groups contribute zero, without renormalizing the surviving weight.
-    Exactly zero belongs to the positive group. No magnitude weighting.
+    Exactly zero belongs to the positive group. objective="sign": no magnitude weighting.
+    objective="advantage_weighted": each log-probability is multiplied by its detached
+    weight (actor_sample_weights) inside the same group means (sample-count denominators;
+    no renormalization after clipping).
     """
     if log_prob.shape != advantage.shape or not 0 <= alpha <= 1 or not log_prob.numel():
         raise ValueError("Invalid PMPO shapes, empty batch, or mixing coefficient")
+    if objective not in ACTOR_OBJECTIVES:
+        raise ValueError(f"Unknown PMPO actor objective {objective!r}")
     require_finite(log_prob=log_prob, advantage=advantage)
     positive = advantage.detach() >= 0
     negative = ~positive
+    if objective == "advantage_weighted":
+        log_prob = actor_sample_weights(advantage, weight_cap) * log_prob
     pos = log_prob.masked_fill(~positive, 0).sum() / positive.sum().clamp_min(1)
     neg = log_prob.masked_fill(~negative, 0).sum() / negative.sum().clamp_min(1)
     return (1 - alpha) * neg - alpha * pos
+
+
+def actor_sample_weights(advantage, weight_cap=5.0):
+    """Detached weights w_i = min(cap, |A_i| / max(mean_{j in g} |A_j|, 1e-8)) within each
+    sign group g (A >= 0 positive, A < 0 negative). All-zero advantages get weight 0."""
+    magnitude = advantage.detach().abs()
+    positive = advantage.detach() >= 0
+    weights = torch.zeros_like(magnitude)
+    for group in (positive, ~positive):
+        if group.any():
+            scale = magnitude[group].mean().clamp_min(1e-8)
+            weights[group] = (magnitude[group] / scale).clamp(max=weight_cap)
+    return weights
 
 
 class VisualHead(nn.Module):
@@ -125,6 +153,11 @@ class PMPOBeta(nn.Module):
             raise ValueError("Concentration floor, learning rates and gradient clip must be positive")
         if cfg.beta_kl < 0 or cfg.entropy_coef < 0 or cfg.prior_refresh_interval < 1 or cfg.imagination_horizon < 1:
             raise ValueError("Invalid KL/entropy coefficient or rollout/block length")
+        if cfg.actor_objective not in ACTOR_OBJECTIVES:
+            raise ValueError(f"actor_objective must be one of {ACTOR_OBJECTIVES}, got {cfg.actor_objective!r}")
+        cap = cfg.advantage_weight_cap
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not np.isfinite(cap) or cap <= 0:
+            raise ValueError(f"advantage_weight_cap must be a finite positive number, got {cap!r}")
         self.register_buffer("action_low", low.float())
         self.register_buffer("action_high", high.float())
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
@@ -147,10 +180,20 @@ class PMPOBeta(nn.Module):
     def device(self):
         return self.action_low.device
 
+    def objective_settings(self):
+        """The actor objective a checkpoint was trained with; loading must not change it."""
+        if self.cfg.actor_objective == "sign":
+            return dict(mode="sign")
+        return dict(mode=self.cfg.actor_objective, weight_cap=float(self.cfg.advantage_weight_cap))
+
     def get_extra_state(self):
-        return deepcopy(dict(rng=self._rng, fixed_obs=self._fixed_obs))
+        return deepcopy(dict(rng=self._rng, fixed_obs=self._fixed_obs, objective=self.objective_settings()))
 
     def set_extra_state(self, state):
+        saved = state.get("objective", dict(mode="sign"))  # saved before the setting existed: sign-only
+        if saved != self.objective_settings():
+            raise ValueError(f"PMPO state was trained with actor objective {saved}, the config gives "
+                             f"{self.objective_settings()}; it cannot be loaded or resumed with a different objective")
         self._rng = deepcopy(state["rng"])
         self._fixed_obs = state["fixed_obs"]
 
@@ -259,7 +302,7 @@ class PMPOBeta(nn.Module):
             # actor_loss, computed fully detached so it cannot perturb the main graph.
             kl_initial = kl_divergence(self.distribution(raw.detach()), self.distribution(self.initial_actor(flat_obs))).sum(-1)
         kl = kl_divergence(dist, prior).sum(-1)
-        pmpo_raw_loss = pmpo_loss(logp, advantage.flatten(), c.alpha_pmpo)
+        pmpo_raw_loss = pmpo_loss(logp, advantage.flatten(), c.alpha_pmpo, c.actor_objective, c.advantage_weight_cap)
         kl_loss = c.beta_kl * kl.mean()
         entropy_loss = -c.entropy_coef * entropy.mean()
         actor_loss = pmpo_raw_loss + kl_loss + entropy_loss
@@ -276,6 +319,7 @@ class PMPOBeta(nn.Module):
                        rollout_length=float(obs.shape[1]), all_finite=1.0)
         with torch.no_grad():
             metrics.update(summary_statistics(advantage, "advantage"))
+            metrics.update(self.objective_diagnostics(advantage.flatten()))
             pos = advantage.flatten() >= 0
             pos_logp = logp.detach().masked_fill(~pos, 0).sum() / pos.sum().clamp_min(1)
             neg_logp = logp.detach().masked_fill(pos, 0).sum() / (~pos).sum().clamp_min(1)
@@ -310,6 +354,34 @@ class PMPOBeta(nn.Module):
             require_finite(**{k: torch.as_tensor(v) for k, v in metrics.items()})
         # Disjoint graphs: each optimizer owns exactly one encoder and head.
         return actor_loss + value_loss, metrics
+
+    @torch.no_grad()
+    def objective_diagnostics(self, advantage):
+        """Per sign group: |A| mean/max, actor sample weights (1 for sign-only) and the fraction
+        clipped at the cap; actor movement from its construction-time snapshot."""
+        metrics = {}
+        positive = advantage >= 0
+        if self.cfg.actor_objective == "advantage_weighted":
+            weights = actor_sample_weights(advantage, self.cfg.advantage_weight_cap)
+        else:
+            weights = torch.ones_like(advantage)
+        for name, group in (("positive", positive), ("negative", ~positive)):
+            count = group.sum()
+            if count:
+                a, w = advantage[group].abs(), weights[group]
+                at_cap = (w >= self.cfg.advantage_weight_cap).float().mean() if \
+                    self.cfg.actor_objective == "advantage_weighted" else w.new_zeros(())
+                metrics.update({f"advantage_abs_mean_{name}": a.mean(), f"advantage_abs_max_{name}": a.max(),
+                                f"weight_mean_{name}": w.mean(), f"weight_max_{name}": w.max(),
+                                f"weight_std_{name}": w.std(unbiased=False), f"weight_clipped_fraction_{name}": at_cap})
+            else:
+                zero = advantage.new_zeros(())
+                metrics.update({f"{k}_{name}": zero for k in ("advantage_abs_mean", "advantage_abs_max", "weight_mean",
+                                                              "weight_max", "weight_std", "weight_clipped_fraction")})
+        num = sum((p - q).square().sum() for p, q in zip(self.actor.parameters(), self.initial_actor.parameters()))
+        den = sum(q.square().sum() for q in self.initial_actor.parameters())
+        metrics["actor_rel_distance_from_init"] = (num.sqrt() / den.sqrt().clamp_min(1e-12))
+        return metrics
 
     @torch.no_grad()
     def diagnostics(self, raw, actions, logp=None, entropy=None):

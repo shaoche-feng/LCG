@@ -23,6 +23,11 @@ actor_critic:
   # term at all -- see the plateau/over-concentration investigation on
   # branch pmpo-beta-continuous). 0.0 is bit-identical to the baseline actor loss.
   entropy_coef: 0.01
+  # Actor objective: sign (default; Eq. 11, no magnitude weighting) or advantage_weighted
+  # (log-probabilities weighted by min(cap, |A| / mean |A|) within each sign group; KL, entropy
+  # and critic unchanged). The cap of 5 is an engineering choice, not a validated optimum.
+  actor_objective: sign
+  advantage_weight_cap: 5.0
   # Snapshot before updates 0,500,1000,...; held fixed for 500 fresh-rollout updates.
   # A moving prior refreshed every 10 updates was validated to collapse (beta
   # concentration runaway, entropy collapse, action-boundary drift, near-state-
