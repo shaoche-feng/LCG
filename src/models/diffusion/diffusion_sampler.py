@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -27,13 +27,15 @@ class DiffusionSampler:
         self.sigmas = build_sigmas(cfg.num_steps_denoising, cfg.sigma_min, cfg.sigma_max, cfg.rho, denoiser.device)
 
     @torch.no_grad()
-    def sample(self, prev_obs: Tensor, prev_act: Tensor) -> Tuple[Tensor, List[Tensor]]:
+    def sample(self, prev_obs: Tensor, prev_act: Tensor, noise: Optional[Tensor] = None) -> Tuple[Tensor, List[Tensor]]:
+        """noise: optional initial noise (b, c, h, w), e.g. shared across ensemble members;
+        with s_churn=0 it is the only randomness of the sample."""
         device = prev_obs.device
         b, t, c, h, w = prev_obs.size()
         prev_obs = prev_obs.reshape(b, t * c, h, w)
         s_in = torch.ones(b, device=device)
         gamma_ = min(self.cfg.s_churn / (len(self.sigmas) - 1), 2**0.5 - 1)
-        x = torch.randn(b, c, h, w, device=device)
+        x = torch.randn(b, c, h, w, device=device) if noise is None else noise.clone()
         trajectory = [x]
         for sigma, next_sigma in zip(self.sigmas[:-1], self.sigmas[1:]):
             gamma = gamma_ if self.cfg.s_tmin <= sigma <= self.cfg.s_tmax else 0

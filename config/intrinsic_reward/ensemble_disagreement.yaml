@@ -1,0 +1,26 @@
+# MAX-inspired diffusion ensemble disagreement baseline (not an exact MAX reproduction, not an
+# exact information gain). Reward-scoring settings only; the ensemble itself (members,
+# bootstrap) is configured under `ensemble:` in trainer.yaml.
+#
+# Per imagined transition, every member predicts the next frame from the same frame history
+# and action with the same initial diffusion noise (s_churn=0, so the noise is the only
+# randomness). Raw score, on predictions in the model's float [-1, 1] space (unquantized):
+#   mean over channels and pixels of mean over members of (prediction - ensemble mean)^2
+# With num_noise_samples > 1 the score is computed per shared-noise sample and averaged; the
+# next observation always comes from the first noise sample, from one member drawn uniformly at
+# random, independently for each trajectory and at every transition.
+_target_: ensemble.EnsembleDisagreementConfig
+
+method: ensemble_disagreement
+enabled: True
+
+num_noise_samples: 1
+member_selection: uniform_per_transition
+
+# Policy reward = raw / fixed_divisor. The divisor is provisional and explicitly not LCG's
+# 100; observed magnitudes are reported, not tuned against task returns. rms and none remain.
+reward_scaling: fixed
+fixed_divisor: 1.0
+rms_alpha: 1.0
+rms_ema_decay: 0.99
+rms_eps: 1e-8

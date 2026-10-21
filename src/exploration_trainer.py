@@ -20,6 +20,7 @@ from coroutines.collector import COLLECTION_MODES, CollectorState, make_collecto
 from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
 from data.milestone import milestone_name, publish_milestone, referenced_files
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
+from ensemble import check_ensemble_settings, EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining
 from lcg import LCGLifecycle, selected_named_parameters
 from models.pmpo_beta import PMPOOptimizers, summary_statistics
 from pmpo_diagnostic import PMPORunDiagnostic
@@ -55,6 +56,9 @@ class ExplorationTrainer(StateDictMixin):
     the denoiser only. Recorded task rewards stay in the dataset for downstream training;
     every exploration learner input has them removed (collate_segments_without_rewards).
     Test diagnostics (evaluation.*, see test_diagnostics) only read them for return summaries.
+
+    The intrinsic reward is intrinsic_reward.method: "lcg" (default; one denoiser) or
+    "ensemble_disagreement" (ensemble.members denoisers, see ensemble.py).
     """
 
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
@@ -103,6 +107,21 @@ class ExplorationTrainer(StateDictMixin):
             raise ValueError("The uniform baseline trains no exploration policy; set intrinsic_reward.enabled=false")
         if not self._learned_exploration and cfg.get("pmpo_diagnostic") is not None:
             raise ValueError("pmpo_diagnostic needs PMPO updates; the uniform baseline has none")
+        # Intrinsic-reward method; configs without `method` are LCG. Only the ensemble method
+        # trains more than one denoiser (ensemble.* is ignored otherwise).
+        self._method = OmegaConf.select(cfg, "intrinsic_reward.method", default="lcg") if self._learned_exploration else None
+        if self._method not in (None, "lcg", "ensemble_disagreement"):
+            raise ValueError(f"intrinsic_reward.method must be lcg or ensemble_disagreement, got {self._method!r}")
+        self._ensemble_members, self._ensemble_cfg = 1, None
+        if self._method == "ensemble_disagreement":
+            check_ensemble_settings(OmegaConf.select(cfg, "ensemble.members"), OmegaConf.select(cfg, "ensemble.bootstrap"))
+            self._ensemble_members = cfg.ensemble.members
+            fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
+            self._ensemble_cfg = EnsembleDisagreementConfig(**fields)  # plain ValueError on bad settings
+            if cfg.training.compile_wm:
+                raise ValueError("Ensemble imagination is not compiled; set training.compile_wm=false")
+            if cfg.world_model_env.diffusion_sampler.s_churn != 0:
+                raise ValueError("Ensemble disagreement shares the initial noise only; it needs s_churn=0")
         keep_last = cfg.milestones.keep_last
         if keep_last is not None and keep_last < 1:
             raise ValueError(f"milestones.keep_last must be null or at least 1, got {keep_last}")
@@ -164,7 +183,8 @@ class ExplorationTrainer(StateDictMixin):
         action_kwargs, = broadcast_if_needed(action_kwargs)
 
         # Create models (no reward/end model: exploration never uses task reward)
-        self.agent = Agent(instantiate(cfg.agent, rew_end_model=None, **action_kwargs)).to(self._device)
+        self.agent = Agent(instantiate(cfg.agent, rew_end_model=None, ensemble_members=self._ensemble_members,
+                                       **action_kwargs)).to(self._device)
         self._agent = build_ddp_wrapper(**self.agent._modules) if dist.is_initialized() else self.agent
 
         if cfg.initialization.path_to_ckpt is not None:
@@ -195,6 +215,12 @@ class ExplorationTrainer(StateDictMixin):
             actor_critic_opt = PMPOOptimizers(self.agent.actor_critic, cfg.actor_critic.training.lr_warmup_steps)
         self.opt = CommonTools(denoiser_opt, None, actor_critic_opt)
         self.lr_sched = CommonTools(get_lr_sched(denoiser_opt, cfg.denoiser.training.lr_warmup_steps), None, None)
+        # Ensemble members 1..K-1: their own optimizers and schedulers (member 0 uses the above).
+        self.ensemble = None
+        if self._ensemble_members > 1:
+            opts = [configure_opt(m, **cfg.denoiser.optimizer) for m in self.agent.ensemble_members]
+            scheds = [get_lr_sched(o, cfg.denoiser.training.lr_warmup_steps) for o in opts]
+            self.ensemble = EnsembleTraining(self._ensemble_members, bool(cfg.ensemble.bootstrap), seed, opts, scheds)
 
         # Data loaders: task rewards are removed from every exploration learner input.
 
@@ -220,6 +246,15 @@ class ExplorationTrainer(StateDictMixin):
         dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length, collate_segments_without_rewards)
 
         self._data_loader_train = CommonTools(dl_denoiser_train, None, None)
+        # Ensemble: one sampler per member (bootstrap multiplicities when enabled), shared replay.
+        self._member_samplers, self._member_loaders = [], []
+        if self.ensemble is not None:
+            for k in range(self._ensemble_members):
+                mult = partial(self.ensemble.multiplicity, k) if self.ensemble.bootstrap else None
+                bs_k = make_batch_sampler(c.batch_size, seq_length, get_sample_weights(c.sample_weights),
+                                          episode_multiplicity=mult)
+                self._member_samplers.append(bs_k)
+                self._member_loaders.append(make_data_loader(batch_sampler=bs_k))
         self._data_loader_test = CommonTools(dl_denoiser_test, None, None)
 
         # RL env: imagination without a reward/end model (zero reward placeholder, no
@@ -232,7 +267,10 @@ class ExplorationTrainer(StateDictMixin):
             bs = make_batch_sampler(c.batch_size, sl, get_sample_weights(c.sample_weights))
             dl_actor_critic = make_data_loader(batch_sampler=bs)
             wm_env_cfg = instantiate(cfg.world_model_env)
-            rl_env = WorldModelEnv(self.agent.denoiser, None, dl_actor_critic, wm_env_cfg, return_imagined_candidate=True)
+            ensemble = self.agent.denoisers if self.ensemble is not None else None
+            rl_env = WorldModelEnv(self.agent.denoiser, None, dl_actor_critic, wm_env_cfg,
+                                   return_imagined_candidate=self._method == "lcg", ensemble=ensemble,
+                                   ensemble_noise_samples=self._ensemble_cfg.num_noise_samples if ensemble else 1)
             if cfg.training.compile_wm:
                 rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
 
@@ -252,8 +290,12 @@ class ExplorationTrainer(StateDictMixin):
 
         # LCG intrinsic-reward lifecycle, the only exploration scorer (learned exploration).
         self._lcg_lifecycle = None
-        self._lcg_reward_scaling = None
-        if self._learned_exploration:
+        self._ensemble_scorer = None
+        self._lcg_reward_scaling = None  # intrinsic reward settings a resume must not change (any method)
+        if self._method == "ensemble_disagreement":
+            self._lcg_reward_scaling = self._ensemble_cfg.reward_scaling_settings()
+            self._ensemble_scorer = EnsembleScorer(self._ensemble_cfg)
+        elif self._learned_exploration:
             lcg_cfg = instantiate(cfg.intrinsic_reward)
             selected_named_parameters(self.agent.denoiser, lcg_cfg.theta_s)  # fail now on a wrong theta_S, not at epoch 1
             self._lcg_reward_scaling = lcg_cfg.reward_scaling_settings()
@@ -441,24 +483,36 @@ class ExplorationTrainer(StateDictMixin):
                     if self._use_cuda:
                         torch.cuda.reset_peak_memory_stats(self._device)
                     t_refresh = time.time()
-                    # Refresh the intrinsic scorer on this epoch's denoiser, then rewire the
-                    # PMPO hook. The round seed is the checkpointed epoch, so a resumed run
-                    # continues the seed sequence (the lifecycle itself is not checkpointed).
-                    self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
-                    self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
+                    if self._lcg_lifecycle is not None:
+                        # Refresh the intrinsic scorer on this epoch's denoiser, then rewire the
+                        # PMPO hook. The round seed is the checkpointed epoch, so a resumed run
+                        # continues the seed sequence (the lifecycle itself is not checkpointed).
+                        self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
+                        self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
+                    else:
+                        # Ensemble: frozen members (eval mode, no optimizer step) score imagination.
+                        for denoiser in self.agent.denoisers:
+                            denoiser.eval()
+                        self._ensemble_scorer.reset()
+                        self.agent.actor_critic.set_intrinsic_reward_fn(self._ensemble_scorer)
                     t_refresh = time.time() - t_refresh
                 steps = cfg.steps_first_epoch if self.epoch == 1 else cfg.steps_per_epoch
                 t0 = time.time()
-                to_log += self.train_component(name, steps)
+                if name == "denoiser" and self.ensemble is not None:
+                    to_log += self.train_ensemble(steps)
+                else:
+                    to_log += self.train_component(name, steps)
                 if self._use_cuda:
                     torch.cuda.synchronize(self._device)
                 print(f"[TIMING] epoch={self.epoch} component={name} time={time.time() - t0:.2f}s", flush=True)
                 if name == "actor_critic":
-                    lcg = self._lcg_lifecycle
                     # Wall-clock monitoring (timing/*), not compared between runs.
-                    timing = {"timing/lcg_refresh_seconds": t_refresh, "timing/lcg_precision_seconds": lcg.precision_seconds,
-                              "timing/lcg_scoring_seconds": lcg.scoring_seconds,
-                              "timing/pmpo_update_seconds": time.time() - t0, "timing/pmpo_updates": steps}
+                    timing = {"timing/pmpo_update_seconds": time.time() - t0, "timing/pmpo_updates": steps}
+                    lcg = self._lcg_lifecycle
+                    if lcg is not None:
+                        timing.update({"timing/lcg_refresh_seconds": t_refresh,
+                                       "timing/lcg_precision_seconds": lcg.precision_seconds,
+                                       "timing/lcg_scoring_seconds": lcg.scoring_seconds})
                     if self._use_cuda:
                         timing["timing/gpu_peak_allocated_gb"] = torch.cuda.max_memory_allocated(self._device) / 2 ** 30
                         timing["timing/gpu_peak_reserved_gb"] = torch.cuda.max_memory_reserved(self._device) / 2 ** 30
@@ -466,13 +520,41 @@ class ExplorationTrainer(StateDictMixin):
                     to_log.append(timing)
         return to_log
 
+    def train_ensemble(self, steps: int) -> Logs:
+        """Each member trains `steps` updates (the per-member schedule; K members cost K times the
+        updates) on its own RNG stream and sampler."""
+        to_log, timing = [], {}
+        ens = self.ensemble
+        for k in range(ens.members):
+            t0 = time.time()
+            with ens.member_rng(k):
+                to_log += self.train_component("denoiser", steps, member=k)
+            if self._use_cuda:
+                torch.cuda.synchronize(self._device)
+            timing[f"timing/denoiser_member_{k}_seconds"] = time.time() - t0
+            sampler = self._member_samplers[k]
+            ens.empty_bootstrap_batches[k] += sampler.empty_bootstrap_batches
+            sampler.empty_bootstrap_batches = 0
+        summary = {"ensemble/total_denoiser_updates": sum(ens.updates)}
+        for k in range(ens.members):
+            summary[f"ensemble/member_{k}_updates"] = ens.updates[k]
+            summary[f"ensemble/member_{k}_empty_bootstrap_batches"] = ens.empty_bootstrap_batches[k]
+            if ens.bootstrap:
+                m = ens.multiplicity(k, self.train_dataset.num_episodes)
+                summary[f"ensemble/member_{k}_bootstrap_zero_episode_fraction"] = float((m == 0).mean())
+        to_log.append({**timing, **summary})
+        print(f"[TIMING] epoch={self.epoch} {timing}", flush=True)
+        return to_log
+
     def lcg_reward_metrics(self) -> Dict[str, Any]:
-        """Raw LCG scores and the policy reward (after scaling) of the last PMPO update."""
-        lcg = self._lcg_lifecycle
-        if lcg is None or lcg.last_raw is None:
+        """Raw intrinsic scores and the policy reward (after scaling) of the last PMPO update
+        (lcg_* for LCG, ens_* for ensemble disagreement)."""
+        scorer = self._lcg_lifecycle or self._ensemble_scorer
+        if scorer is None or scorer.last_raw is None:
             return {}
+        name = "lcg" if scorer is self._lcg_lifecycle else "ens"
         metrics = {}
-        for prefix, values in (("lcg_raw_reward", lcg.last_raw), ("lcg_policy_reward", lcg.last_scaled)):
+        for prefix, values in ((f"{name}_raw_reward", scorer.last_raw), (f"{name}_policy_reward", scorer.last_scaled)):
             values = values.float()
             metrics.update(summary_statistics(values, prefix))
             metrics[f"{prefix}_p99"] = torch.quantile(values.flatten(), 0.99)
@@ -525,12 +607,17 @@ class ExplorationTrainer(StateDictMixin):
             to_log += self.test_component("denoiser")
         return to_log
 
-    def train_component(self, name: str, steps: int) -> Logs:
+    def train_component(self, name: str, steps: int, member: Optional[int] = None) -> Logs:
         cfg = getattr(self._cfg, name).training
         model = getattr(self._agent, name)
         opt = self.opt.get(name)
         lr_sched = self.lr_sched.get(name)
         data_loader = self._data_loader_train.get(name)
+        if member is not None:  # ensemble denoiser member
+            model = self.agent.denoisers[member]
+            if member > 0:
+                opt, lr_sched = self.ensemble.optimizers[member - 1], self.ensemble.schedulers[member - 1]
+            data_loader = self._member_loaders[member]
 
         if name == "actor_critic":
             if cfg.grad_acc_steps != 1 or self._world_size != 1:
@@ -567,9 +654,13 @@ class ExplorationTrainer(StateDictMixin):
                 raise FloatingPointError(f"Non-finite {name} loss")
             loss.backward()
 
-            num_batch = self.num_batch_train.get(name)
-            metrics[f"num_batch_train_{name}"] = num_batch
-            self.num_batch_train.set(name, num_batch + 1)
+            if member is None or member == 0:
+                num_batch = self.num_batch_train.get(name)
+                metrics[f"num_batch_train_{name}"] = num_batch
+                self.num_batch_train.set(name, num_batch + 1)
+            if member is not None:
+                metrics[f"num_batch_train_member"] = self.ensemble.updates[member]
+                self.ensemble.updates[member] += 1
 
             if (i + 1) % cfg.grad_acc_steps == 0:
                 if cfg.max_grad_norm is not None:
@@ -587,7 +678,8 @@ class ExplorationTrainer(StateDictMixin):
             to_log.append(metrics)
 
         process_confusion_matrices_if_any_and_compute_classification_metrics(to_log)
-        to_log = [{f"{name}/train/{k}": v for k, v in d.items()} for d in to_log]
+        prefix = f"{name}/train" if member is None else f"{name}/member_{member}/train"
+        to_log = [{f"{prefix}/{k}": v for k, v in d.items()} for d in to_log]
         return to_log
 
     @torch.no_grad()
@@ -631,6 +723,12 @@ class ExplorationTrainer(StateDictMixin):
                              f"{self._lcg_reward_scaling}; a resume must not switch it")
         self._rng_to_restore = state_dict.pop("rng")
         diagnostic_state = state_dict.pop("pmpo_diagnostic", None)
+        state_dict.setdefault("ensemble", None)  # checkpoints from before ensembles: single denoiser
+        saved = (state_dict["ensemble"] or {}).get("settings")
+        expected = self.ensemble.settings() if self.ensemble is not None else None
+        if saved != expected:  # checked before any weights are loaded
+            raise ValueError(f"Checkpoint was trained with ensemble settings {saved}, the config gives {expected} "
+                             "(None: single denoiser); a resume must not change them")
         check_same_packages(state_dict["source"])
         super().load_state_dict(state_dict)
         self.restore_collection_state(collection)
@@ -742,16 +840,23 @@ class ExplorationTrainer(StateDictMixin):
             num_episodes=int(self.train_dataset.num_episodes),
             epoch=int(self.epoch),
             counters=dict(denoiser_batches=int(self.num_batch_train.denoiser),
-                          pmpo_updates=int(self.agent.actor_critic.updates.item())),
+                          pmpo_updates=int(self.agent.actor_critic.updates.item()),
+                          **(dict(member_denoiser_batches=list(self.ensemble.updates)) if self.ensemble else {})),
             exploration=dict(collection_mode=cfg.collection.train.mode,
-                             intrinsic_reward_enabled=bool(cfg.intrinsic_reward.enabled)),
+                             intrinsic_reward_enabled=bool(cfg.intrinsic_reward.enabled),
+                             **(dict(method=self._method) if self._method else {})),
             model=dict(denoiser=OmegaConf.to_container(cfg.agent.denoiser),
                        env=OmegaConf.to_container(cfg.env.train)),
             run_config="../../config/trainer.yaml",
             source=self.source,
         )
+        member_states = None
+        if self.ensemble is not None:
+            manifest["ensemble"] = dict(members=self.ensemble.members, bootstrap=self.ensemble.bootstrap,
+                                        downstream_default_member=0, note="denoiser.pt is member 0")
+            member_states = [m.state_dict() for m in self.agent.ensemble_members]
         return publish_milestone(self._path_milestones, name, self.agent.denoiser.state_dict(),
-                                 self.train_dataset, successors, manifest)
+                                 self.train_dataset, successors, manifest, member_states)
 
     def prune_episode_versions(self) -> None:
         """Delete replay versions no longer referenced by this checkpoint or any milestone."""

@@ -20,6 +20,8 @@ class AgentConfig:
     continuous_action_dim: Optional[int] = None  # continuous action dimension, e.g. DM Control
     action_low: Optional[List[float]] = None  # required iff continuous_action_dim is set
     action_high: Optional[List[float]] = None  # required iff continuous_action_dim is set
+    # Denoisers in total (member 0 is `denoiser`); > 1 only for ensemble disagreement.
+    ensemble_members: int = 1
 
     def __post_init__(self) -> None:
         if self.continuous_action_dim is None or self.continuous_action_dim < 1:
@@ -52,17 +54,25 @@ class Agent(nn.Module):
         self.denoiser = Denoiser(cfg.denoiser)
         self.rew_end_model = RewEndModel(cfg.rew_end_model) if cfg.rew_end_model is not None else None
         self.actor_critic = PMPOBeta(cfg.actor_critic)
+        # Members 1..K-1, built last (independent initializations); empty for a single denoiser,
+        # so single-model state dicts are unchanged.
+        self.ensemble_members = nn.ModuleList(Denoiser(cfg.denoiser) for _ in range(cfg.ensemble_members - 1))
 
     @property
     def device(self):
         return self.denoiser.device
+
+    @property
+    def denoisers(self) -> List[Denoiser]:
+        return [self.denoiser, *self.ensemble_members]
 
     def setup_training(
         self,
         sigma_distribution_cfg: SigmaDistributionConfig,
         rl_env: Optional[WorldModelEnv],
     ) -> None:
-        self.denoiser.setup_training(sigma_distribution_cfg)
+        for denoiser in self.denoisers:
+            denoiser.setup_training(sigma_distribution_cfg)
         if rl_env is not None:  # None: no policy training (uniform baseline)
             self.actor_critic.setup_training(rl_env)
 
@@ -75,6 +85,16 @@ class Agent(nn.Module):
     ) -> None:
         # Trusted local agent snapshots may include PMPO's numpy/Python RNG state.
         sd = torch.load(Path(path_to_ckpt), map_location=self.device, weights_only=False)
+        # Only member 0 would be restored here, leaving other members randomly initialized:
+        # refuse before loading anything.
+        source_members = 1 + len({k.split(".")[1] for k in sd if k.startswith("ensemble_members.")})
+        if load_denoiser and (source_members > 1 or len(self.ensemble_members) > 0):
+            raise ValueError(
+                f"Cannot initialize denoisers from {path_to_ckpt}: the snapshot holds {source_members} denoiser(s) and "
+                f"this agent {len(self.denoisers)}. Denoiser ensembles are not warm-started through "
+                "initialization.path_to_ckpt; start ensemble training fresh, or resume it with the full-state "
+                "checkpoint workflow (scripts/resume.sh)."
+            )
         sd = {k: extract_state_dict(sd, k) for k in ("denoiser", "rew_end_model", "actor_critic")}
         if load_denoiser:
             self.denoiser.load_state_dict(sd["denoiser"])

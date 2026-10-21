@@ -2,7 +2,8 @@
 
 Layout inside a run folder:
 
-    milestones/steps_NNNNNN/denoiser.pt    denoiser weights
+    milestones/steps_NNNNNN/denoiser.pt    denoiser weights (ensemble: member 0)
+    milestones/steps_NNNNNN/denoiser_member_K.pt  ensemble member K >= 1 (ensemble runs only)
     milestones/steps_NNNNNN/dataset.pt     replay index (episode versions, checksums, lengths, labels)
     milestones/steps_NNNNNN/manifest.yaml  what the milestone is, with file checksums
 
@@ -33,10 +34,16 @@ def milestone_name(num_steps: int) -> str:
     return f"steps_{num_steps:06d}"
 
 
-def downstream_output_dir(milestone_path: Path, task_name: str, seed: int) -> Path:
-    """Reserved: <run>/downstream/<milestone>/<task>/seed_<seed>/ (not created here)."""
+def downstream_output_dir(milestone_path: Path, task_name: str, seed: int, member_index: int = 0) -> Path:
+    """Reserved: <run>/downstream/<milestone>/<task>/seed_<seed>/ (not created here); an
+    ensemble member other than 0 adds `_member_<k>`."""
     milestone_path = Path(milestone_path)
-    return milestone_path.parent.parent / "downstream" / milestone_path.name / task_name / f"seed_{seed}"
+    name = f"seed_{seed}" + (f"_member_{member_index}" if member_index else "")
+    return milestone_path.parent.parent / "downstream" / milestone_path.name / task_name / name
+
+
+def member_file(member_index: int) -> str:
+    return DENOISER_FILE if member_index == 0 else f"denoiser_member_{member_index}.pt"
 
 
 def state_sha256(state_dict: Dict[str, torch.Tensor]) -> str:
@@ -55,13 +62,18 @@ def publish_milestone(
     dataset: Dataset,
     successor_observations: Dict[int, torch.Tensor],
     manifest: Dict[str, Any],
+    member_states: Optional[List[Dict[str, torch.Tensor]]] = None,
 ) -> Path:
     """Publish a complete milestone folder atomically (written aside, then renamed). An
-    existing milestone is kept if it holds the same training state, otherwise rejected."""
+    existing milestone is kept if it holds the same training state, otherwise rejected.
+    member_states: ensemble members 1..K-1 (member 0 is denoiser_state)."""
     milestones_dir = Path(milestones_dir)
     final = milestones_dir / name
+    member_states = member_states or []
     identity = dict(denoiser_sha256=state_sha256(denoiser_state), dataset_sha256=index_sha256(dataset),
                     **{k: manifest[k] for k in ("epoch", "collected_steps", "counters")})
+    if member_states:
+        identity["member_sha256"] = [identity["denoiser_sha256"], *(state_sha256(s) for s in member_states)]
     if final.exists():
         existing = read_manifest(final)
         if existing.get("identity") != identity:
@@ -73,6 +85,8 @@ def publish_milestone(
         shutil.rmtree(tmp)  # left by an interrupted publish
     tmp.mkdir(parents=True)
     torch.save(denoiser_state, tmp / DENOISER_FILE)
+    for k, state in enumerate(member_states, start=1):
+        torch.save(state, tmp / member_file(k))
     if None in dataset.file_sha256:
         raise ValueError(f"{dataset.name} has episode files without checksums; cannot publish a milestone")
     files = []
@@ -93,6 +107,8 @@ def publish_milestone(
         files=dict(
             denoiser=dict(path=DENOISER_FILE, sha256=file_sha256(tmp / DENOISER_FILE)),
             dataset=dict(path=DATASET_FILE, sha256=file_sha256(tmp / DATASET_FILE)),
+            **{f"denoiser_member_{k}": dict(path=member_file(k), sha256=file_sha256(tmp / member_file(k)))
+               for k in range(1, len(member_states) + 1)},
         ),
         identity=identity,
     )
@@ -136,13 +152,23 @@ class Milestone:
     task_name: str
     task_index: int  # column of Episode.task_rew for task_name
     successor_observations: Dict[int, torch.Tensor]
+    member_index: int = 0  # ensemble member loaded as denoiser_state (0 for single-model milestones)
+
+
+def milestone_members(manifest: Dict[str, Any]) -> int:
+    """Number of denoisers a milestone holds (1 for single-model milestones)."""
+    return int((manifest.get("ensemble") or {}).get("members", 1))
 
 
 def load_milestone(milestone_path: Path, task_name: str, map_location: Optional[torch.device] = None,
-                   cache_in_ram: bool = False) -> Milestone:
-    """Resolve and validate a milestone for downstream training on task_name."""
+                   cache_in_ram: bool = False, member_index: int = 0) -> Milestone:
+    """Resolve and validate a milestone for downstream training on task_name; denoiser_state
+    is ensemble member `member_index` (0, the only one, for single-model milestones)."""
     path = Path(milestone_path)
     manifest = read_manifest(path)
+    members = milestone_members(manifest)
+    if isinstance(member_index, bool) or not isinstance(member_index, int) or not 0 <= member_index < members:
+        raise ValueError(f"Milestone {path} has {members} denoiser(s); member_index {member_index!r} is not one of them")
     for key, entry in manifest["files"].items():
         file = path / entry["path"]
         if not file.is_file():
@@ -175,6 +201,9 @@ def load_milestone(milestone_path: Path, task_name: str, map_location: Optional[
     if task_name not in task_names:
         raise ValueError(f"Milestone {path} has no reward labels for task {task_name!r}; recorded: {task_names}")
 
-    denoiser_state = torch.load(path / manifest["files"]["denoiser"]["path"], map_location=map_location, weights_only=True)
+    key = "denoiser" if member_index == 0 else f"denoiser_member_{member_index}"
+    denoiser_state = torch.load(path / manifest["files"][key]["path"], map_location=map_location, weights_only=True)
+    if members > 1 and state_sha256(denoiser_state) != manifest["identity"]["member_sha256"][member_index]:
+        raise ValueError(f"Milestone {path}: member {member_index} weights do not match the recorded identity")
     return Milestone(path, manifest, denoiser_state, dataset, task_name, task_names.index(task_name),
-                     saved["successor_observations"])
+                     saved["successor_observations"], member_index)

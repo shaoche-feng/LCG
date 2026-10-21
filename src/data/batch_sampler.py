@@ -1,4 +1,4 @@
-from typing import Generator, List, Optional
+from typing import Callable, Generator, List, Optional
 
 import numpy as np
 import torch
@@ -17,6 +17,7 @@ class BatchSampler(torch.utils.data.Sampler):
         seq_length: int,
         sample_weights: Optional[List[float]] = None,
         can_sample_beyond_end: bool = False,
+        episode_multiplicity: Optional[Callable[[int], np.ndarray]] = None,
     ) -> None:
         super().__init__(dataset)
         assert isinstance(dataset, Dataset)
@@ -27,6 +28,11 @@ class BatchSampler(torch.utils.data.Sampler):
         self.batch_size = batch_size
         self.seq_length = seq_length
         self.can_sample_beyond_end = can_sample_beyond_end
+        # Bootstrap: episode probabilities are multiplied by these per-episode multiplicities
+        # (the anchor step stays uniform within the episode). If every multiplicity is zero, the
+        # batch uses the ordinary weights instead, counted in empty_bootstrap_batches.
+        self.episode_multiplicity = episode_multiplicity
+        self.empty_bootstrap_batches = 0
 
     def __len__(self):
         raise NotImplementedError
@@ -52,6 +58,12 @@ class BatchSampler(torch.utils.data.Sampler):
 
         episodes_partition = np.arange(self.rank, num_episodes, self.world_size)
         weights = np.array(weights[self.rank::self.world_size])
+        if self.episode_multiplicity is not None:
+            boot = weights * self.episode_multiplicity(num_episodes)[episodes_partition]
+            if boot.sum() > 0:
+                weights = boot
+            else:
+                self.empty_bootstrap_batches += 1
         episode_ids = np.random.choice(episodes_partition, size=self.batch_size, replace=True, p=weights / weights.sum())
         timesteps = np.random.randint(low=0, high=self.dataset.lengths[episode_ids])
 

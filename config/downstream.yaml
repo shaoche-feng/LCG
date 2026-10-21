@@ -20,6 +20,9 @@ hydra:
 
 initialization:
   milestone_path: ???
+  # Ensemble milestones hold several denoisers; this one (fixed in advance, never chosen by
+  # evaluation results) is loaded as the frozen denoiser. Single-model milestones: only 0.
+  member_index: 0
 
 downstream:
   task_name: ???

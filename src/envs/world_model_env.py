@@ -29,6 +29,14 @@ class ImaginedCandidate:
     y_star: Tensor
 
 
+def ensemble_disagreement(predictions: Tensor) -> Tensor:
+    """predictions: (members, batch, channels, height, width) next frames in the model's
+    [-1, 1] float space (unquantized). Population variance across members, averaged over
+    members, channels and pixels: mean_pixels(mean_members((p - mean_members(p))^2)) -> (batch,)."""
+    centered = predictions - predictions.mean(dim=0, keepdim=True)
+    return centered.square().mean(dim=0).flatten(1).mean(dim=1)
+
+
 @dataclass
 class WorldModelEnvConfig:
     horizon: int
@@ -50,8 +58,22 @@ class WorldModelEnv:
         return_denoising_trajectory: bool = False,
         return_imagined_candidate: bool = False,
         sample_ends: bool = True,
+        ensemble: Optional[List[Denoiser]] = None,
+        ensemble_noise_samples: int = 1,
     ) -> None:
         self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
+        # Ensemble imagination: all members predict from the same history/action with the same
+        # initial noise; disagreement is reported per transition and one uniformly chosen
+        # member's prediction (independently per trajectory) becomes the next observation.
+        self.ensemble_samplers = None
+        if ensemble is not None:
+            if len(ensemble) < 2 or ensemble[0] is not denoiser:
+                raise ValueError("An imagination ensemble needs >= 2 members, member 0 being the env's denoiser")
+            if cfg.diffusion_sampler.s_churn != 0:
+                raise ValueError("Ensemble disagreement shares the initial noise only; it needs s_churn=0")
+            self.ensemble_samplers = [DiffusionSampler(d, cfg.diffusion_sampler) for d in ensemble]
+        self.ensemble_noise_samples = ensemble_noise_samples
+        self.last_disagreement, self.last_member = None, None
         self.rew_end_model = rew_end_model
         # False: use only the reward head; imagined episodes end by horizon truncation.
         self.sample_ends = sample_ends
@@ -132,6 +154,10 @@ class WorldModelEnv:
         if self.return_imagined_candidate:
             info["imagined_candidate"] = ImaginedCandidate(candidate_x_obs, candidate_x_act, next_obs.clone())
 
+        if self.ensemble_samplers is not None:
+            info["ensemble_disagreement"] = self.last_disagreement
+            info["ensemble_member"] = self.last_member
+
         if dead.any():
             # final_observation ends the old trajectory; the returned observation,
             # burnin_obs and prompt belong to the new replay prompt.
@@ -143,7 +169,28 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def predict_next_obs(self) -> Tuple[Tensor, List[Tensor]]:
-        return self.sampler.sample(self.obs_buffer, self.act_buffer)
+        if self.ensemble_samplers is None:
+            return self.sampler.sample(self.obs_buffer, self.act_buffer)
+        return self.predict_next_obs_ensemble(), []
+
+    @torch.no_grad()
+    def predict_next_obs_ensemble(self) -> Tensor:
+        """Disagreement for each shared-noise sample, averaged over samples; the next
+        observation is taken from the first noise sample (fixed before any score is seen), from
+        a member drawn uniformly and independently for every trajectory at every transition."""
+        b, _, c, h, w = self.obs_buffer.shape
+        scores, first = [], None
+        for s in range(self.ensemble_noise_samples):
+            noise = torch.randn(b, c, h, w, device=self.obs_buffer.device)
+            predictions = torch.stack([smp.sample(self.obs_buffer, self.act_buffer, noise)[0]
+                                       for smp in self.ensemble_samplers])  # (members, b, c, h, w)
+            scores.append(ensemble_disagreement(predictions))
+            if s == 0:
+                first = predictions
+        member = torch.randint(len(self.ensemble_samplers), (b,), device=self.obs_buffer.device)
+        self.last_disagreement = torch.stack(scores).mean(dim=0)
+        self.last_member = member
+        return first[member, torch.arange(b, device=member.device)]
 
     @torch.no_grad()
     def predict_rew_end(self, next_obs: Tensor) -> Tuple[Tensor, Tensor]:

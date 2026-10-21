@@ -61,8 +61,10 @@ class DownstreamTrainer:
         print(f"Starting on {self._device}")
 
         # The exact milestone: validated denoiser, replay versions and task labels.
+        # Ensemble milestones: one configured member (default 0) is the frozen denoiser.
+        member_index = OmegaConf.select(cfg, "initialization.member_index", default=0)
         self.milestone = load_milestone(cfg.initialization.milestone_path, task_name, map_location=self._device,
-                                        cache_in_ram=True)
+                                        cache_in_ram=True, member_index=member_index)
         manifest = self.milestone.manifest
         if manifest["domain"] not in TIME_LIMIT_ONLY_DOMAINS:
             raise ValueError(f"Domain {manifest['domain']!r} is not verified to end only at its time limit")
@@ -78,7 +80,7 @@ class DownstreamTrainer:
         self.cfg = cfg
 
         # Outputs: never overwrite; trained in a work folder renamed when complete.
-        self.output_dir = downstream_output_dir(self.milestone.path, task_name, seed)
+        self.output_dir = downstream_output_dir(self.milestone.path, task_name, seed, self.milestone.member_index)
         self._work_dir = self.output_dir.with_name(f".{self.output_dir.name}.tmp")
         self._path_checkpoint = self._work_dir / "checkpoints" / "state.pt"
         if self.output_dir.exists():
@@ -211,7 +213,9 @@ class DownstreamTrainer:
         manifest = self.milestone.manifest
         summary = dict(
             milestone=dict(path=Path(os.path.relpath(self.milestone.path, self.output_dir)).as_posix(),
-                           identity=manifest["identity"], collected_steps=manifest["collected_steps"]),
+                           identity=manifest["identity"], collected_steps=manifest["collected_steps"],
+                           member_index=self.milestone.member_index,
+                           member_sha256=state_sha256(self.milestone.denoiser_state)),
             task_name=self.milestone.task_name,
             task_index=self.milestone.task_index,
             seed=self.cfg.downstream.seed,
@@ -272,7 +276,7 @@ class DownstreamTrainer:
             raise ValueError("Checkpoint was trained on a different milestone replay (dataset.pt checksum differs)")
         if (self._work_dir / state["milestone"]["path"]).resolve() != self.milestone.path.resolve():
             raise ValueError("Checkpoint refers to a milestone at a different place in the run folder")
-        changed = changed_settings(state["config"], OmegaConf.to_container(self.cfg))
+        changed = changed_settings(normalized_saved_config(state["config"]), OmegaConf.to_container(self.cfg))
         if changed:
             raise ValueError(f"Cannot resume with different settings: {changed}")
         self.agent.rew_end_model.load_state_dict(state["rew_end_model"])
@@ -319,6 +323,15 @@ def recover_metrics_log(path: Path) -> Optional[Path]:
     tmp.replace(path)
     print(f"Recovered an interrupted metrics row into {recovery}")
     return recovery
+
+
+def normalized_saved_config(saved: Dict[str, Any]) -> Dict[str, Any]:
+    """A saved downstream config as the current code reads it: configs from before ensemble
+    milestones have no initialization.member_index, which meant the only denoiser (member 0).
+    Returns a copy; the saved file is not changed."""
+    saved = deepcopy(saved)
+    saved.setdefault("initialization", {}).setdefault("member_index", 0)
+    return saved
 
 
 def changed_settings(saved: Dict[str, Any], current: Dict[str, Any], prefix: str = "") -> List[str]:
@@ -426,7 +439,8 @@ def evaluate_saved_output(cfg: DictConfig) -> Path:
     weights-only outputs from before checkpoints existed)."""
     check_evaluation_config(cfg.evaluation)
     task_name, seed = cfg.downstream.task_name, cfg.downstream.seed
-    output_dir = downstream_output_dir(Path(cfg.initialization.milestone_path), task_name, seed)
+    output_dir = downstream_output_dir(Path(cfg.initialization.milestone_path), task_name, seed,
+                                       OmegaConf.select(cfg, "initialization.member_index", default=0))
     if not (output_dir / "summary.yaml").is_file():
         raise FileNotFoundError(f"No completed downstream output at {output_dir}")
     saved = OmegaConf.load(output_dir / "config.yaml")
