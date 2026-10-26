@@ -20,7 +20,7 @@ from coroutines.collector import COLLECTION_MODES, CollectorState, make_collecto
 from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
 from data.milestone import milestone_name, publish_milestone, referenced_files
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
-from ensemble import check_ensemble_settings, EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining
+from ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
 from lcg import LCGLifecycle, selected_named_parameters
 from models.pmpo_beta import PMPOOptimizers, summary_statistics
 from pmpo_diagnostic import PMPORunDiagnostic
@@ -58,12 +58,12 @@ class ExplorationTrainer(StateDictMixin):
     Test diagnostics (evaluation.*, see test_diagnostics) only read them for return summaries.
 
     The intrinsic reward is intrinsic_reward.method: "lcg" (default; one denoiser) or
-    "ensemble_disagreement" (ensemble.members denoisers, see ensemble.py).
+    "ensemble_disagreement" (intrinsic_reward.num_members denoisers, see ensemble.py).
     """
 
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
-        cfg = normalize_saved_config(cfg)
+        cfg = migrate_ensemble_layout(normalize_saved_config(cfg))  # older saved ensemble layout, in memory
         OmegaConf.resolve(cfg)
         self._cfg = cfg
         self._rank = dist.get_rank() if dist.is_initialized() else 0
@@ -108,16 +108,15 @@ class ExplorationTrainer(StateDictMixin):
         if not self._learned_exploration and cfg.get("pmpo_diagnostic") is not None:
             raise ValueError("pmpo_diagnostic needs PMPO updates; the uniform baseline has none")
         # Intrinsic-reward method; configs without `method` are LCG. Only the ensemble method
-        # trains more than one denoiser (ensemble.* is ignored otherwise).
+        # trains more than one denoiser (intrinsic_reward.num_members).
         self._method = OmegaConf.select(cfg, "intrinsic_reward.method", default="lcg") if self._learned_exploration else None
         if self._method not in (None, "lcg", "ensemble_disagreement"):
             raise ValueError(f"intrinsic_reward.method must be lcg or ensemble_disagreement, got {self._method!r}")
         self._ensemble_members, self._ensemble_cfg = 1, None
         if self._method == "ensemble_disagreement":
-            check_ensemble_settings(OmegaConf.select(cfg, "ensemble.members"), OmegaConf.select(cfg, "ensemble.bootstrap"))
-            self._ensemble_members = cfg.ensemble.members
             fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
             self._ensemble_cfg = EnsembleDisagreementConfig(**fields)  # plain ValueError on bad settings
+            self._ensemble_members = self._ensemble_cfg.num_members
             if cfg.training.compile_wm:
                 raise ValueError("Ensemble imagination is not compiled; set training.compile_wm=false")
             if cfg.world_model_env.diffusion_sampler.s_churn != 0:
@@ -220,7 +219,7 @@ class ExplorationTrainer(StateDictMixin):
         if self._ensemble_members > 1:
             opts = [configure_opt(m, **cfg.denoiser.optimizer) for m in self.agent.ensemble_members]
             scheds = [get_lr_sched(o, cfg.denoiser.training.lr_warmup_steps) for o in opts]
-            self.ensemble = EnsembleTraining(self._ensemble_members, bool(cfg.ensemble.bootstrap), seed, opts, scheds)
+            self.ensemble = EnsembleTraining(self._ensemble_members, self._ensemble_cfg.bootstrap, seed, opts, scheds)
 
         # Data loaders: task rewards are removed from every exploration learner input.
 

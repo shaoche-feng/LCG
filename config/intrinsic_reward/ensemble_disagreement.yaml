@@ -1,6 +1,7 @@
 # MAX-inspired diffusion ensemble disagreement baseline (not an exact MAX reproduction, not an
-# exact information gain). Reward-scoring settings only; the ensemble itself (members,
-# bootstrap) is configured under `ensemble:` in trainer.yaml.
+# exact information gain). All of this method's settings: the ensemble (num_members,
+# bootstrap) and the reward scoring below. Saved configs from before this layout kept the
+# ensemble under a top-level `ensemble:` (members, bootstrap); they are read as these fields.
 #
 # Per imagined transition, every member predicts the next frame from the same frame history
 # and action with the same initial diffusion noise (s_churn=0, so the noise is the only
@@ -13,6 +14,12 @@ _target_: ensemble.EnsembleDisagreementConfig
 
 method: ensemble_disagreement
 enabled: True
+
+# Ensemble (model construction and training). num_members >= 2 denoisers, each with its own
+# initialization, optimizer, scheduler, sampling and corruption RNG. bootstrap: each member
+# weights every episode by a fixed Poisson(1) multiplicity (episode-level bootstrap).
+num_members: 5
+bootstrap: True
 
 num_noise_samples: 1
 member_selection: uniform_per_transition

@@ -58,14 +58,6 @@ collection:
     epsilon: 0.0
     num_final_episodes: 100
 
-# Denoiser ensemble: used only by intrinsic_reward=ensemble_disagreement (uniform and LCG
-# train one denoiser and ignore this). members >= 2; each member has its own initialization,
-# optimizer, scheduler, sampling and corruption RNG. bootstrap: each member weights every
-# episode by a fixed Poisson(1) multiplicity (episode-level bootstrap of the shared replay).
-ensemble:
-  members: 5
-  bootstrap: True
-
 static_dataset:
   path: null  # if specified, will disable train/test data collection
   ignore_sample_weights: True

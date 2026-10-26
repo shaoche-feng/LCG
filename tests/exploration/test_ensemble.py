@@ -22,7 +22,7 @@ from test_test_diagnostics import BASE, Crash, start, same
 from utils import rng_state
 
 ENS = [o for o in TINY if not o.startswith("intrinsic_reward.")] + [
-    "intrinsic_reward=ensemble_disagreement", "ensemble.members=3", "ensemble.bootstrap=true", "training.compile_wm=false",
+    "intrinsic_reward=ensemble_disagreement", "intrinsic_reward.num_members=3", "intrinsic_reward.bootstrap=true", "training.compile_wm=false",
     "agent.actor_critic.actor_objective=advantage_weighted"]
 OFF = ["evaluation.should=false"]
 
@@ -53,12 +53,16 @@ def tiny_denoiser(seed):
 
 def test_defaults_presets_and_single_denoiser_methods():
     cfg = compose([])
-    assert (cfg.ensemble.members, cfg.ensemble.bootstrap) == (5, True)
+    assert "ensemble" not in cfg  # the ensemble lives in intrinsic_reward
+    group = compose(["intrinsic_reward=ensemble_disagreement"])
+    assert (group.intrinsic_reward.num_members, group.intrinsic_reward.bootstrap) == (5, True)
     assert OmegaConf.select(cfg, "intrinsic_reward.method", default="lcg") == "lcg"
     preset = compose(["+experiment=walker_ensemble_100k"])
     OmegaConf.resolve(preset)
     assert preset.intrinsic_reward.method == "ensemble_disagreement"
-    assert (preset.ensemble.members, preset.ensemble.bootstrap, preset.training.compile_wm) == (5, True, False)
+    assert "ensemble" not in preset
+    assert (preset.intrinsic_reward.num_members, preset.intrinsic_reward.bootstrap, preset.training.compile_wm) == (
+        5, True, False)
     assert (preset.agent.actor_critic.actor_objective, preset.agent.actor_critic.advantage_weight_cap) == (
         "advantage_weighted", 5.0)
     assert preset.intrinsic_reward.fixed_divisor == 1.0 and preset.intrinsic_reward.reward_scaling == "fixed"
@@ -83,9 +87,9 @@ def test_uniform_and_lcg_keep_one_denoiser(tmp_path, monkeypatch, extra):
 
 
 @pytest.mark.parametrize("extra,match", [
-    (["ensemble.members=1"], "ensemble.members must be an integer >= 2"),
-    (["ensemble.members=0"], "ensemble.members must be an integer >= 2"),
-    (["ensemble.bootstrap=1"], "ensemble.bootstrap must be true or false"),
+    (["intrinsic_reward.num_members=1"], "intrinsic_reward.num_members must be an integer >= 2"),
+    (["intrinsic_reward.num_members=0"], "intrinsic_reward.num_members must be an integer >= 2"),
+    (["intrinsic_reward.bootstrap=1"], "intrinsic_reward.bootstrap must be true or false"),
     (["training.compile_wm=true"], "not compiled"),
     (["world_model_env.diffusion_sampler.s_churn=0.5"], "s_churn=0"),
     (["intrinsic_reward.num_noise_samples=0"], "num_noise_samples"),
@@ -293,7 +297,8 @@ def test_resume_matches_uninterrupted_and_rejects_changed_ensembles(tmp_path, mo
     with pytest.raises(Crash):
         crashed._run()
     monkeypatch.setattr(ExplorationTrainer, "train_agent", original)
-    for overrides, match in ((["ensemble.members=4"], "ensemble settings"), (["ensemble.bootstrap=false"], "ensemble settings"),
+    for overrides, match in ((["intrinsic_reward.num_members=4"], "ensemble settings"),
+                             (["intrinsic_reward.bootstrap=false"], "ensemble settings"),
                              (["intrinsic_reward.fixed_divisor=2.0"], "must not switch")):
         with pytest.raises(ValueError, match=match):
             start(tmp_path / "split", monkeypatch, overrides, resume=True)

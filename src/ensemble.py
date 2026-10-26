@@ -28,9 +28,12 @@ MEMBER_SELECTIONS = ("uniform_per_transition",)
 
 @dataclass
 class EnsembleDisagreementConfig:
-    """Reward-scoring settings (model construction/training settings are `ensemble.*`)."""
+    """All ensemble-disagreement settings: the ensemble (num_members, bootstrap) and the
+    reward scoring (the rest)."""
     method: str = "ensemble_disagreement"
     enabled: bool = True
+    num_members: int = 5  # ensemble construction/training: denoisers (>= 2)
+    bootstrap: bool = True  # episode-level Poisson(1) bootstrap per member
     num_noise_samples: int = 1  # shared-noise samples per transition; scores averaged
     member_selection: str = "uniform_per_transition"
     reward_scaling: str = "fixed"  # fixed: raw / fixed_divisor only; rms: RunningRMS (reset each epoch); none: raw
@@ -42,6 +45,7 @@ class EnsembleDisagreementConfig:
     def __post_init__(self) -> None:
         if self.method != "ensemble_disagreement":
             raise ValueError(f"EnsembleDisagreementConfig.method must be ensemble_disagreement, got {self.method!r}")
+        check_ensemble_settings(self.num_members, self.bootstrap)
         if isinstance(self.num_noise_samples, bool) or not isinstance(self.num_noise_samples, int) or self.num_noise_samples < 1:
             raise ValueError(f"num_noise_samples must be a positive integer, got {self.num_noise_samples!r}")
         if self.member_selection not in MEMBER_SELECTIONS:
@@ -68,9 +72,37 @@ class EnsembleDisagreementConfig:
 
 def check_ensemble_settings(members, bootstrap) -> None:
     if isinstance(members, bool) or not isinstance(members, int) or members < 2:
-        raise ValueError(f"ensemble.members must be an integer >= 2 for ensemble disagreement, got {members!r}")
+        raise ValueError(f"intrinsic_reward.num_members must be an integer >= 2 for ensemble disagreement, got {members!r}")
     if not isinstance(bootstrap, bool):
-        raise ValueError(f"ensemble.bootstrap must be true or false, got {bootstrap!r}")
+        raise ValueError(f"intrinsic_reward.bootstrap must be true or false, got {bootstrap!r}")
+
+
+LEGACY_FIELDS = (("members", "num_members"), ("bootstrap", "bootstrap"))
+
+
+def migrate_ensemble_layout(cfg):
+    """Read a config saved before the ensemble settings moved into intrinsic_reward: a
+    top-level `ensemble: {members, bootstrap}` becomes intrinsic_reward.num_members/bootstrap
+    (saved values kept). Disagreeing layouts are rejected; for other methods the old section
+    was unused and is dropped. Returns a copy; the input (and any file) is unchanged."""
+    from omegaconf import OmegaConf, open_dict
+    legacy = cfg.get("ensemble") if hasattr(cfg, "get") else None
+    if legacy is None:
+        return cfg
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg))  # unresolved copy
+    intrinsic = cfg.get("intrinsic_reward")
+    is_ensemble = intrinsic is not None and intrinsic.get("method") == "ensemble_disagreement"
+    with open_dict(cfg):
+        for old, new in LEGACY_FIELDS:
+            if old not in legacy:
+                continue
+            if is_ensemble:
+                if new in intrinsic and intrinsic[new] != legacy[old]:
+                    raise ValueError(f"Conflicting ensemble settings: ensemble.{old}={legacy[old]!r} (older layout) but "
+                                     f"intrinsic_reward.{new}={intrinsic[new]!r}; keep one layout")
+                intrinsic[new] = legacy[old]
+        del cfg["ensemble"]
+    return cfg
 
 
 def episode_multiplicity(seed: int, member: int, episode_id: int) -> int:

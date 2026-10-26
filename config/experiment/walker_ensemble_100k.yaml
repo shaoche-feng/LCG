@@ -6,6 +6,9 @@
 #   python src/main.py +experiment=walker_ensemble_100k common.devices=0 common.seed=0 \
 #       hydra.run.dir=outputs/<run name>
 #
+# Member count and bootstrap are intrinsic_reward settings (defaults 5 and true, from
+# config/intrinsic_reward/ensemble_disagreement.yaml), e.g. intrinsic_reward.num_members=5.
+#
 # Same training-data budget, collection schedule, per-member denoiser schedule, milestones and
 # test diagnostics as walker_uniform_100k / walker_lcg_100k. The PMPO actor objective is the
 # advantage-weighted one used in the LCG online pilot (cap 5); the repository default stays
@@ -33,10 +36,6 @@ evaluation:
   should: true
   every: 10
   collect_test: true
-
-ensemble:
-  members: 5
-  bootstrap: true
 
 agent:
   actor_critic:
