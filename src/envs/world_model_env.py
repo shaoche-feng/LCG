@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -12,7 +12,9 @@ from models.rew_end_model import RewEndModel
 
 ResetOutput = Tuple[torch.FloatTensor, Dict[str, Any]]
 StepOutput = Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]
-InitialCondition = Tuple[Tensor, Tensor, Tensor, Optional[Tuple[Tensor, Tensor]]]
+# obs, act, valid, rew/end-model burn-in state, preceding frame/action (feature encoder only)
+InitialCondition = Tuple[Tensor, Tensor, Tensor, Optional[Tuple[Tensor, Tensor]], Optional[Tuple[Tensor, Tensor]]]
+FeatureEncoder = Callable[[Tensor, Tensor, Tensor], Tensor]
 
 
 @dataclass
@@ -60,6 +62,7 @@ class WorldModelEnv:
         sample_ends: bool = True,
         ensemble: Optional[List[Denoiser]] = None,
         ensemble_noise_samples: int = 1,
+        feature_encoder: Optional[FeatureEncoder] = None,
     ) -> None:
         self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
         # Ensemble imagination: all members predict from the same history/action with the same
@@ -73,6 +76,12 @@ class WorldModelEnv:
                 raise ValueError("Ensemble disagreement shares the initial noise only; it needs s_churn=0")
             self.ensemble_samplers = [DiffusionSampler(d, cfg.diffusion_sampler) for d in ensemble]
         self.ensemble_noise_samples = ensemble_noise_samples
+        # Plan2Explore: feature_encoder(o_t, o_{t-n..t-1}, a_{t-n..t-1}) of each current frame is
+        # reported per step (info["plan2explore_feature"], with the taken action). The encoder's
+        # context reaches one frame further back than the sampler's window, so the frame and
+        # action preceding the window are tracked (from replay at prompts: the step before the
+        # prompt, or zero padding at an episode start, as in the denoiser's training batches).
+        self.feature_encoder = feature_encoder
         self.last_disagreement, self.last_member = None, None
         self.rew_end_model = rew_end_model
         # False: use only the reward head; imagined episodes end by horizon truncation.
@@ -103,9 +112,11 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def reset(self, **kwargs) -> ResetOutput:
-        obs, act, valid, hx_cx = self.generator_init.send(self.num_envs)
+        obs, act, valid, hx_cx, preceding = self.generator_init.send(self.num_envs)
         self.obs_buffer = obs
         self.act_buffer = act
+        if self.feature_encoder is not None:
+            self.prev_obs, self.prev_act = preceding
         if self.rew_end_model is not None:
             self.hx_rew_end, self.cx_rew_end = hx_cx
         self.ep_len = torch.zeros(self.num_envs, dtype=torch.long, device=obs.device)
@@ -115,9 +126,11 @@ class WorldModelEnv:
     @torch.no_grad()
     def reset_dead(self, dead: torch.BoolTensor) -> Tuple[Tensor, Tensor]:
         """Returns the new replay prompts of the dead rows."""
-        obs, act, valid, hx_cx = self.generator_init.send(dead.sum().item())
+        obs, act, valid, hx_cx, preceding = self.generator_init.send(dead.sum().item())
         self.obs_buffer[dead] = obs
         self.act_buffer[dead] = act
+        if self.feature_encoder is not None:
+            self.prev_obs[dead], self.prev_act[dead] = preceding
         if self.rew_end_model is not None:
             self.hx_rew_end[:, dead], self.cx_rew_end[:, dead] = hx_cx
         self.ep_len[dead] = 0
@@ -131,6 +144,14 @@ class WorldModelEnv:
             candidate_x_obs = self.obs_buffer.clone()
             candidate_x_act = self.act_buffer.clone()
 
+        feature = None
+        if self.feature_encoder is not None:
+            # Current frame o_t with o_{t-n..t-1} and a_{t-n..t-1}; the action a_t just taken
+            # is not part of it (it goes to the predictors separately). No random numbers.
+            context = torch.cat((self.prev_obs.unsqueeze(1), self.obs_buffer[:, :-1]), dim=1)
+            context_act = torch.cat((self.prev_act.unsqueeze(1), self.act_buffer[:, :-1]), dim=1)
+            feature = self.feature_encoder(self.obs_buffer[:, -1], context, context_act)
+
         next_obs, denoising_trajectory = self.predict_next_obs()
         if self.rew_end_model is None:
             rew = torch.zeros(self.num_envs, device=next_obs.device)
@@ -141,6 +162,8 @@ class WorldModelEnv:
         self.ep_len += 1
         trunc = (self.ep_len >= self.horizon).long()
 
+        if self.feature_encoder is not None:
+            self.prev_obs, self.prev_act = self.obs_buffer[:, 0].clone(), self.act_buffer[:, 0].clone()
         self.obs_buffer = self.obs_buffer.roll(-1, dims=1)
         self.act_buffer = self.act_buffer.roll(-1, dims=1)
         self.obs_buffer[:, -1] = next_obs
@@ -157,6 +180,10 @@ class WorldModelEnv:
         if self.ensemble_samplers is not None:
             info["ensemble_disagreement"] = self.last_disagreement
             info["ensemble_member"] = self.last_member
+
+        if feature is not None:
+            info["plan2explore_feature"] = feature
+            info["plan2explore_action"] = act.clone()
 
         if dead.any():
             # final_observation ends the old trajectory; the returned observation,
@@ -217,7 +244,7 @@ class WorldModelEnv:
 
         while True:
             # Preload on device and burnin rew/end model
-            obs_, act_, valid_, hx_, cx_ = [], [], [], [], []
+            obs_, act_, valid_, hx_, cx_, prev_obs_, prev_act_ = [], [], [], [], [], [], []
             for _ in range(num_batches_to_preload):
                 batch = next(data_iterator)
                 obs = batch.obs.to(self.device)
@@ -226,6 +253,10 @@ class WorldModelEnv:
                 obs_.extend(list(obs))
                 act_.extend(list(act))
                 valid_.extend(list(valid))
+                if self.feature_encoder is not None:
+                    prev_obs, prev_act = self.preceding_step(batch)
+                    prev_obs_.extend(list(prev_obs))
+                    prev_act_.extend(list(prev_act))
                 if self.rew_end_model is not None:
                     with torch.no_grad():
                         *_, (hx, cx) = self.rew_end_model.predict_rew_end(obs[:, :-1], act[:, :-1], obs[:, 1:])  # Burn-in of rew/end model
@@ -244,5 +275,22 @@ class WorldModelEnv:
                     hx = torch.stack(hx_[c : c + num_dead]).unsqueeze(0)
                     cx = torch.stack(cx_[c : c + num_dead]).unsqueeze(0)
                     hx_cx = (hx, cx)
+                preceding = None
+                if self.feature_encoder is not None:
+                    preceding = (torch.stack(prev_obs_[c : c + num_dead]), torch.stack(prev_act_[c : c + num_dead]))
                 c += num_dead
-                num_dead = yield obs, act, valid, hx_cx
+                num_dead = yield obs, act, valid, hx_cx, preceding
+
+    def preceding_step(self, batch) -> Tuple[Tensor, Tensor]:
+        """Frame and action of the replay step just before each prompt window (zeros when the
+        window is left-padded or starts its episode). Reads only obs/act of the replay episode."""
+        dataset = self.data_loader.dataset
+        b, _, c, h, w = batch.obs.shape
+        prev_obs = torch.zeros(b, c, h, w, dtype=batch.obs.dtype)
+        prev_act = torch.zeros(b, batch.act.shape[-1], dtype=batch.act.dtype)
+        for i, segment_id in enumerate(batch.segment_ids):
+            if bool(batch.mask_padding[i, 0]) and segment_id.start > 0:
+                episode = dataset.load_episode(segment_id.episode_id)
+                prev_obs[i] = episode.obs[segment_id.start - 1]
+                prev_act[i] = episode.act[segment_id.start - 1]
+        return prev_obs.to(self.device), prev_act.to(self.device)

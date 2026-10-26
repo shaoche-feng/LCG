@@ -23,6 +23,7 @@ from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
 from lcg import LCGLifecycle, selected_named_parameters
 from models.pmpo_beta import PMPOOptimizers, summary_statistics
+from plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
 from pmpo_diagnostic import PMPORunDiagnostic
 from utils import (
     broadcast_if_needed,
@@ -57,8 +58,10 @@ class ExplorationTrainer(StateDictMixin):
     every exploration learner input has them removed (collate_segments_without_rewards).
     Test diagnostics (evaluation.*, see test_diagnostics) only read them for return summaries.
 
-    The intrinsic reward is intrinsic_reward.method: "lcg" (default; one denoiser) or
-    "ensemble_disagreement" (intrinsic_reward.num_members denoisers, see ensemble.py).
+    The intrinsic reward is intrinsic_reward.method: "lcg" (default; one denoiser),
+    "ensemble_disagreement" (intrinsic_reward.num_members denoisers, see ensemble.py) or
+    "plan2explore_disagreement" (one denoiser plus intrinsic_reward.num_members lightweight
+    feature predictors, see plan2explore.py).
     """
 
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
@@ -110,9 +113,16 @@ class ExplorationTrainer(StateDictMixin):
         # Intrinsic-reward method; configs without `method` are LCG. Only the ensemble method
         # trains more than one denoiser (intrinsic_reward.num_members).
         self._method = OmegaConf.select(cfg, "intrinsic_reward.method", default="lcg") if self._learned_exploration else None
-        if self._method not in (None, "lcg", "ensemble_disagreement"):
-            raise ValueError(f"intrinsic_reward.method must be lcg or ensemble_disagreement, got {self._method!r}")
-        self._ensemble_members, self._ensemble_cfg = 1, None
+        if self._method not in (None, "lcg", "ensemble_disagreement", "plan2explore_disagreement"):
+            raise ValueError(f"intrinsic_reward.method must be lcg, ensemble_disagreement or plan2explore_disagreement, "
+                             f"got {self._method!r}")
+        self._ensemble_members, self._ensemble_cfg, self._p2e_cfg = 1, None, None
+        if self._method == "plan2explore_disagreement":
+            fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
+            self._p2e_cfg = Plan2ExploreConfig(**fields)  # plain ValueError on bad settings
+            if cfg.training.compile_wm:
+                raise ValueError("Plan2Explore imagination is validated uncompiled; set training.compile_wm=false")
+            check_feature_layers(self._p2e_cfg, instantiate(cfg.agent.denoiser), cfg.env.train.size)
         if self._method == "ensemble_disagreement":
             fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
             self._ensemble_cfg = EnsembleDisagreementConfig(**fields)  # plain ValueError on bad settings
@@ -188,6 +198,16 @@ class ExplorationTrainer(StateDictMixin):
 
         if cfg.initialization.path_to_ckpt is not None:
             self.agent.load(**cfg.initialization)
+
+        # Plan2Explore: feature extractor on the (single) denoiser and the predictor heads. The
+        # selected blocks and pooling are shape-checked on the model here, before any data.
+        self.plan2explore = None
+        if self._p2e_cfg is not None:
+            self.plan2explore = Plan2Explore(self._p2e_cfg, self.agent.denoiser, cfg.env.train.size,
+                                             action_kwargs["action_low"], action_kwargs["action_high"], seed, self._device)
+            print(f"[P2E] feature layers {self.plan2explore.extractor.layer_shapes} -> feature_dim "
+                  f"{self.plan2explore.feature_dim}; {self._p2e_cfg.num_members} heads, "
+                  f"{self.plan2explore.num_head_parameters} parameters", flush=True)
 
         # Collectors. The train collector's state (unfinished episodes, env loop position)
         # is kept here so checkpoints can save and restore it.
@@ -269,7 +289,8 @@ class ExplorationTrainer(StateDictMixin):
             ensemble = self.agent.denoisers if self.ensemble is not None else None
             rl_env = WorldModelEnv(self.agent.denoiser, None, dl_actor_critic, wm_env_cfg,
                                    return_imagined_candidate=self._method == "lcg", ensemble=ensemble,
-                                   ensemble_noise_samples=self._ensemble_cfg.num_noise_samples if ensemble else 1)
+                                   ensemble_noise_samples=self._ensemble_cfg.num_noise_samples if ensemble else 1,
+                                   feature_encoder=self.plan2explore.extractor if self.plan2explore else None)
             if cfg.training.compile_wm:
                 rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
 
@@ -294,6 +315,8 @@ class ExplorationTrainer(StateDictMixin):
         if self._method == "ensemble_disagreement":
             self._lcg_reward_scaling = self._ensemble_cfg.reward_scaling_settings()
             self._ensemble_scorer = EnsembleScorer(self._ensemble_cfg)
+        elif self._method == "plan2explore_disagreement":
+            self._lcg_reward_scaling = self._p2e_cfg.reward_scaling_settings()
         elif self._learned_exploration:
             lcg_cfg = instantiate(cfg.intrinsic_reward)
             selected_named_parameters(self.agent.denoiser, lcg_cfg.theta_s)  # fail now on a wrong theta_S, not at epoch 1
@@ -488,6 +511,16 @@ class ExplorationTrainer(StateDictMixin):
                         # continues the seed sequence (the lifecycle itself is not checkpointed).
                         self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
                         self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
+                    elif self.plan2explore is not None:
+                        # Encode the replay with this epoch's (frozen) denoiser, fit fresh heads, then
+                        # freeze them; the denoiser stays in eval mode for PMPO (only read).
+                        to_log += self.plan2explore.refresh(self.agent.denoiser, self.train_dataset,
+                                                            self.successor_observations(), epoch=self.epoch)
+                        if self._use_cuda:  # the refresh alone (gpu_peak_* below covers refresh + PMPO)
+                            to_log.append({"timing/p2e_refresh_gpu_peak_allocated_gb":
+                                           torch.cuda.max_memory_allocated(self._device) / 2 ** 30})
+                        self.agent.denoiser.eval()
+                        self.agent.actor_critic.set_intrinsic_reward_fn(self.plan2explore)
                     else:
                         # Ensemble: frozen members (eval mode, no optimizer step) score imagination.
                         for denoiser in self.agent.denoisers:
@@ -512,6 +545,12 @@ class ExplorationTrainer(StateDictMixin):
                         timing.update({"timing/lcg_refresh_seconds": t_refresh,
                                        "timing/lcg_precision_seconds": lcg.precision_seconds,
                                        "timing/lcg_scoring_seconds": lcg.scoring_seconds})
+                    if self.plan2explore is not None:
+                        # Imagination feature extraction (one extractor pass per imagined step) and
+                        # head scoring, both inside pmpo_update_seconds; the refresh is not.
+                        timing.update({"timing/p2e_refresh_seconds": t_refresh,
+                                       "timing/p2e_imagination_feature_seconds": self.plan2explore.extractor.seconds,
+                                       "timing/p2e_scoring_seconds": self.plan2explore.scoring_seconds})
                     if self._use_cuda:
                         timing["timing/gpu_peak_allocated_gb"] = torch.cuda.max_memory_allocated(self._device) / 2 ** 30
                         timing["timing/gpu_peak_reserved_gb"] = torch.cuda.max_memory_reserved(self._device) / 2 ** 30
@@ -548,10 +587,10 @@ class ExplorationTrainer(StateDictMixin):
     def lcg_reward_metrics(self) -> Dict[str, Any]:
         """Raw intrinsic scores and the policy reward (after scaling) of the last PMPO update
         (lcg_* for LCG, ens_* for ensemble disagreement)."""
-        scorer = self._lcg_lifecycle or self._ensemble_scorer
+        scorer = self._lcg_lifecycle or self._ensemble_scorer or self.plan2explore
         if scorer is None or scorer.last_raw is None:
             return {}
-        name = "lcg" if scorer is self._lcg_lifecycle else "ens"
+        name = "lcg" if scorer is self._lcg_lifecycle else scorer.metric_prefix
         metrics = {}
         for prefix, values in ((f"{name}_raw_reward", scorer.last_raw), (f"{name}_policy_reward", scorer.last_scaled)):
             values = values.float()
@@ -728,6 +767,12 @@ class ExplorationTrainer(StateDictMixin):
         if saved != expected:  # checked before any weights are loaded
             raise ValueError(f"Checkpoint was trained with ensemble settings {saved}, the config gives {expected} "
                              "(None: single denoiser); a resume must not change them")
+        state_dict.setdefault("plan2explore", None)  # checkpoints from before Plan2Explore
+        if self.plan2explore is not None:
+            self.plan2explore.check_settings(state_dict["plan2explore"])  # before any weights are loaded
+        elif state_dict["plan2explore"] is not None:
+            raise ValueError("Checkpoint was trained with Plan2Explore feature predictors, the config selects "
+                             f"intrinsic_reward method {self._method!r}; a resume must not change it")
         check_same_packages(state_dict["source"])
         super().load_state_dict(state_dict)
         self.restore_collection_state(collection)
@@ -823,14 +868,20 @@ class ExplorationTrainer(StateDictMixin):
             if milestone["retired"] and path.exists():
                 shutil.rmtree(path)
 
-    def publish_milestone(self, name: str) -> Path:
-        cfg = self._cfg
+    def successor_observations(self) -> Dict[int, torch.Tensor]:
+        """Observation after the last stored step of each unfinished training episode (the
+        collector's current observation), by episode id."""
         state = self._train_collector_state
         successors = {}
         if state.loop.obs is not None:
             for i, episode_id in enumerate(state.episode_ids):
                 if episode_id is not None:
                     successors[episode_id] = state.loop.obs[i]
+        return successors
+
+    def publish_milestone(self, name: str) -> Path:
+        cfg = self._cfg
+        successors = self.successor_observations()
         manifest = dict(
             created_by="ExplorationTrainer",
             domain=cfg.env.train.domain_name,
@@ -854,6 +905,16 @@ class ExplorationTrainer(StateDictMixin):
             manifest["ensemble"] = dict(members=self.ensemble.members, bootstrap=self.ensemble.bootstrap,
                                         downstream_default_member=0, note="denoiser.pt is member 0")
             member_states = [m.state_dict() for m in self.agent.ensemble_members]
+        if self.plan2explore is not None:
+            # Provenance only: the heads are exploration state (checkpoints/state.pt); downstream
+            # training needs just denoiser.pt and the replay.
+            p2e = self.plan2explore
+            manifest["plan2explore"] = dict(
+                num_members=p2e.cfg.num_members, feature_layers=list(p2e.cfg.feature_layers),
+                feature_dim=int(p2e.feature_dim), feature_sigma=float(p2e.cfg.feature_sigma),
+                pool_size=int(p2e.cfg.pool_size), probe_sha256=p2e.extractor.probe_sha256,
+                last_refresh_epoch=p2e.last_refresh_epoch, refreshes=int(p2e.refreshes),
+                note="single denoiser; feature predictors are not part of the milestone")
         return publish_milestone(self._path_milestones, name, self.agent.denoiser.state_dict(),
                                  self.train_dataset, successors, manifest, member_states)
 

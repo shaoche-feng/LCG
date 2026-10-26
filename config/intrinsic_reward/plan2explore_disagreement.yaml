@@ -1,0 +1,47 @@
+# Plan2Explore-style lightweight ensemble disagreement on DIAMOND (an adaptation, not an exact
+# Plan2Explore reproduction; design: docs/PLAN2EXPLORE_DESIGN.md). All of this method's settings.
+# The agent keeps ONE diffusion denoiser, which still generates every imagined frame;
+# num_members counts the lightweight next-feature predictors (for ensemble_disagreement it
+# counts denoisers). Every number below is a working placeholder, not a tuned or validated value.
+#
+# Feature of a frame o_t: the frozen denoiser's selected UNet block outputs for the input
+# o_t + feature_sigma * eps + sigma_offset_noise * eps_offset (one fixed probe from probe_seed,
+# shared by all frames and heads), conditioned on the real preceding frames o_{t-n..t-1} and
+# actions a_{t-n..t-1} (zero padding before an episode start, as in denoiser training), with the
+# normal EDM preconditioning at feature_sigma; each map average-pooled to pool_size x pool_size,
+# concatenated, standardized with the epoch's training-replay mean/std (std >= feature_std_floor).
+# Heads: f_k(z_t, a_t) -> z_{t+1}, refitted from scratch after every denoiser phase, frozen in PMPO.
+# Raw reward of an imagined transition: mean over features of the sample variance (K - 1) of the
+# heads' predicted means.
+_target_: plan2explore.Plan2ExploreConfig
+
+method: plan2explore_disagreement
+enabled: True
+
+num_members: 5  # predictor heads, >= 2
+bootstrap: True  # episode-level Poisson(1) multiplicities per refresh and member
+
+# InnerModel module names (default architecture: depths [2,2,2,2], channels [64]*4, 64x64 input).
+#   unet.d_blocks.2  (64, 16, 16)  last two downsampling resolutions (default)
+#   unet.d_blocks.3  (64, 8, 8)
+#   unet.mid_blocks  (64, 8, 8)    deepest/middle alternative
+#   unet.u_blocks.2  (64, 32, 32)  middle upsampling alternative (unet.u_blocks.1: (64, 16, 16))
+feature_layers: [unet.d_blocks.2, unet.d_blocks.3]
+pool_size: 4  # 4x4 adaptive average pooling per map: 2 x 64 x 16 = 2048 features by default
+# Pixel-noise sigma of the probe. The input also carries the denoiser's offset noise
+# (agent.denoiser.sigma_offset_noise = 0.3), so the effective conditioning sigma is
+# sqrt(0.1^2 + 0.3^2) ~= 0.316; lowering feature_sigma alone does not give a near-clean probe.
+feature_sigma: 0.1
+probe_seed: 0
+feature_std_floor: 1e-3
+encode_batch_size: 256  # frames per extractor call (replay encoding); no effect on the features
+
+hidden_dims: [256, 256]
+activation: silu
+lr: 1e-3  # Adam
+batch_size: 256
+fit_updates: 500  # per head, after every denoiser phase
+
+# Policy reward = raw / fixed_divisor (provisional 1.0); none: raw.
+reward_scaling: fixed
+fixed_divisor: 1.0
