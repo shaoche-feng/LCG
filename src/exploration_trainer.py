@@ -24,6 +24,7 @@ from ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTrainin
 from lcg import LCGLifecycle, selected_named_parameters
 from models.pmpo_beta import PMPOOptimizers, summary_statistics
 from plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
+from laplace import LaplaceConfig, LaplaceEnsemble, LaplaceScorer
 from pmpo_diagnostic import PMPORunDiagnostic
 from utils import (
     broadcast_if_needed,
@@ -61,7 +62,8 @@ class ExplorationTrainer(StateDictMixin):
     The intrinsic reward is intrinsic_reward.method: "lcg" (default; one denoiser),
     "ensemble_disagreement" (intrinsic_reward.num_members denoisers, see ensemble.py) or
     "plan2explore_disagreement" (one denoiser plus intrinsic_reward.num_members lightweight
-    feature predictors, see plan2explore.py).
+    feature predictors, see plan2explore.py) or "laplace_disagreement" (one denoiser and
+    intrinsic_reward.num_members Gaussian samples of its LCG-selected parameters, see laplace.py).
     """
 
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
@@ -113,10 +115,17 @@ class ExplorationTrainer(StateDictMixin):
         # Intrinsic-reward method; configs without `method` are LCG. Only the ensemble method
         # trains more than one denoiser (intrinsic_reward.num_members).
         self._method = OmegaConf.select(cfg, "intrinsic_reward.method", default="lcg") if self._learned_exploration else None
-        if self._method not in (None, "lcg", "ensemble_disagreement", "plan2explore_disagreement"):
-            raise ValueError(f"intrinsic_reward.method must be lcg, ensemble_disagreement or plan2explore_disagreement, "
-                             f"got {self._method!r}")
-        self._ensemble_members, self._ensemble_cfg, self._p2e_cfg = 1, None, None
+        if self._method not in (None, "lcg", "ensemble_disagreement", "plan2explore_disagreement", "laplace_disagreement"):
+            raise ValueError(f"intrinsic_reward.method must be lcg, ensemble_disagreement, plan2explore_disagreement or "
+                             f"laplace_disagreement, got {self._method!r}")
+        self._ensemble_members, self._ensemble_cfg, self._p2e_cfg, self._laplace_cfg = 1, None, None, None
+        if self._method == "laplace_disagreement":
+            fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
+            self._laplace_cfg = LaplaceConfig(**fields)  # plain ValueError on bad settings
+            if cfg.training.compile_wm:
+                raise ValueError("Laplace ensemble imagination is not compiled; set training.compile_wm=false")
+            if cfg.world_model_env.diffusion_sampler.s_churn != 0:
+                raise ValueError("Laplace members share the initial noise only; it needs s_churn=0")
         if self._method == "plan2explore_disagreement":
             fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
             self._p2e_cfg = Plan2ExploreConfig(**fields)  # plain ValueError on bad settings
@@ -209,6 +218,16 @@ class ExplorationTrainer(StateDictMixin):
                   f"{self.plan2explore.feature_dim}; {self._p2e_cfg.num_members} heads, "
                   f"{self.plan2explore.num_head_parameters} parameters", flush=True)
 
+        # Laplace: LCG's selection (and its guards) on the single denoiser; samples are drawn at
+        # each refresh. The agent holds one denoiser; members exist only as a sample bank.
+        self.laplace = None
+        if self._laplace_cfg is not None:
+            self.laplace = LaplaceEnsemble(self._laplace_cfg, self.agent.denoiser,
+                                           instantiate(cfg.denoiser.sigma_distribution), seed, self._device)
+            print(f"[LAPLACE] {len(self.laplace.names)} selected tensors, {self.laplace.dim} scalars; "
+                  f"{self._laplace_cfg.num_members} samples; shared prefix "
+                  f"{'on' if self.laplace.use_prefix else 'off'}", flush=True)
+
         # Collectors. The train collector's state (unfinished episodes, env loop position)
         # is kept here so checkpoints can save and restore it.
         self._train_collector_state = CollectorState()
@@ -289,8 +308,10 @@ class ExplorationTrainer(StateDictMixin):
             ensemble = self.agent.denoisers if self.ensemble is not None else None
             rl_env = WorldModelEnv(self.agent.denoiser, None, dl_actor_critic, wm_env_cfg,
                                    return_imagined_candidate=self._method == "lcg", ensemble=ensemble,
-                                   ensemble_noise_samples=self._ensemble_cfg.num_noise_samples if ensemble else 1,
-                                   feature_encoder=self.plan2explore.extractor if self.plan2explore else None)
+                                   ensemble_noise_samples=(self._ensemble_cfg.num_noise_samples if ensemble else
+                                                           self._laplace_cfg.num_noise_samples if self.laplace else 1),
+                                   feature_encoder=self.plan2explore.extractor if self.plan2explore else None,
+                                   member_predictor=self.laplace.predict_members if self.laplace else None)
             if cfg.training.compile_wm:
                 rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
 
@@ -317,6 +338,9 @@ class ExplorationTrainer(StateDictMixin):
             self._ensemble_scorer = EnsembleScorer(self._ensemble_cfg)
         elif self._method == "plan2explore_disagreement":
             self._lcg_reward_scaling = self._p2e_cfg.reward_scaling_settings()
+        elif self._method == "laplace_disagreement":
+            self._lcg_reward_scaling = self._laplace_cfg.reward_scaling_settings()
+            self._ensemble_scorer = LaplaceScorer(self._laplace_cfg)
         elif self._learned_exploration:
             lcg_cfg = instantiate(cfg.intrinsic_reward)
             selected_named_parameters(self.agent.denoiser, lcg_cfg.theta_s)  # fail now on a wrong theta_S, not at epoch 1
@@ -521,6 +545,16 @@ class ExplorationTrainer(StateDictMixin):
                                            torch.cuda.max_memory_allocated(self._device) / 2 ** 30})
                         self.agent.denoiser.eval()
                         self.agent.actor_critic.set_intrinsic_reward_fn(self.plan2explore)
+                    elif self.laplace is not None:
+                        # LCG's precision on this epoch's denoiser, then a fresh sample bank, frozen
+                        # for the PMPO phase; the base denoiser is only read (eval mode).
+                        to_log.append(self.laplace.refresh(self.train_dataset, epoch=self.epoch))
+                        if self._use_cuda:  # the refresh alone (gpu_peak_* below covers refresh + PMPO)
+                            to_log.append({"timing/laplace_refresh_gpu_peak_allocated_gb":
+                                           torch.cuda.max_memory_allocated(self._device) / 2 ** 30})
+                        self.agent.denoiser.eval()
+                        self._ensemble_scorer.reset()
+                        self.agent.actor_critic.set_intrinsic_reward_fn(self._ensemble_scorer)
                     else:
                         # Ensemble: frozen members (eval mode, no optimizer step) score imagination.
                         for denoiser in self.agent.denoisers:
@@ -551,6 +585,13 @@ class ExplorationTrainer(StateDictMixin):
                         timing.update({"timing/p2e_refresh_seconds": t_refresh,
                                        "timing/p2e_imagination_feature_seconds": self.plan2explore.extractor.seconds,
                                        "timing/p2e_scoring_seconds": self.plan2explore.scoring_seconds})
+                    if self.laplace is not None:
+                        # Member predictions (all K complete chains per imagined step) are inside
+                        # pmpo_update_seconds; the refresh (precision + sampling) is not.
+                        timing.update({"timing/laplace_refresh_seconds": t_refresh,
+                                       "timing/laplace_prediction_seconds": self.laplace.prediction_seconds,
+                                       "timing/laplace_prediction_calls": self.laplace.prediction_calls,
+                                       "timing/laplace_shared_prefix_evaluations": self.laplace.prefix_evaluations})
                     if self._use_cuda:
                         timing["timing/gpu_peak_allocated_gb"] = torch.cuda.max_memory_allocated(self._device) / 2 ** 30
                         timing["timing/gpu_peak_reserved_gb"] = torch.cuda.max_memory_reserved(self._device) / 2 ** 30
@@ -767,6 +808,12 @@ class ExplorationTrainer(StateDictMixin):
         if saved != expected:  # checked before any weights are loaded
             raise ValueError(f"Checkpoint was trained with ensemble settings {saved}, the config gives {expected} "
                              "(None: single denoiser); a resume must not change them")
+        state_dict.setdefault("laplace", None)  # checkpoints from before the Laplace ensemble
+        if self.laplace is not None:
+            self.laplace.check_settings(state_dict["laplace"])  # before any weights are loaded
+        elif state_dict["laplace"] is not None:
+            raise ValueError("Checkpoint was trained with a Laplace sample bank, the config selects "
+                             f"intrinsic_reward method {self._method!r}; a resume must not change it")
         state_dict.setdefault("plan2explore", None)  # checkpoints from before Plan2Explore
         if self.plan2explore is not None:
             self.plan2explore.check_settings(state_dict["plan2explore"])  # before any weights are loaded
@@ -915,6 +962,15 @@ class ExplorationTrainer(StateDictMixin):
                 pool_size=int(p2e.cfg.pool_size), probe_sha256=p2e.extractor.probe_sha256,
                 last_refresh_epoch=p2e.last_refresh_epoch, refreshes=int(p2e.refreshes),
                 note="single denoiser; feature predictors are not part of the milestone")
+        if self.laplace is not None:
+            # Provenance only: denoiser.pt is the unperturbed trained model; the sample bank is
+            # exploration state (checkpoints/state.pt), not used downstream.
+            lap = self.laplace
+            manifest["laplace"] = dict(
+                num_members=lap.cfg.num_members, posterior_temperature=float(lap.cfg.posterior_temperature),
+                selected_include=list(lap.cfg.theta_s.include), selected_dim=int(lap.dim),
+                refresh_epoch=lap.refresh_epoch, refreshes=int(lap.refreshes),
+                note="denoiser.pt is the unperturbed base model; sampled members are not part of the milestone")
         return publish_milestone(self._path_milestones, name, self.agent.denoiser.state_dict(),
                                  self.train_dataset, successors, manifest, member_states)
 

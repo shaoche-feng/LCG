@@ -6,7 +6,7 @@ from .forward_jvp import (
     unflatten_to_dict,
 )
 from .intrinsic_reward import imagined_candidates_from_batch, make_lcg_intrinsic_reward_fn
-from .lifecycle import LCGConfig, LCGLifecycle
+from .lifecycle import LCGConfig, LCGLifecycle, lcg_historical_precision
 from .precision import assert_setup_valid, historical_precision, load_transition, sample_uniform_historical_transitions
 from .reward_normalization import RunningRMS, RunningRMSConfig, wrap_with_running_rms
 from .theta_s import (

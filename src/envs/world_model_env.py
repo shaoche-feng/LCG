@@ -15,6 +15,9 @@ StepOutput = Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]
 # obs, act, valid, rew/end-model burn-in state, preceding frame/action (feature encoder only)
 InitialCondition = Tuple[Tensor, Tensor, Tensor, Optional[Tuple[Tensor, Tensor]], Optional[Tuple[Tensor, Tensor]]]
 FeatureEncoder = Callable[[Tensor, Tensor, Tensor], Tensor]
+# member_predictor(sampler, obs_buffer, act_buffer, noise) -> (members, b, c, h, w) completed
+# next-frame predictions from shared initial noise (e.g. sampled-parameter members).
+MemberPredictor = Callable[[DiffusionSampler, Tensor, Tensor, Tensor], Tensor]
 
 
 @dataclass
@@ -32,9 +35,11 @@ class ImaginedCandidate:
 
 
 def ensemble_disagreement(predictions: Tensor) -> Tensor:
-    """predictions: (members, batch, channels, height, width) next frames in the model's
-    [-1, 1] float space (unquantized). Population variance across members, averaged over
-    members, channels and pixels: mean_pixels(mean_members((p - mean_members(p))^2)) -> (batch,)."""
+    """predictions: (members, batch, channels, height, width) completed next frames as the
+    diffusion sampler returns them: float tensors in [-1, 1] whose values lie on the uint8 grid
+    (the final Euler step returns the last denoiser output, which Denoiser.wrap_model_output
+    quantizes). Population variance across members, averaged over members, channels and
+    pixels: mean_pixels(mean_members((p - mean_members(p))^2)) -> (batch,)."""
     centered = predictions - predictions.mean(dim=0, keepdim=True)
     return centered.square().mean(dim=0).flatten(1).mean(dim=1)
 
@@ -63,6 +68,7 @@ class WorldModelEnv:
         ensemble: Optional[List[Denoiser]] = None,
         ensemble_noise_samples: int = 1,
         feature_encoder: Optional[FeatureEncoder] = None,
+        member_predictor: Optional[MemberPredictor] = None,
     ) -> None:
         self.sampler = DiffusionSampler(denoiser, cfg.diffusion_sampler)
         # Ensemble imagination: all members predict from the same history/action with the same
@@ -75,6 +81,14 @@ class WorldModelEnv:
             if cfg.diffusion_sampler.s_churn != 0:
                 raise ValueError("Ensemble disagreement shares the initial noise only; it needs s_churn=0")
             self.ensemble_samplers = [DiffusionSampler(d, cfg.diffusion_sampler) for d in ensemble]
+        # Sampled-parameter ensembles (Laplace) give their members' predictions through
+        # member_predictor; disagreement and member selection are the same as above.
+        self.member_predictor = member_predictor
+        if member_predictor is not None:
+            if ensemble is not None:
+                raise ValueError("Give either an ensemble of denoisers or a member predictor, not both")
+            if cfg.diffusion_sampler.s_churn != 0:
+                raise ValueError("Ensemble disagreement shares the initial noise only; it needs s_churn=0")
         self.ensemble_noise_samples = ensemble_noise_samples
         # Plan2Explore: feature_encoder(o_t, o_{t-n..t-1}, a_{t-n..t-1}) of each current frame is
         # reported per step (info["plan2explore_feature"], with the taken action). The encoder's
@@ -177,7 +191,7 @@ class WorldModelEnv:
         if self.return_imagined_candidate:
             info["imagined_candidate"] = ImaginedCandidate(candidate_x_obs, candidate_x_act, next_obs.clone())
 
-        if self.ensemble_samplers is not None:
+        if self.ensemble_samplers is not None or self.member_predictor is not None:
             info["ensemble_disagreement"] = self.last_disagreement
             info["ensemble_member"] = self.last_member
 
@@ -196,7 +210,7 @@ class WorldModelEnv:
 
     @torch.no_grad()
     def predict_next_obs(self) -> Tuple[Tensor, List[Tensor]]:
-        if self.ensemble_samplers is None:
+        if self.ensemble_samplers is None and self.member_predictor is None:
             return self.sampler.sample(self.obs_buffer, self.act_buffer)
         return self.predict_next_obs_ensemble(), []
 
@@ -209,12 +223,15 @@ class WorldModelEnv:
         scores, first = [], None
         for s in range(self.ensemble_noise_samples):
             noise = torch.randn(b, c, h, w, device=self.obs_buffer.device)
-            predictions = torch.stack([smp.sample(self.obs_buffer, self.act_buffer, noise)[0]
-                                       for smp in self.ensemble_samplers])  # (members, b, c, h, w)
+            if self.member_predictor is not None:
+                predictions = self.member_predictor(self.sampler, self.obs_buffer, self.act_buffer, noise)
+            else:
+                predictions = torch.stack([smp.sample(self.obs_buffer, self.act_buffer, noise)[0]
+                                           for smp in self.ensemble_samplers])  # (members, b, c, h, w)
             scores.append(ensemble_disagreement(predictions))
             if s == 0:
                 first = predictions
-        member = torch.randint(len(self.ensemble_samplers), (b,), device=self.obs_buffer.device)
+        member = torch.randint(first.shape[0], (b,), device=self.obs_buffer.device)
         self.last_disagreement = torch.stack(scores).mean(dim=0)
         self.last_member = member
         return first[member, torch.arange(b, device=member.device)]

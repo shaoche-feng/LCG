@@ -1,8 +1,9 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from torch import Tensor
+from torch.func import functional_call
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -106,9 +107,14 @@ class Denoiser(nn.Module):
         c_noise = sigma.log() / 4
         return Conditioners(*(add_dims(c, n) for c, n in zip((c_in, c_out, c_skip, c_noise), (4, 4, 4, 1, 1))))
 
-    def compute_model_output(self, noisy_next_obs: Tensor, obs: Tensor, act: Tensor, cs: Conditioners) -> Tensor:
+    def compute_model_output(self, noisy_next_obs: Tensor, obs: Tensor, act: Tensor, cs: Conditioners,
+                             params: Optional[Dict[str, Tensor]] = None) -> Tensor:
+        """params: optional InnerModel parameter values substituted for this call only
+        (torch.func.functional_call); the module's own weights are never modified."""
         rescaled_obs = obs / self.cfg.sigma_data
         rescaled_noise = noisy_next_obs * cs.c_in
+        if params is not None:
+            return functional_call(self.inner_model, params, (rescaled_noise, cs.c_noise, rescaled_obs, act))
         return self.inner_model(rescaled_noise, cs.c_noise, rescaled_obs, act)
     
     @torch.no_grad()
@@ -119,9 +125,10 @@ class Denoiser(nn.Module):
         return d
     
     @torch.no_grad()
-    def denoise(self, noisy_next_obs: Tensor, sigma: Tensor, obs: Tensor, act: Tensor) -> Tensor:
+    def denoise(self, noisy_next_obs: Tensor, sigma: Tensor, obs: Tensor, act: Tensor,
+                params: Optional[Dict[str, Tensor]] = None) -> Tensor:
         cs = self.compute_conditioners(sigma)
-        model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
+        model_output = self.compute_model_output(noisy_next_obs, obs, act, cs, params)
         denoised = self.wrap_model_output(noisy_next_obs, model_output, cs)
         return denoised
 

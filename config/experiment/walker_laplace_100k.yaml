@@ -1,0 +1,63 @@
+# @package _global_
+# Step 6 Laplace-inspired sampled diffusion ensemble (one denoiser, 5 Gaussian samples of its
+# LCG-selected R1 parameters from LCG's historical precision; full-ensemble pixel disagreement).
+# Settings: config/intrinsic_reward/laplace_disagreement.yaml.
+#
+#   python src/main.py +experiment=walker_laplace_100k common.devices=0 common.seed=0 \
+#       hydra.run.dir=outputs/<run name>
+# On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
+# scripts/resume.sh <run folder>.
+#
+# Same training-data budget, collection schedule, denoiser schedule, milestones, test diagnostics
+# and controller as walker_ensemble_100k (advantage-weighted PMPO, cap 5). The maintained
+# walker_lcg_100k preset is sign-only: controlled comparisons with LCG must align the controller
+# explicitly. R1 guards and LCG's historical settings (320 / 3 / 1e-4) as in walker_lcg_100k.
+defaults:
+  - override /intrinsic_reward: laplace_disagreement
+
+env:
+  train:
+    domain_name: walker
+    task_names: [stand, walk, run]
+
+collection:
+  train:
+    num_envs: 1
+    first_epoch:
+      min: 5000
+      mode: uniform
+    mode: policy
+    steps_per_epoch: 500
+    num_steps_total: 100000
+
+evaluation:
+  should: true
+  every: 10
+  collect_test: true
+
+intrinsic_reward:
+  theta_s:
+    include: ["unet.u_blocks.3.resblocks.0.*"]
+    exclude: []
+    expected_num_tensors: 10
+    expected_dim: 217664
+  precision_reference_size: 320
+  precision_num_mc: 3
+  damping: 1e-4
+  beta: 1.0
+
+agent:
+  actor_critic:
+    actor_objective: advantage_weighted
+    advantage_weight_cap: 5.0
+
+training:
+  compile_wm: false
+
+common:
+  seed: 0
+
+wandb:
+  mode: online
+  project: lcg-reward-free
+  name: walker-laplace-100k

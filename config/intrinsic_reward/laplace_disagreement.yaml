@@ -1,0 +1,41 @@
+# Laplace-inspired sampled diffusion ensemble disagreement (design: docs/LAPLACE_ENSEMBLE_DESIGN.md).
+# All of this method's settings. One trained denoiser; after each denoiser phase LCG's historical
+# precision h over the selected parameters theta_S (same selector, settings and code as LCG)
+# defines q(theta_S) = Normal(theta_hat_S, posterior_temperature * diag(h)^-1); num_members samples
+# are drawn once per refresh and frozen for that epoch's PMPO phase (the central model is not a
+# member). Every member runs the full diffusion chain from the same initial noise with its
+# sampled parameters fixed; reward and next observation are the full ensemble's (population
+# pixel variance; one uniformly drawn member per trajectory and transition). A curvature-based
+# approximation, not a calibrated posterior. Values are working placeholders, not tuned.
+_target_: laplace.LaplaceConfig
+
+method: laplace_disagreement
+enabled: True
+
+num_members: 5  # sampled parameter sets, >= 2
+posterior_temperature: 1.0  # covariance multiplier T: perturbation std = sqrt(T) / sqrt(h)
+
+# Selected parameters: LCG's R1 (first ResBlock of the last decoder level), LCG's selector.
+theta_s:
+  _target_: lcg.theta_s.ThetaSConfig
+  include: ["unet.u_blocks.3.resblocks.0.*"]
+  exclude: []
+  expected_num_tensors: null
+  expected_dim: null
+
+# LCG's historical precision, unchanged (lcg.lcg_historical_precision): diagonal
+# damping + beta * (N / B) * sum over B reference transitions of the probe-averaged squared VJP.
+precision_reference_size: 320  # B, the reference-bank size (not a posterior data count)
+precision_num_mc: 3
+damping: 1e-4
+beta: 1.0
+
+num_noise_samples: 1
+member_selection: uniform_per_transition
+# First denoising evaluation: run the shared U-Net prefix once (exact; only for selections in
+# the last decoder level / norm_out / conv_out), later evaluations per member.
+shared_prefix: True
+
+# Policy reward = raw / fixed_divisor (provisional 1.0, not LCG's 100); none: raw.
+reward_scaling: fixed
+fixed_divisor: 1.0

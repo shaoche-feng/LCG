@@ -149,11 +149,7 @@ class LCGLifecycle:
         params = list(theta_s_named.values())
 
         start = _synchronized_time(self.device)
-        self.h_D = historical_precision(
-            denoiser, params, dataset, self.sigma_cfg,
-            B=self.cfg.precision_reference_size, N=dataset.num_steps, num_mc=self.cfg.precision_num_mc,
-            beta=self.cfg.beta, damping=self.cfg.damping, seed=seed,
-        )
+        self.h_D = lcg_historical_precision(denoiser, params, dataset, self.sigma_cfg, self.cfg, round_identifier)
         self.precision_seconds = _synchronized_time(self.device) - start
         self.scoring_seconds = 0.0
         assert_setup_valid(theta_s_named, self.h_D, d_S=self._theta_s_dim)
@@ -199,6 +195,20 @@ class LCGLifecycle:
         if self.cfg.reward_scaling == "rms":
             return self.rms(raw)
         return raw
+
+
+def lcg_historical_precision(denoiser: Denoiser, params, dataset: Dataset, sigma_cfg: SigmaDistributionConfig, cfg,
+                             round_identifier: int) -> Tensor:
+    """LCG's historical precision h_D of one refresh round, exactly as LCG uses it (shared with
+    the Laplace ensemble). cfg supplies precision_reference_size (B), precision_num_mc, beta and
+    damping; N is the replay size; the round identifier seeds the reference draw and probes.
+    Diagonal: damping + beta * (N / B) * sum over B reference transitions of the probe-averaged
+    squared VJP sqrt(2) xi^T F_theta (see precision.historical_precision)."""
+    return historical_precision(
+        denoiser, params, dataset, sigma_cfg,
+        B=cfg.precision_reference_size, N=dataset.num_steps, num_mc=cfg.precision_num_mc,
+        beta=cfg.beta, damping=cfg.damping, seed=round_identifier,
+    )
 
 
 def _synchronized_time(device: torch.device) -> float:
