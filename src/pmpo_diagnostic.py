@@ -10,6 +10,7 @@ import wandb
 
 from coroutines.frame_history import FrameHistory
 from envs.dm_control_env import DMControlEnv
+from models.pmpo_beta import flat_metric_name
 
 # Clean wandb namespace for the main PMPO monitoring metrics (see check_update);
 # mirrored only when a wandb run is already active (wandb.mode != "disabled"), so
@@ -365,8 +366,10 @@ class PMPORunDiagnostic:
         return summary
 
     def finish_epoch(self, epoch, logs, real_steps):
-        rows = [{k.removeprefix("actor_critic/train/"): float(v) for k, v in log.items()}
-                for log in logs if "actor_critic/train/loss_actor" in log]
+        # Trainer rows hold grouped paths (actor_critic/train/<group>/<name>); back to flat names.
+        rows = [{flat_metric_name(k.removeprefix("actor_critic/train/")): float(v) for k, v in log.items()
+                 if k.startswith("actor_critic/train/")}
+                for log in logs if "actor_critic/train/core/loss_actor" in log]
         if not rows:
             raise DiagnosticStop("Epoch had no PMPO updates")
         aggregate = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}

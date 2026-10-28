@@ -392,8 +392,8 @@ def test_trainer_runs_one_denoiser_with_frozen_bank(tmp_path, monkeypatch):
     keys = set().union(*logs)
     for key in ("laplace/precision_median", "laplace/member_2_relative_perturbation", "laplace/selected_dim",
                 "timing/laplace_refresh_seconds", "timing/laplace_prediction_seconds",
-                "timing/laplace_precision_seconds", "actor_critic/train/laplace_raw_reward_mean",
-                "actor_critic/train/laplace_policy_reward_p99"):
+                "timing/laplace_precision_seconds", "actor_critic/train/intrinsic/raw_reward_mean",
+                "actor_critic/train/intrinsic/scaled_reward_max"):
         assert key in keys, key
     assert all(row["timing/laplace_shared_prefix_evaluations"] > 0 for row in logs if "timing/laplace_shared_prefix_evaluations" in row)
 

@@ -81,12 +81,13 @@ def test_trainer_policy_reward_is_raw_lcg_over_the_fixed_divisor(tmp_path, monke
     assert len(rewards) == trainer.agent.actor_critic.updates.item() == 3 and trainer._lcg_lifecycle.rms is None
     for raw, reward in rewards:
         assert torch.equal(reward, raw / 100.0)
-    rows = [row for row in logs if "actor_critic/train/lcg_raw_reward_mean" in row]
+    rows = [row for row in logs if "actor_critic/train/intrinsic/raw_reward_mean" in row]
     assert len(rows) == 3
     for row, (raw, reward) in zip(rows, rewards):
-        assert row["actor_critic/train/lcg_raw_reward_max"] == raw.max()
-        assert row["actor_critic/train/lcg_policy_reward_mean"] == reward.float().mean()
-        assert {f"actor_critic/train/lcg_policy_reward_{k}" for k in ("std", "p10", "median", "p90", "p99")} <= set(row)
+        assert row["actor_critic/train/intrinsic/raw_reward_max"] == raw.max()
+        assert row["actor_critic/train/intrinsic/scaled_reward_mean"] == reward.float().mean()
+        assert row["actor_critic/train/intrinsic/scaled_reward_max"] == reward.float().max()
+        assert not any("/debug/" in k for k in row)  # distribution detail only with debug metrics
     assert any("timing/lcg_scoring_seconds" in row and "timing/pmpo_update_seconds" in row for row in logs)
 
 

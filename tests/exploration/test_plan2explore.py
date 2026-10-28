@@ -664,9 +664,9 @@ def test_trainer_runs_one_denoiser_and_logs(tmp_path, monkeypatch):
     for key in ("plan2explore/eligible_transitions", "plan2explore/member_2_loss_last", "plan2explore/feature_dim",
                 "plan2explore/near_constant_coordinates", "timing/p2e_feature_preparation_seconds",
                 "timing/p2e_fit_seconds", "timing/p2e_scoring_seconds", "timing/p2e_imagination_feature_seconds",
-                "actor_critic/train/p2e_raw_reward_mean", "actor_critic/train/p2e_policy_reward_p99"):
+                "actor_critic/train/intrinsic/raw_reward_mean", "actor_critic/train/intrinsic/scaled_reward_max"):
         assert key in keys, key
-    rewards = [row["actor_critic/train/p2e_raw_reward_mean"] for row in logs if "actor_critic/train/p2e_raw_reward_mean" in row]
+    rewards = [row["actor_critic/train/intrinsic/raw_reward_mean"] for row in logs if "actor_critic/train/intrinsic/raw_reward_mean" in row]
     assert all(torch.isfinite(torch.as_tensor(r)) and r > 0 for r in rewards)
 
 

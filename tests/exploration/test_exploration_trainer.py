@@ -153,7 +153,7 @@ def test_changing_task_rewards_does_not_change_exploration(tmp_path, monkeypatch
             torch.testing.assert_close(b.agent.state_dict()[key], value, rtol=0, atol=0)
     torch.testing.assert_close(a._lcg_lifecycle.h_D, b._lcg_lifecycle.h_D, rtol=0, atol=0)
     rows = numeric_logs(logs_a)
-    assert any("actor_critic/train/loss_actor" in row and "actor_critic/train/action_mean_0" in row for row in rows)
+    assert any("actor_critic/train/core/loss_actor" in row and "actor_critic/train/gaussian/policy_conditional_std_0" in row for row in rows)
     assert any("denoiser/test/loss_denoising" in row for row in rows)
     # Task returns are not logged, so every logged row is identical: losses, PMPO metrics, actions.
     assert rows == numeric_logs(logs_b)

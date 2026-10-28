@@ -119,7 +119,7 @@ def test_actor_value_prior_share_identical_state_representation():
 
 def test_imagined_likelihood_replay_equals_generation_and_fixed_stacks_vary():
     from test_pmpo_integration import make_system
-    model, _ = make_system()
+    model, _ = make_system(debug_metrics=True)  # the fixed-state probes are debug metrics
     rollout = model.collect_imagination()
     states, _, _, _, _, raw, values, _, _ = rollout
     assert states.shape == (2, 3, 12, 8, 8)

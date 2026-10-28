@@ -63,7 +63,10 @@ class PMPOBetaConfig:
     imagination_horizon: int = 15
     max_grad_norm: float = 10.0
     seed: int = 0
-    log_diagnostics: bool = False
+    log_diagnostics: bool = False  # print every update's metrics as JSON on the terminal
+    # Detailed per-update metrics (logged under actor_critic/train/debug/). False: the debug-only
+    # quantities are not computed at all. Logging only: losses, updates and state are identical.
+    debug_metrics: bool = False
     # Slow EMA critic regularization (reference controller), adapted to the scalar critic. With
     # slow_critic_coef > 0 an EMA copy of the critic (outside the optimizer, no gradients) is kept,
     # value_loss += slow_critic_coef * MSE(V(s), sg(V_slow(s))) on the same states and mean
@@ -79,6 +82,42 @@ class PMPOBetaConfig:
     # configs saved before this field keep it): the stack starts from the latest prompt frames.
     # Real-environment histories always repeat the reset observation.
     imagination_history: str = "replay_prompt"
+
+
+# Logged metric groups (actor_critic/train/<group>/<name>); every other metric is debug-only.
+CORE_METRICS = ("loss_actor", "loss_value", "kl_prior", "policy_entropy", "return_mean", "value_mean",
+                "value_target_correlation", "positive_fraction", "actor_grad_norm", "value_grad_norm",
+                "num_batch_train_actor_critic")
+EMA_METRICS = ("loss_value_target", "loss_slowreg", "slow_value_gap")
+DISTRIBUTION_METRIC_PREFIXES = dict(tanh_gaussian=("pretanh_", "tanh_inverse_limited_fraction", "policy_conditional_std_"),
+                                    beta=("alpha_", "beta_", "policy_conditional_std_"))
+DISTRIBUTION_GROUPS = dict(tanh_gaussian="gaussian", beta="beta")
+# Renamed in their groups: flat model name -> path within actor_critic/train/.
+RENAMED_METRICS = {"weight_clipped_fraction_positive": "weights/clipped_fraction_positive",
+                   "weight_clipped_fraction_negative": "weights/clipped_fraction_negative",
+                   **{f"intrinsic_{kind}_reward_{stat}": f"intrinsic/{kind}_reward_{stat}"
+                      for kind in ("raw", "scaled") for stat in ("mean", "max")}}
+
+
+def metric_path(name, actor_distribution):
+    """W&B path of a flat controller metric below actor_critic/train/."""
+    if name in CORE_METRICS:
+        return f"core/{name}"
+    if name in EMA_METRICS:
+        return f"EMA/{name}"
+    if name in RENAMED_METRICS:
+        return RENAMED_METRICS[name]
+    if name.startswith(DISTRIBUTION_METRIC_PREFIXES[actor_distribution]):
+        return f"{DISTRIBUTION_GROUPS[actor_distribution]}/{name}"
+    return f"debug/{name}"
+
+
+def flat_metric_name(path):
+    """Inverse of metric_path: the flat controller name of a path below actor_critic/train/."""
+    for name, renamed in RENAMED_METRICS.items():
+        if path == renamed:
+            return name
+    return path.split("/", 1)[1]
 
 
 ACTOR_DISTRIBUTIONS = ("beta", "tanh_gaussian")
@@ -271,6 +310,8 @@ class PMPOBeta(nn.Module):
         if cfg.slow_critic_coef > 0:
             # Exact copy of the freshly initialized online critic; never optimized (no gradients).
             self.slow_value = deepcopy(self.value).requires_grad_(False)
+        # Logging only (not a controller setting): the PMPO diagnostic mode turns it on.
+        self.debug_metrics = bool(cfg.debug_metrics)
         self.intrinsic_reward_fn = None
         self.rl_env = None
         self._fixed_obs = None
@@ -458,11 +499,9 @@ class PMPOBeta(nn.Module):
         values = self.value(flat_obs).squeeze(-1)
         logp, entropy = self.log_prob_and_entropy(raw, act.flatten(0, 1))
         dist = self.distribution(raw)
+        debug = self.debug_metrics
         with torch.no_grad():
             prior = self.distribution(self.prior_actor(flat_obs))
-            # Diagnostic only, see initial_actor's docstring above: never added to
-            # actor_loss, computed fully detached so it cannot perturb the main graph.
-            kl_initial = kl_divergence(self.distribution(raw.detach()), self.distribution(self.initial_actor(flat_obs))).sum(-1)
         kl = kl_divergence(dist, prior).sum(-1)
         pmpo_raw_loss = pmpo_loss(logp, advantage.flatten(), c.alpha_pmpo, c.actor_objective, c.advantage_weight_cap)
         kl_loss = c.beta_kl * kl.mean()
@@ -475,86 +514,94 @@ class PMPOBeta(nn.Module):
                 slow_values = self.slow_value(flat_obs).squeeze(-1)
             slowreg_loss = F.mse_loss(values, slow_values)  # same states, same mean reduction
             slow_metrics = dict(loss_value_target=value_loss.detach(), loss_slowreg=slowreg_loss.detach(),
-                                slow_value_mean=slow_values.mean(), slow_value_gap=(values.detach() - slow_values).abs().mean())
+                                slow_value_gap=(values.detach() - slow_values).abs().mean())
+            if debug:
+                slow_metrics["slow_value_mean"] = slow_values.mean()
             value_loss = value_loss + c.slow_critic_coef * slowreg_loss
         require_finite(targets=targets, values=values, kl=kl, actor_loss=actor_loss, value_loss=value_loss)
-        metrics = self.diagnostics(raw.detach(), act.flatten(0, 1), logp.detach(), entropy.detach())
-        metrics.update(loss_actor=actor_loss.detach(), loss_value=value_loss.detach(), kl_prior=kl.mean().detach(),
-                       kl_initial=kl_initial.mean().detach(),
-                       loss_pmpo_raw=pmpo_raw_loss.detach(), loss_entropy=entropy_loss.detach(),
-                       loss_actor_total=actor_loss.detach(),
-                       **slow_metrics,
-                       value_mean=values.mean().detach(), value_std=values.std(unbiased=False).detach(),
-                       return_mean=targets.mean(), return_std=targets.std(unbiased=False),
-                       positive_fraction=(advantage >= 0).float().mean(), negative_fraction=(advantage < 0).float().mean(),
-                       rollout_length=float(obs.shape[1]), all_finite=1.0)
+        # Logged metrics (metric_path gives their W&B groups). Everything debug-only is computed
+        # only with debug_metrics: no extra policy probes, initial-actor KL or parameter
+        # distances otherwise. None of it enters the losses or consumes random numbers.
         with torch.no_grad():
-            metrics.update(summary_statistics(advantage, "advantage"))
-            metrics.update(self.objective_diagnostics(advantage.flatten()))
-            pos = advantage.flatten() >= 0
-            pos_logp = logp.detach().masked_fill(~pos, 0).sum() / pos.sum().clamp_min(1)
-            neg_logp = logp.detach().masked_fill(pos, 0).sum() / (~pos).sum().clamp_min(1)
+            metrics = self.diagnostics(raw.detach(), act.flatten(0, 1), logp.detach(), entropy.detach(), debug=debug)
             centered_value = values.detach() - values.detach().mean()
             centered_target = targets.flatten() - targets.mean()
             correlation = (centered_value * centered_target).mean() / (
                 centered_value.square().mean() * centered_target.square().mean()).sqrt().clamp_min(1e-12)
-            metrics.update(positive_log_probability=pos_logp, negative_log_probability=neg_logp,
-                           loss_positive=-c.alpha_pmpo * pos_logp,
-                           loss_negative=(1 - c.alpha_pmpo) * neg_logp,
-                           loss_kl=c.beta_kl * kl.mean().detach(),
-                           advantage_zero_fraction=(advantage == 0).float().mean(),
-                           advantage_near_zero_fraction=(advantage.abs() <= 1e-6).float().mean(),
-                           value_target_correlation=correlation,
-                           value_bias=(values.detach() - targets.flatten()).mean(),
-                           value_abs_max=values.detach().abs().max(), return_abs_max=targets.abs().max())
-            per_dim_entropy = self.entropy_per_dim(dist).detach()
-            for d in range(per_dim_entropy.shape[-1]):
-                metrics[f"policy_entropy_dim_{d}"] = per_dim_entropy[:, d].mean()
-            frames = flat_obs.reshape(-1, self.frame_stack, self.cfg.img_channels, self.cfg.img_size, self.cfg.img_size)
-            difference = (frames[:, 1:] - frames[:, :-1]).abs().flatten(1).mean(1)
-            metrics.update(stack_temporal_difference_mean=difference.mean(),
-                           stack_temporal_variation_fraction=(difference > 0).float().mean())
-        with torch.no_grad():
-            if self._fixed_obs is None:
-                self._fixed_obs = flat_obs[:32].clone()
-            fixed_mean = self.sample_action(self.actor(self._fixed_obs.to(self.device)), deterministic=True)
-            for d, std in enumerate(fixed_mean.std(0, unbiased=False)):
-                metrics[f"fixed_policy_mean_state_std_{d}"] = std
-            metrics.update(self.temporal_diagnostics(self._fixed_obs.to(self.device), "fixed"))
+            metrics.update(loss_actor=actor_loss.detach(), loss_value=value_loss.detach(), kl_prior=kl.mean().detach(),
+                           policy_entropy=entropy.mean(), return_mean=targets.mean(), value_mean=values.mean().detach(),
+                           value_target_correlation=correlation, positive_fraction=(advantage >= 0).float().mean(),
+                           **slow_metrics)
+            metrics.update(self.objective_diagnostics(advantage.flatten(), debug=debug))
+            if debug:
+                # Diagnostic only, see initial_actor's docstring above: never added to actor_loss.
+                kl_initial = kl_divergence(self.distribution(raw.detach()), self.distribution(self.initial_actor(flat_obs))).sum(-1)
+                pos = advantage.flatten() >= 0
+                pos_logp = logp.detach().masked_fill(~pos, 0).sum() / pos.sum().clamp_min(1)
+                neg_logp = logp.detach().masked_fill(pos, 0).sum() / (~pos).sum().clamp_min(1)
+                metrics.update(summary_statistics(advantage, "advantage"))
+                metrics.update(kl_initial=kl_initial.mean(), loss_pmpo_raw=pmpo_raw_loss.detach(),
+                               loss_entropy=entropy_loss.detach(), loss_kl=c.beta_kl * kl.mean().detach(),
+                               positive_log_probability=pos_logp, negative_log_probability=neg_logp,
+                               loss_positive=-c.alpha_pmpo * pos_logp, loss_negative=(1 - c.alpha_pmpo) * neg_logp,
+                               value_std=values.std(unbiased=False).detach(), return_std=targets.std(unbiased=False),
+                               negative_fraction=(advantage < 0).float().mean(),
+                               advantage_zero_fraction=(advantage == 0).float().mean(),
+                               advantage_near_zero_fraction=(advantage.abs() <= 1e-6).float().mean(),
+                               value_bias=(values.detach() - targets.flatten()).mean(),
+                               value_abs_max=values.detach().abs().max(), return_abs_max=targets.abs().max())
+                per_dim_entropy = self.entropy_per_dim(dist).detach()
+                for d in range(per_dim_entropy.shape[-1]):
+                    metrics[f"policy_entropy_dim_{d}"] = per_dim_entropy[:, d].mean()
+                frames = flat_obs.reshape(-1, self.frame_stack, self.cfg.img_channels, self.cfg.img_size, self.cfg.img_size)
+                difference = (frames[:, 1:] - frames[:, :-1]).abs().flatten(1).mean(1)
+                metrics.update(stack_temporal_difference_mean=difference.mean(),
+                               stack_temporal_variation_fraction=(difference > 0).float().mean())
+                # Fixed-state probes: the first 32 states seen while debug metrics are on (a
+                # debug-only cache in the extra state; it never affects training).
+                if self._fixed_obs is None:
+                    self._fixed_obs = flat_obs[:32].clone()
+                fixed_mean = self.sample_action(self.actor(self._fixed_obs.to(self.device)), deterministic=True)
+                for d, std in enumerate(fixed_mean.std(0, unbiased=False)):
+                    metrics[f"fixed_policy_mean_state_std_{d}"] = std
+                metrics.update(self.temporal_diagnostics(self._fixed_obs.to(self.device), "fixed"))
             require_finite(**{k: torch.as_tensor(v) for k, v in metrics.items()})
         # Disjoint graphs: each optimizer owns exactly one encoder and head.
         return actor_loss + value_loss, metrics
 
     @torch.no_grad()
-    def objective_diagnostics(self, advantage):
-        """Per sign group: |A| mean/max, actor sample weights (1 for sign-only) and the fraction
-        clipped at the cap; actor movement from its construction-time snapshot."""
+    def objective_diagnostics(self, advantage, debug=True):
+        """Per sign group: the fraction of actor sample weights clipped at the cap (0 for
+        sign-only); with debug, also |A| mean/max, the weights (1 for sign-only) and the actor's
+        movement from its construction-time snapshot."""
         metrics = {}
         positive = advantage >= 0
-        if self.cfg.actor_objective == "advantage_weighted":
-            weights = actor_sample_weights(advantage, self.cfg.advantage_weight_cap)
-        else:
-            weights = torch.ones_like(advantage)
+        weighted = self.cfg.actor_objective == "advantage_weighted"
+        weights = actor_sample_weights(advantage, self.cfg.advantage_weight_cap) if weighted else torch.ones_like(advantage)
         for name, group in (("positive", positive), ("negative", ~positive)):
             count = group.sum()
             if count:
                 a, w = advantage[group].abs(), weights[group]
-                at_cap = (w >= self.cfg.advantage_weight_cap).float().mean() if \
-                    self.cfg.actor_objective == "advantage_weighted" else w.new_zeros(())
-                metrics.update({f"advantage_abs_mean_{name}": a.mean(), f"advantage_abs_max_{name}": a.max(),
-                                f"weight_mean_{name}": w.mean(), f"weight_max_{name}": w.max(),
-                                f"weight_std_{name}": w.std(unbiased=False), f"weight_clipped_fraction_{name}": at_cap})
+                metrics[f"weight_clipped_fraction_{name}"] = (w >= self.cfg.advantage_weight_cap).float().mean()                     if weighted else w.new_zeros(())
+                if debug:
+                    metrics.update({f"advantage_abs_mean_{name}": a.mean(), f"advantage_abs_max_{name}": a.max(),
+                                    f"weight_mean_{name}": w.mean(), f"weight_max_{name}": w.max(),
+                                    f"weight_std_{name}": w.std(unbiased=False)})
             else:
-                zero = advantage.new_zeros(())
-                metrics.update({f"{k}_{name}": zero for k in ("advantage_abs_mean", "advantage_abs_max", "weight_mean",
-                                                              "weight_max", "weight_std", "weight_clipped_fraction")})
-        num = sum((p - q).square().sum() for p, q in zip(self.actor.parameters(), self.initial_actor.parameters()))
-        den = sum(q.square().sum() for q in self.initial_actor.parameters())
-        metrics["actor_rel_distance_from_init"] = (num.sqrt() / den.sqrt().clamp_min(1e-12))
+                keys = ("weight_clipped_fraction",) + (("advantage_abs_mean", "advantage_abs_max", "weight_mean",
+                                                        "weight_max", "weight_std") if debug else ())
+                metrics.update({f"{k}_{name}": advantage.new_zeros(()) for k in keys})
+        if debug:
+            num = sum((p - q).square().sum() for p, q in zip(self.actor.parameters(), self.initial_actor.parameters()))
+            den = sum(q.square().sum() for q in self.initial_actor.parameters())
+            metrics["actor_rel_distance_from_init"] = (num.sqrt() / den.sqrt().clamp_min(1e-12))
         return metrics
 
     @torch.no_grad()
-    def diagnostics(self, raw, actions, logp=None, entropy=None):
+    def diagnostics(self, raw, actions, logp=None, entropy=None, debug=True):
+        """Distribution parameters and per-dimension conditional spread; with debug (the default
+        for direct callers such as the PMPO diagnostic), also per-dimension action and mean-action
+        statistics, bound proximity and log-probability/entropy summaries."""
         dist = self.distribution(raw)
         width = self.action_high - self.action_low
         unit = (actions - self.action_low) / width
@@ -572,16 +619,18 @@ class PMPOBeta(nn.Module):
             m1 = self.gauss_hermite_expectation(dist, torch.tanh)
             m2 = self.gauss_hermite_expectation(dist, lambda x: torch.tanh(x) ** 2)
             conditional_var = (m2 - m1 ** 2).clamp_min(0) * (width / 2) ** 2
-            means = self.to_environment((torch.tanh(dist.mean) + 1) / 2)  # deterministic evaluation actions
         else:
             for name, param in (("alpha", dist.concentration1), ("beta", dist.concentration0)):
                 metrics.update(summary_statistics(param, name))
                 metrics[f"{name}_near_floor_fraction"] = (param < self.cfg.concentration_min + 0.01).float().mean()
             a, b = dist.concentration1, dist.concentration0
             conditional_var = a * b / ((a + b) ** 2 * (a + b + 1)) * width ** 2
-            means = self.to_environment(dist.mean)
         for d in range(actions.shape[-1]):
             metrics[f"policy_conditional_std_{d}"] = conditional_var[:, d].mean().sqrt()
+        if not debug:
+            return metrics
+        # Deterministic evaluation actions: tanh(mu) (Gaussian) or the Beta mean, in env units.
+        means = self.to_environment((torch.tanh(dist.mean) + 1) / 2 if self.gaussian else dist.mean)
         for d in range(actions.shape[-1]):
             metrics[f"action_mean_{d}"] = actions[:, d].mean()
             metrics[f"action_std_{d}"] = actions[:, d].std(unbiased=False)

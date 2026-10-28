@@ -23,7 +23,8 @@ from device_report import device_lines
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
 from lcg import LCGLifecycle, selected_named_parameters
-from models.pmpo_beta import PMPOOptimizers, check_controller_state, controller_settings, summary_statistics
+from models.pmpo_beta import (PMPOOptimizers, check_controller_state, controller_settings, metric_path,
+                              summary_statistics)
 from plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
 from laplace import LaplaceConfig, LaplaceEnsemble, LaplaceScorer
 from intrinsic_eval import aggregate, episode_record, IntrinsicEvaluator
@@ -354,6 +355,8 @@ class ExplorationTrainer(StateDictMixin):
                 raise ValueError("PMPO diagnostic epoch bound must be in [1, 2000]")
             self._pmpo_diagnostic = PMPORunDiagnostic(diagnostic_cfg, self.agent.actor_critic, cfg.env.test,
                                                       optimizers=self.opt.actor_critic, trainer_state_fn=self.state_dict)
+            # The diagnostic's stop rules read the detailed per-update metrics.
+            self.agent.actor_critic.debug_metrics = True
 
         # LCG intrinsic-reward lifecycle, the only exploration scorer (learned exploration).
         self._lcg_lifecycle = None
@@ -696,18 +699,21 @@ class ExplorationTrainer(StateDictMixin):
         to_log.append({**timing, **summary})
         return to_log
 
-    def lcg_reward_metrics(self) -> Dict[str, Any]:
-        """Raw intrinsic scores and the policy reward (after scaling) of the last PMPO update
-        (lcg_* for LCG, ens_* for ensemble disagreement)."""
+    def intrinsic_reward_metrics(self) -> Dict[str, Any]:
+        """Per imagined step of the last PMPO update: the scorer's raw intrinsic reward and the
+        scaled policy reward, under the same names for every method (units differ by method).
+        Mean and max always; with debug metrics also std, min, p10, median, p90, p99."""
         scorer = self._lcg_lifecycle or self._ensemble_scorer or self.plan2explore
         if scorer is None or scorer.last_raw is None:
             return {}
-        name = "lcg" if scorer is self._lcg_lifecycle else scorer.metric_prefix
         metrics = {}
-        for prefix, values in ((f"{name}_raw_reward", scorer.last_raw), (f"{name}_policy_reward", scorer.last_scaled)):
-            values = values.float()
-            metrics.update(summary_statistics(values, prefix))
-            metrics[f"{prefix}_p99"] = torch.quantile(values.flatten(), 0.99)
+        for kind, values in (("raw", scorer.last_raw), ("scaled", scorer.last_scaled)):
+            values, prefix = values.float(), f"intrinsic_{kind}_reward"
+            metrics.update({f"{prefix}_mean": values.mean(), f"{prefix}_max": values.max()})
+            if self.agent.actor_critic.debug_metrics:
+                stats = summary_statistics(values, prefix)
+                metrics.update({k: v for k, v in stats.items() if not k.endswith(("_mean", "_max"))})
+                metrics[f"{prefix}_p99"] = torch.quantile(values.flatten(), 0.99)
         return metrics
 
     # ---------------------------------------------------------------- run logging (terminal, W&B)
@@ -818,11 +824,15 @@ class ExplorationTrainer(StateDictMixin):
                 summary[f"epoch_summary/denoiser_member_{k}_loss_mean"] = mean(lambda key: key == f"denoiser/member_{k}/train/loss_denoising")
         summary["epoch_summary/denoiser_test_loss_mean"] = mean(lambda k: k == "denoiser/test/loss_denoising")
         for name in PMPO_SUMMARY:
-            summary[f"epoch_summary/pmpo_{name}_mean"] = mean(lambda k: k == f"actor_critic/train/{name}")
-        summary["epoch_summary/intrinsic_raw_reward_mean"] = mean(lambda k: k.startswith("actor_critic/train/") and k.endswith("_raw_reward_mean"))
-        raw_max = values(lambda k: k.startswith("actor_critic/train/") and k.endswith("_raw_reward_max"))
+            summary[f"epoch_summary/pmpo_{name}_mean"] = mean(lambda k: k == f"actor_critic/train/core/{name}")
+        # negative_fraction is a debug metric; its epoch mean is 1 - the positive fraction's
+        # (complementary fractions of the same advantages; equal up to float rounding).
+        positive = summary["epoch_summary/pmpo_positive_fraction_mean"]
+        summary["epoch_summary/pmpo_negative_fraction_mean"] = None if positive is None else 1.0 - positive
+        summary["epoch_summary/intrinsic_raw_reward_mean"] = mean(lambda k: k == "actor_critic/train/intrinsic/raw_reward_mean")
+        raw_max = values(lambda k: k == "actor_critic/train/intrinsic/raw_reward_max")
         summary["epoch_summary/intrinsic_raw_reward_max"] = max(raw_max) if raw_max else None
-        summary["epoch_summary/intrinsic_scaled_reward_mean"] = mean(lambda k: k.startswith("actor_critic/train/") and k.endswith("_policy_reward_mean"))
+        summary["epoch_summary/intrinsic_scaled_reward_mean"] = mean(lambda k: k == "actor_critic/train/intrinsic/scaled_reward_mean")
         summary = {k: v for k, v in summary.items() if v is not None}
         summary.update(self.progress_counters())
         summary["progress/new_train_env_steps"] = int(self.train_dataset.num_steps - steps_before)
@@ -861,8 +871,8 @@ class ExplorationTrainer(StateDictMixin):
         if self._rank != 0 or wandb.run is None:
             return
         wandb.define_metric("epoch")
-        wandb.define_metric("actor_critic/train/num_batch_train_actor_critic")
-        wandb.define_metric("actor_critic/train/*", step_metric="actor_critic/train/num_batch_train_actor_critic")
+        wandb.define_metric(PMPO_UPDATE_AXIS)
+        wandb.define_metric("actor_critic/train/*", step_metric=PMPO_UPDATE_AXIS)
         wandb.define_metric("denoiser/train/num_batch_train_denoiser")
         wandb.define_metric("denoiser/train/*", step_metric="denoiser/train/num_batch_train_denoiser")
         for k in range(self.ensemble.members if self.ensemble is not None else 0):
@@ -895,7 +905,8 @@ class ExplorationTrainer(StateDictMixin):
             ac = self.agent.actor_critic
             controller = dict(controller_settings(ac.cfg), actor_objective=ac.objective_settings(),
                               entropy_coef=float(ac.cfg.entropy_coef), beta_kl=float(ac.cfg.beta_kl),
-                              prior_refresh_interval=int(ac.cfg.prior_refresh_interval))
+                              prior_refresh_interval=int(ac.cfg.prior_refresh_interval),
+                              debug_metrics=bool(ac.debug_metrics))
         return dict(seed=self._seed, method=self._method or "uniform", method_name=METHOD_NAMES[self._method],
                     method_settings=settings, controller=controller, source=self.source, evaluation=self.evaluation_protocol(),
                     milestones=[m["name"] for m in self.milestones if not m["retired"]])
@@ -1038,7 +1049,7 @@ class ExplorationTrainer(StateDictMixin):
                 loss, metrics = model()
                 loss.backward()
                 metrics.update(opt.step())
-                metrics.update(self.lcg_reward_metrics())
+                metrics.update(self.intrinsic_reward_metrics())
                 if self._pmpo_diagnostic is not None:
                     self._pmpo_diagnostic.check_update(metrics, self.epoch, self.num_batch_train.actor_critic,
                                                        real_steps=self.train_dataset.num_steps)
@@ -1046,7 +1057,8 @@ class ExplorationTrainer(StateDictMixin):
                     print("PMPO_DIAGNOSTICS " + json.dumps({k: float(v) for k, v in metrics.items()}), flush=True)
                 self.num_batch_train.actor_critic += 1
                 metrics["num_batch_train_actor_critic"] = self.num_batch_train.actor_critic
-                logs.append({f"actor_critic/train/{k}": v for k, v in metrics.items()})
+                dist = model.cfg.actor_distribution
+                logs.append({f"actor_critic/train/{metric_path(k, dist)}": v for k, v in metrics.items()})
             return logs
 
         model.train()
@@ -1380,7 +1392,8 @@ REFRESH_WORK = {"lcg": "historical precision and candidate bank on this epoch's 
                 "plan2explore_disagreement": "replay feature encoding and fresh predictor heads",
                 "laplace_disagreement": "historical precision and a new posterior sample bank"}
 # Existing PMPO metrics averaged over the epoch's updates in epoch_summary/*.
-PMPO_SUMMARY = ("loss_actor", "loss_value", "policy_entropy", "kl_prior", "positive_fraction", "negative_fraction",
+PMPO_UPDATE_AXIS = "actor_critic/train/core/num_batch_train_actor_critic"
+PMPO_SUMMARY = ("loss_actor", "loss_value", "policy_entropy", "kl_prior", "positive_fraction",
                 "actor_grad_norm", "value_grad_norm", "return_mean")
 # W&B metrics plotted against epoch (setup_wandb): every logged key outside the per-update
 # denoiser/actor_critic train rows.
@@ -1413,12 +1426,12 @@ def lcg_refresh_metrics(lcg, dataset: Dataset) -> Dict[str, Any]:
 def training_intrinsic_line(rows: Logs) -> str:
     """Raw and scaled intrinsic reward per imagined step over this epoch's PMPO updates: mean of
     the per-update means, max of the per-update maxima (the epoch_summary/* definitions)."""
-    def stat(suffix, reduce):
-        values = [float(v) for row in rows for k, v in row.items()
-                  if k.startswith("actor_critic/train/") and k.endswith(suffix)]
+    def stat(key, reduce):
+        values = [float(row[key]) for row in rows if key in row]
         return reduce(values) if values else None
     parts = []
-    for label, key in (("raw", "_raw_reward"), ("scaled", "_policy_reward")):
+    for label in ("raw", "scaled"):
+        key = f"actor_critic/train/intrinsic/{label}_reward"
         mean, high = stat(f"{key}_mean", lambda v: float(np.mean(v))), stat(f"{key}_max", max)
         if mean is not None:
             parts.append(f"{label} mean {mean:.4g}, max {high:.4g}")

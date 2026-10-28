@@ -172,7 +172,9 @@ def test_finish_epoch_reports_world_model_losses_and_saves_full_checkpoint(tmp_p
     diag.check_update(metrics, epoch=1, update=2)
     pmpo_log = dict(metrics, loss_actor=0.5, positive_fraction=0.5, negative_fraction=0.5,
                     alpha_min=1., beta_min=1.)
-    logs = [{"actor_critic/train/" + k: v for k, v in pmpo_log.items()},
+    from models.pmpo_beta import metric_path
+    # The trainer logs grouped paths (actor_critic/train/<group>/<name>); finish_epoch maps them back.
+    logs = [{"actor_critic/train/" + metric_path(k, model.cfg.actor_distribution): v for k, v in pmpo_log.items()},
             {"denoiser/train/loss": 1.5, "denoiser/train/other": 0.2},
             {"denoiser/train/loss": 1.3, "denoiser/train/other": 0.1},
             {"rew_end_model/train/loss": 0.7}]

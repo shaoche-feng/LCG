@@ -295,11 +295,14 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
 
 
 class Prompts(IterableDataset):
+    def __init__(self, action_dim=2):
+        self.action = torch.tensor([-0.5, 3.]).repeat(action_dim // 2)
+
     def __iter__(self):
         while True:
             # Real prompt rewards deliberately huge: they must never become targets.
             yield SimpleNamespace(obs=torch.rand(2, 3, 8, 8) * 2 - 1,
-                                  act=torch.tensor([[-0.5, 3.], [-0.5, 3.]]), rew=torch.full((2,), 1e9))
+                                  act=self.action.repeat(2, 1), rew=torch.full((2,), 1e9))
 
 
 def collate(samples):
@@ -309,17 +312,21 @@ def collate(samples):
                            mask_padding=torch.ones(obs.shape[:2], dtype=torch.bool))
 
 
-def make_system(device="cpu", **kwargs):
+def make_system(device="cpu", action_dim=2, **kwargs):
+    """Controller and a tiny DIAMOND world model; action_dim (even) tiles the 2-d bounds."""
     torch.manual_seed(7)
+    if action_dim != 2:
+        kwargs.update(continuous_action_dim=action_dim, action_low=[-3., 0.5] * (action_dim // 2),
+                      action_high=[2., 7.] * (action_dim // 2))
     model = make_controller(**kwargs).to(device)
     denoiser = Denoiser(DenoiserConfig(
         inner_model=InnerModelConfig(img_channels=3, num_steps_conditioning=2, cond_channels=16,
-                                    depths=[1], channels=[8], attn_depths=[False], continuous_action_dim=2),
+                                    depths=[1], channels=[8], attn_depths=[False], continuous_action_dim=action_dim),
         sigma_data=0.5, sigma_offset_noise=0.3)).to(device)
     reward = RewEndModel(RewEndModelConfig(lstm_dim=16, img_channels=3, img_size=8, cond_channels=16,
                                          depths=[1], channels=[8], attn_depths=[False],
-                                         continuous_action_dim=2)).to(device)
-    loader = DataLoader(Prompts(), batch_size=2, collate_fn=collate, generator=torch.Generator().manual_seed(0))
+                                         continuous_action_dim=action_dim)).to(device)
+    loader = DataLoader(Prompts(action_dim), batch_size=2, collate_fn=collate, generator=torch.Generator().manual_seed(0))
     env = WorldModelEnv(denoiser, reward, loader,
                         WorldModelEnvConfig(horizon=2, num_batches_to_preload=1,
                                             diffusion_sampler=DiffusionSamplerConfig(num_steps_denoising=2)))
@@ -329,12 +336,12 @@ def make_system(device="cpu", **kwargs):
 
 def test_actual_diamond_rollout_and_update():
     torch.set_num_threads(1)
-    model, env = make_system()
+    model, env = make_system(debug_metrics=True)
     opt = PMPOOptimizers(model, warmup_steps=0)
     actor_before = deepcopy(model.actor.state_dict())
     value_before = deepcopy(model.value.state_dict())
     loss, metrics = model()
-    assert metrics["rollout_length"] == 3
+    assert not {"rollout_length", "all_finite", "loss_actor_total"} & set(metrics)  # removed in both modes
     assert abs(metrics["return_mean"]) < 1e6
     assert "kl_initial" in metrics and float(metrics["kl_initial"]) == pytest.approx(0.0, abs=1e-5)
     assert all(p.grad is None for p in model.initial_actor.parameters())
@@ -539,24 +546,22 @@ def test_entropy_coef_zero_reproduces_baseline_actor_loss_exactly():
     # entropy_coef defaults to 0.0: the Stage 3 code path must be bit-identical to the
     # frozen 100k baseline when the new coefficient is left at its default.
     torch.manual_seed(11)
-    baseline, _ = make_system()
+    baseline, _ = make_system(debug_metrics=True)
     torch.manual_seed(11)
-    zero_entropy, _ = make_system(entropy_coef=0.0)
+    zero_entropy, _ = make_system(entropy_coef=0.0, debug_metrics=True)
     loss_baseline, metrics_baseline = baseline()
     loss_zero, metrics_zero = zero_entropy()
     torch.testing.assert_close(loss_baseline, loss_zero, rtol=0, atol=0)
     torch.testing.assert_close(metrics_baseline["loss_actor"], metrics_zero["loss_actor"], rtol=0, atol=0)
     assert float(metrics_zero["loss_entropy"]) == pytest.approx(0.0, abs=0.0)
-    torch.testing.assert_close(metrics_zero["loss_actor_total"], metrics_zero["loss_actor"], rtol=0, atol=0)
 
 
 def test_entropy_coef_adds_signed_bonus_and_logs_components_separately():
-    model, _ = make_system(entropy_coef=0.01)
+    model, _ = make_system(entropy_coef=0.01, debug_metrics=True)
     loss, metrics = model()
-    # loss_actor_total must equal the sum of the three logged components exactly.
+    # loss_actor must equal the sum of the three logged (debug) components.
     expected = metrics["loss_pmpo_raw"] + metrics["loss_kl"] + metrics["loss_entropy"]
-    torch.testing.assert_close(metrics["loss_actor_total"], expected, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(metrics["loss_actor"], metrics["loss_actor_total"], rtol=0, atol=0)
+    torch.testing.assert_close(metrics["loss_actor"], expected, rtol=1e-5, atol=1e-6)
     # loss_entropy = -entropy_coef * mean(H(pi)); its sign is tied to the sign of entropy.
     expected_entropy_term = -0.01 * metrics["policy_entropy"]
     torch.testing.assert_close(metrics["loss_entropy"], expected_entropy_term, rtol=1e-4, atol=1e-6)
@@ -711,7 +716,7 @@ def test_gaussian_kl_is_analytic_between_pre_tanh_normals_and_prior_frozen():
 
 @pytest.mark.parametrize("objective", ["sign", "advantage_weighted"])
 def test_h10_update_is_finite_with_gaussian_diagnostics_only(objective):
-    model, _ = make_system(**H10, actor_objective=objective, prior_refresh_interval=2)
+    model, _ = make_system(**H10, actor_objective=objective, prior_refresh_interval=2, debug_metrics=True)
     opt = PMPOOptimizers(model, 0)
     for _ in range(3):
         opt.zero_grad()
@@ -732,7 +737,7 @@ def test_objective_weights_only_the_pmpo_term_kl_entropy_and_critic_unchanged():
     from models.pmpo_beta import pmpo_loss
     results = {}
     for objective in ("sign", "advantage_weighted"):
-        model, _ = make_system(**H10, actor_objective=objective)
+        model, _ = make_system(**H10, actor_objective=objective, debug_metrics=True)
         captured = {}
         collect = model.collect_imagination
 
@@ -926,3 +931,109 @@ def test_trainer_world_model_pmpo_diagnostic_and_resume_with_the_h10_controller(
         assert line in saved
     rows = [json.loads(line) for line in (tmp_path / "pmpo_diagnostic/updates.jsonl").read_text().splitlines()]
     assert rows and all("pretanh_std_mean" in r and "alpha_mean" not in r for r in rows)
+
+# ---------------------------------------------------------------- actor_critic metric schema and debug switch
+
+def logged_paths(model, metrics):
+    from models.pmpo_beta import metric_path
+    return {metric_path(k, model.cfg.actor_distribution) for k in metrics}
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_walker_six_dimension_metric_schema(debug, ac_schema):
+    """Controller + optimizer metrics of one update, as logged paths, for the Gaussian EMA
+    controller with Walker's 6 action dimensions: the agreed schema without the trainer's
+    intrinsic keys (43 - 4 by default, 148 - 4 - 12 with debug metrics)."""
+    model, _ = make_system(action_dim=6, **H10, actor_objective="advantage_weighted", debug_metrics=debug)
+    opt = PMPOOptimizers(model, 0)
+    loss, metrics = model()
+    loss.backward()
+    metrics.update(opt.step())
+    metrics["num_batch_train_actor_critic"] = 1
+    schema = ac_schema(6, debug)
+    assert len(ac_schema(6, False)) == 43 and len(ac_schema(6, True)) == 148
+    intrinsic = {k for k in schema if k.startswith("intrinsic/") or k.startswith("debug/intrinsic_")}
+    assert logged_paths(model, metrics) == schema - intrinsic
+    assert not {"loss_actor_total", "rollout_length", "all_finite"} & set(metrics)  # removed in both modes
+    assert all(torch.isfinite(torch.as_tensor(v)).all() for v in metrics.values())
+
+
+def test_metric_paths_are_invertible_and_beta_is_not_labelled_gaussian():
+    from models.pmpo_beta import flat_metric_name, metric_path
+    model, _ = make_system(**H10, debug_metrics=True)
+    _, metrics = model()
+    names = list(metrics) + ["intrinsic_raw_reward_mean", "intrinsic_scaled_reward_max", "intrinsic_raw_reward_p99"]
+    for name in names:
+        assert flat_metric_name(metric_path(name, "tanh_gaussian")) == name
+    beta, _ = make_system(debug_metrics=False)  # Beta actor, no slow critic
+    _, beta_metrics = beta()
+    paths = logged_paths(beta, beta_metrics)
+    assert {"beta/alpha_mean", "beta/beta_max", "beta/alpha_near_floor_fraction", "beta/policy_conditional_std_1"} <= paths
+    assert not any(p.startswith(("gaussian/", "EMA/", "debug/")) for p in paths)
+
+
+def test_debug_off_skips_the_expensive_probes():
+    model, _ = make_system(**H10)
+    assert model.debug_metrics is False
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("debug-only computation with debug_metrics=false")
+    model.temporal_diagnostics = forbidden  # fixed-state policy probes
+    model.initial_actor.forward = forbidden  # KL to the initial actor
+    model.initial_actor.parameters = forbidden  # parameter distance from the initial actor
+    opt = PMPOOptimizers(model, 0)
+    for _ in range(2):
+        opt.zero_grad()
+        loss, metrics = model()
+        loss.backward()
+        opt.step()
+    assert model._fixed_obs is None  # the debug-only probe cache is never filled
+    assert not any(k.startswith(("action_", "policy_mean", "fixed_", "advantage_", "kl_initial")) for k in metrics)
+
+
+def test_debug_metrics_do_not_change_training():
+    """Same seeds, debug off vs on: identical losses, gradients, parameter updates, optimizer,
+    scheduler, slow critic, prior and update counter, and identical global and controller RNG.
+    The only difference is the debug-only fixed-state cache in the extra state."""
+    runs = {}
+    for debug in (False, True):
+        model, env = make_system(**H10, actor_objective="advantage_weighted", prior_refresh_interval=2,
+                                 debug_metrics=debug)
+        opt = PMPOOptimizers(model, 3)
+        torch.manual_seed(123)
+        losses, grads, shared = [], [], []
+        for _ in range(3):
+            opt.zero_grad()
+            loss, metrics = model()
+            loss.backward()
+            grads.append([p.grad.clone() for p in model.parameters() if p.grad is not None])
+            metrics.update(opt.step())
+            losses.append(loss.detach().clone())
+            shared.append({k: torch.as_tensor(v).clone() for k, v in metrics.items()})
+        runs[debug] = dict(model=model, opt=opt, losses=losses, grads=grads, metrics=shared,
+                           rng=torch.get_rng_state().clone())
+    off, on = runs[False], runs[True]
+    for a, b in zip(off["losses"], on["losses"]):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    for ga, gb in zip(off["grads"], on["grads"]):
+        assert len(ga) == len(gb) and all(torch.equal(x, y) for x, y in zip(ga, gb))
+    for ma, mb in zip(off["metrics"], on["metrics"]):  # every default metric has the same value
+        assert set(ma) < set(mb)
+        for k in ma:
+            torch.testing.assert_close(ma[k], mb[k], rtol=0, atol=0, msg=k)
+    sa, sb = off["model"].state_dict(), on["model"].state_dict()
+    assert sa.keys() == sb.keys()
+    for k, v in sa.items():
+        if torch.is_tensor(v):
+            torch.testing.assert_close(sb[k], v, rtol=0, atol=0, msg=k)  # incl. slow_value, prior, updates
+    ea, eb = sa["_extra_state"], sb["_extra_state"]
+    assert torch.equal(ea["rng"]["cpu"], eb["rng"]["cpu"]) and ea["rng"]["python"] == eb["rng"]["python"]
+    assert (ea["objective"], ea["controller"]) == (eb["objective"], eb["controller"])
+    assert ea["fixed_obs"] is None and eb["fixed_obs"] is not None  # the debug-only cache
+    oa, ob = off["opt"].state_dict(), on["opt"].state_dict()
+    for name in ("actor", "value"):
+        for pid, state in oa[name]["state"].items():
+            for key, value in state.items():
+                torch.testing.assert_close(ob[name]["state"][pid][key], value, rtol=0, atol=0)
+    assert oa["schedulers"] == ob["schedulers"]
+    assert torch.equal(off["rng"], on["rng"])  # global torch RNG after training

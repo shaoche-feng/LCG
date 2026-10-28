@@ -237,10 +237,10 @@ def test_ensemble_is_frozen_and_in_eval_mode_during_pmpo(tmp_path, monkeypatch):
     assert all(not any(modes) for modes, _ in seen)
     # Within an epoch's PMPO phase the members never change (epoch 1 has two updates).
     assert all(torch.equal(a, b) for a, b in zip(seen[0][1], seen[1][1]))
-    assert any("actor_critic/train/ens_raw_reward_mean" in r for r in logs)
+    assert any("actor_critic/train/intrinsic/raw_reward_mean" in r for r in logs)
     for r in logs:
-        if "actor_critic/train/ens_raw_reward_mean" in r:
-            assert r["actor_critic/train/ens_policy_reward_mean"] == pytest.approx(r["actor_critic/train/ens_raw_reward_mean"])
+        if "actor_critic/train/intrinsic/raw_reward_mean" in r:
+            assert r["actor_critic/train/intrinsic/scaled_reward_mean"] == pytest.approx(r["actor_critic/train/intrinsic/raw_reward_mean"])
 
 
 def test_task_rewards_do_not_change_ensemble_exploration(tmp_path, monkeypatch):

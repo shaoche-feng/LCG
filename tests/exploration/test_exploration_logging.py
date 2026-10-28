@@ -127,7 +127,7 @@ def scalars(row):
 
 
 def pmpo_rows(logs):
-    return [(e, r) for e, r in logs if "actor_critic/train/num_batch_train_actor_critic" in r]
+    return [(e, r) for e, r in logs if "actor_critic/train/core/num_batch_train_actor_critic" in r]
 
 
 def terminal_lines(out):
@@ -387,9 +387,10 @@ def test_epoch_rows_counters_axes_and_training_only_epochs(tmp_path, monkeypatch
         assert all(row["progress/train_env_steps"] == steps for e, row in logs if e == epoch)
     assert trainer.agent.actor_critic.updates.item() == 4 and trainer.num_batch_train.denoiser == 4
     # PMPO rows keep their own update counter (W&B step metric), raw and policy reward separate.
-    pmpo = [r for _, r in logs if "actor_critic/train/num_batch_train_actor_critic" in r]
-    assert [r["actor_critic/train/num_batch_train_actor_critic"] for r in pmpo] == [1, 2, 3, 4]
-    assert all("actor_critic/train/lcg_raw_reward_mean" in r and "actor_critic/train/lcg_policy_reward_mean" in r for r in pmpo)
+    pmpo = [r for _, r in logs if "actor_critic/train/core/num_batch_train_actor_critic" in r]
+    assert [r["actor_critic/train/core/num_batch_train_actor_critic"] for r in pmpo] == [1, 2, 3, 4]
+    assert all("actor_critic/train/intrinsic/raw_reward_mean" in r and "actor_critic/train/intrinsic/scaled_reward_mean" in r
+               for r in pmpo)
     # The denoiser test loss and the LCG refresh identity stay in W&B only.
     assert any("denoiser/test/loss_denoising" in r for _, r in logs)
     refresh = [r for _, r in logs if "lcg/h_D_fingerprint" in r]
@@ -419,11 +420,11 @@ def test_epoch_rows_counters_axes_and_training_only_epochs(tmp_path, monkeypatch
     expected = []
     for epoch in (1, 2, 3):
         rows = [r for e, r in pmpo_rows(logs) if e == epoch]
-        stat = {k: [float(r[f"actor_critic/train/lcg_{k}"]) for r in rows]
-                for k in ("raw_reward_mean", "raw_reward_max", "policy_reward_mean", "policy_reward_max")}
+        stat = {k: [float(r[f"actor_critic/train/intrinsic/{k}"]) for r in rows]
+                for k in ("raw_reward_mean", "raw_reward_max", "scaled_reward_mean", "scaled_reward_max")}
         expected.append(f"Imagined intrinsic reward/step: raw mean {np.mean(stat['raw_reward_mean']):.4g}, "
-                        f"max {max(stat['raw_reward_max']):.4g} | scaled mean {np.mean(stat['policy_reward_mean']):.4g}, "
-                        f"max {max(stat['policy_reward_max']):.4g}")
+                        f"max {max(stat['raw_reward_max']):.4g} | scaled mean {np.mean(stat['scaled_reward_mean']):.4g}, "
+                        f"max {max(stat['scaled_reward_max']):.4g}")
     assert [line for line in lines if line.startswith("Imagined intrinsic reward/step: ")] == expected
     assert lines.count("Intrinsic evaluation:") == 3 and lines.count("Final intrinsic evaluation:") == 1
     for prefix, epoch, seeds in (("test_eval/", 1, SEEDS), ("test_eval/", 3, SEEDS), ("final_test_eval/", None, (11, 12))):
@@ -508,7 +509,7 @@ def test_wandb_axes_provenance_milestones_and_unchanged_training(tmp_path, monke
     # Axes: per-update rows on their own counters, everything else on epoch; no logged key matches
     # two globs (so W&B's glob ordering is irrelevant), and every logged key has an axis.
     axes = dict(fake.metrics)
-    assert axes["actor_critic/train/*"] == "actor_critic/train/num_batch_train_actor_critic"
+    assert axes["actor_critic/train/*"] == "actor_critic/train/core/num_batch_train_actor_critic"
     assert axes["denoiser/train/*"] == "denoiser/train/num_batch_train_denoiser"
     assert axes["epoch_summary/*"] == axes["test_eval/*"] == axes["progress/*"] == "epoch"
     globs = [n for n in axes if n.endswith("*")]

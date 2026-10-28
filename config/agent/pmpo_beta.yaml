@@ -53,4 +53,7 @@ actor_critic:
   imagination_horizon: ${world_model_env.horizon}
   max_grad_norm: 10.0
   seed: ${oc.select:common.seed,0}
-  log_diagnostics: false
+  log_diagnostics: false  # print every update's metrics as JSON on the terminal
+  # Detailed per-update metrics under actor_critic/train/debug/ (computed only when true; logging
+  # only, training is identical). The PMPO diagnostic mode turns it on.
+  debug_metrics: false
