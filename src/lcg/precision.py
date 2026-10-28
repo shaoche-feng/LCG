@@ -7,6 +7,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from data import Dataset, SegmentId
+from utils import Progress
 from models.diffusion.denoiser import (
     Denoiser,
     SigmaDistributionConfig,
@@ -134,7 +135,7 @@ def historical_precision(
     segment_ids = sample_uniform_historical_transitions(dataset, B, num_steps_conditioning, seed, rank, world_size)
     scale = beta * (N / B)
 
-    for segment_id in segment_ids:
+    for segment_id in Progress(segment_ids, desc="Historical precision", unit="trans"):
         obs, act, y = load_transition(dataset, segment_id, num_steps_conditioning, device)
         g_i = torch.zeros(d_S, device=device)
         for _ in range(num_mc):
@@ -149,11 +150,12 @@ def historical_precision(
     return h
 
 
-def assert_setup_valid(theta_s_named: Dict[str, Tensor], h_D: Tensor, d_S: int) -> None:
+def assert_setup_valid(theta_s_named: Dict[str, Tensor], h_D: Tensor, d_S: int, verbose: bool = True) -> None:
     flat = torch.cat([t.reshape(-1) for t in theta_s_named.values()])
     assert flat.numel() == d_S, f"theta_S flat dim {flat.numel()} != d_S {d_S}"
     assert h_D.numel() == d_S, f"h_D dim {h_D.numel()} != d_S {d_S}"
     assert torch.isfinite(h_D).all(), "h_D contains non-finite values"
     assert (h_D > 0).all(), "h_D is not strictly positive"
     assert not h_D.requires_grad, "h_D must not require grad"
-    print(f"assert_setup_valid: dim(theta_S)=dim(h_D)={d_S}, h_D finite and >0, h_D.requires_grad=False -- OK")
+    if verbose:
+        print(f"assert_setup_valid: dim(theta_S)=dim(h_D)={d_S}, h_D finite and >0, h_D.requires_grad=False -- OK")

@@ -31,6 +31,7 @@ from data import Dataset
 from data.milestone import state_sha256
 from ensemble import episode_multiplicity
 from models.diffusion.denoiser import apply_noise_from_samples, Denoiser
+from utils import Progress
 
 REWARD_SCALINGS = ("fixed", "none")
 ACTIVATIONS = {"silu": nn.SiLU, "elu": nn.ELU, "relu": nn.ReLU}
@@ -344,7 +345,7 @@ def build_feature_cache(extractor: FeatureExtractor, dataset: Dataset, successor
             pending.clear()
 
     row = 0
-    for episode_id in range(dataset.num_episodes):
+    for episode_id in Progress(range(dataset.num_episodes), desc="P2E replay encoding", unit="ep"):
         episode = dataset.load_episode(episode_id)
         frames, acts, has_next = episode_frames(episode, successors.get(episode_id))
         steps = len(episode)
@@ -526,8 +527,6 @@ class Plan2Explore:
                      f"{p}/near_constant_coordinates": int((self.raw_std < self.cfg.feature_std_floor).sum()),
                      "timing/p2e_identity_seconds": t1 - t0,
                      "timing/p2e_feature_preparation_seconds": t2 - t1, "timing/p2e_fit_seconds": t3 - t2})
-        print(f"[P2E] epoch={epoch} refresh: {cache.counts} reused={reused} feature_dim={self.feature_dim} "
-              f"prep={t2 - t1:.2f}s fit={t3 - t2:.2f}s", flush=True)
         return [logs]
 
     def fit_standardization(self) -> None:
@@ -570,6 +569,8 @@ class Plan2Explore:
         cache, cfg = self.cache, self.cfg
         num_episodes = int(cache.episode.max()) + 1
         heads, logs = [], {}
+        pbar = Progress(total=cfg.num_members * cfg.fit_updates, desc=f"P2E head fitting ({cfg.num_members} heads)",
+                        unit="updates")
         for k in range(cfg.num_members):
             init_seed, sample_seed = self.member_seeds(epoch, k)
             head = self.make_head(init_seed).to(self.device).train()
@@ -591,6 +592,7 @@ class Plan2Explore:
                 opt.step()
                 losses.append(loss.detach())
                 self.fit_updates[k] += 1
+                pbar.update(1)
             losses = torch.stack(losses).float().cpu()
             if not torch.isfinite(losses).all():
                 raise FloatingPointError(f"Non-finite Plan2Explore predictor loss (member {k})")
@@ -600,6 +602,7 @@ class Plan2Explore:
                          f"plan2explore/member_{k}_fit_updates": self.fit_updates[k],
                          f"plan2explore/member_{k}_empty_bootstrap_fallbacks": self.empty_bootstrap_fallbacks[k]})
             heads.append(head.eval().requires_grad_(False))
+        pbar.close()
         self.heads = nn.ModuleList(heads)
         return logs
 
@@ -610,6 +613,17 @@ class Plan2Explore:
         """(K, batch, D) predicted standardized next features of raw features and env actions."""
         z, a = self.standardize(features), self.canonical_action(actions)
         return torch.stack([head(z, a) for head in self.heads])
+
+    @torch.no_grad()
+    def disagreement(self, features: Tensor, actions: Tensor) -> Tensor:
+        """Raw disagreement of the frozen heads for raw features (B, D) and env actions (B, a):
+        the PMPO hook's score, with no monitoring state changed (evaluation)."""
+        if self.heads is None:
+            raise RuntimeError("Plan2Explore heads are not fitted")
+        return predictor_disagreement(self.predict(features.float(), actions.float()))
+
+    def scale(self, raw: Tensor) -> Tensor:
+        return raw / self.cfg.fixed_divisor if self.cfg.reward_scaling == "fixed" else raw
 
     @torch.no_grad()
     def __call__(self, infos: List[Dict], env_rew: Tensor) -> Tensor:

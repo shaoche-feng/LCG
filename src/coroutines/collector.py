@@ -4,13 +4,12 @@ from typing import Generator, List, Optional
 
 import torch
 import torch.nn as nn
-from tqdm import tqdm
 
 from . import coroutine
 from data import Episode, Dataset
 from envs import TorchEnv
 from .env_loop import LoopState, make_env_loop
-from utils import Logs
+from utils import Logs, Progress
 
 
 COLLECTION_MODES = ("uniform", "policy")
@@ -78,16 +77,18 @@ def make_collector(
         num_episodes = 0
         buffer = defaultdict(list)
         to_log = []
-        pbar = tqdm(
+        pbar = Progress(
             total=num_to_collect.total,
             unit=num_to_collect.unit,
-            desc=f"Collect {dataset.name}",
-            disable=not verbose,
+            desc=num_to_collect.desc or f"Collect {dataset.name}",
+            disable=not (verbose and num_to_collect.progress),
         )
 
     def reset():
         nonlocal env_loop, dead
-        env_loop = make_env_loop(env, action_source, epsilon, state=state.loop)
+        if num_to_collect.reset_seed is not None and not reset_every_collect:
+            raise ValueError("A fixed reset seed needs a collector that resets every collect (test collection)")
+        env_loop = make_env_loop(env, action_source, epsilon, state=state.loop, reset_seed=num_to_collect.reset_seed)
         dead = [None] * num_envs
 
     def forget_episodes():
@@ -166,6 +167,10 @@ class NumToCollect:
     steps: Optional[int] = None
     episodes: Optional[int] = None
     mode: str = "policy"  # one of COLLECTION_MODES
+    # Test collection only: the env reset seed of this collect (None: drawn from the RNG).
+    reset_seed: Optional[int] = None
+    desc: Optional[str] = None  # progress-bar description (None: "Collect <dataset>")
+    progress: bool = True  # False: no bar for this collect (the caller shows its own)
 
     def __post_init__(self) -> None:
         assert (self.steps is None) != (self.episodes is None)
@@ -177,7 +182,7 @@ class NumToCollect:
 
     @property
     def unit(self) -> str:
-        return "steps" if self.steps is not None else "eps"
+        return "steps" if self.steps is not None else "ep"
 
     @property
     def total(self) -> int:

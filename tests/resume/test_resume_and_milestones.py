@@ -89,7 +89,8 @@ def numeric(rows, after_epoch=0):
     for epoch, row in rows:
         # NaN compares unequal to itself; the tiny test episodes give a NaN test loss.
         values = {k: "nan" if np.isnan(float(v)) else float(v) for k, v in row.items()
-                  if k != "duration" and not k.startswith(("resume/", "timing/")) and np.ndim(v) == 0}
+                  if k not in ("duration", "progress/train_env_steps")  # the per-row env-step axis
+                  and not k.startswith(("resume/", "timing/")) and np.ndim(v) == 0}
         if epoch > after_epoch and values:
             out.append((epoch, values))
     return out
@@ -179,7 +180,7 @@ def test_learned_resume_matches_uninterrupted_run(tmp_path, monkeypatch):
     assert resumed._train_collector_state.episode_ids == [1]  # unfinished episode, 8 of 10 steps
     finish(resumed)
     resumed._final_rng = rng_state()
-    assert logs_resumed[0] == (2, {"resume/from_epoch": 1})
+    assert logs_resumed[0] == (2, {"resume/from_epoch": 1, "resume/count": 1, "progress/train_env_steps": 24})
     assert_same_run(full, resumed, logs_full, logs_resumed, after_epoch=1)
 
     # Milestones: same contents in both runs; the epoch-1 one kept its 8-step version.

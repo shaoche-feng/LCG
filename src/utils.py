@@ -271,6 +271,90 @@ def wandb_log(logs: Logs, epoch: int):
         wandb.log({"epoch": epoch, **d})
 
 
+# ---------------------------------------------------------------- terminal output
+
+PROGRESS_MODES = ("bar", "none")
+_progress = dict(mode="bar")
+_terminal = dict(blank=True)  # the last stdout line was blank (or nothing was written yet)
+
+
+def configure_progress(mode: str = "bar") -> None:
+    """bar: tqdm progress bars; none: no progress output."""
+    if mode not in PROGRESS_MODES:
+        raise ValueError(f"logging.progress must be one of {PROGRESS_MODES}, got {mode!r}")
+    _progress["mode"] = mode
+
+
+def say(message: str = "") -> None:
+    """Immediately flushed stdout line(s). Written through tqdm, so an active bar is cleared
+    and redrawn below the message instead of being overwritten."""
+    import sys
+    from tqdm import tqdm
+    tqdm.write(message, file=sys.stdout)
+    sys.stdout.flush()
+    _terminal["blank"] = message.endswith("\n") or message == ""
+
+
+def phase() -> None:
+    """A blank line before an epoch heading or a block outside the epochs (never two in a row)."""
+    if not _terminal["blank"]:
+        say()
+
+
+PROGRESS_UNITS = dict(steps="step", updates="update", trans="trans", ep="ep")  # unit -> singular
+
+
+def rate_text(fmt: Dict[str, Any], unit: str) -> str:
+    """tqdm's rate with a space before the unit, inverted below one per second like tqdm's own
+    (e.g. "295.55 steps/s", "3.85 s/update", "? updates/s" before the first measurement)."""
+    rate = fmt.get("rate")
+    if rate is None and fmt.get("elapsed"):
+        rate = (fmt["n"] - fmt.get("initial", 0)) / fmt["elapsed"]
+    if not rate:
+        return f"? {unit}/s"
+    if rate < 1:
+        return f"{1 / rate:.2f} s/{PROGRESS_UNITS.get(unit, unit)}"
+    return f"{rate:.2f} {unit}/s"
+
+
+class Progress:
+    """A tqdm bar: phase, percentage, completed/total, elapsed and remaining time, and rate
+    (rate_text). No postfix (losses and diagnostics go to W&B). Written to stdout, so it stays
+    ordered with say(); each bar is closed (left complete on its own line) when its phase ends.
+    Display only: phase timings in W&B are measured separately."""
+
+    def __init__(self, iterable=None, total: Optional[int] = None, desc: str = "", unit: str = "steps",
+                 disable: bool = False) -> None:
+        import sys
+        from tqdm import tqdm
+
+        class Bar(tqdm):
+            @property
+            def format_dict(self):
+                fmt = super().format_dict
+                fmt["rate_text"] = rate_text(fmt, unit)
+                return fmt
+
+        if total is None and hasattr(iterable, "__len__"):
+            total = len(iterable)
+        disable = disable or _progress["mode"] == "none"
+        bar_format = ("{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_text}]"
+                      if total else "{desc}: {n_fmt} " + unit + " [{elapsed}, {rate_text}]")
+        self._bar = Bar(iterable, total=total, desc=desc, unit=unit, bar_format=bar_format, file=sys.stdout,
+                        leave=True, dynamic_ncols=True, disable=disable)
+        if not disable:
+            _terminal["blank"] = False
+
+    def __iter__(self):
+        return iter(self._bar)
+
+    def update(self, n: int = 1) -> None:
+        self._bar.update(n)
+
+    def close(self) -> None:
+        self._bar.close()
+
+
 def normalize_saved_config(cfg: DictConfig) -> DictConfig:
     """Drop only obsolete schema fields; reject unsupported learning paths.
 

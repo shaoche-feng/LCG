@@ -9,7 +9,7 @@ from torch import Tensor
 from data import Dataset
 from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig
 
-from .forward_jvp import make_jvp_bank
+from .forward_jvp import make_jvp_bank, score_one_jvp_bank
 from .intrinsic_reward import make_lcg_intrinsic_reward_fn
 from .precision import assert_setup_valid, historical_precision
 from .reward_normalization import RunningRMS, RunningRMSConfig
@@ -96,6 +96,7 @@ class LCGLifecycle:
         self.img_channels = img_channels
         self.img_size = img_size
         self.device = device
+        self.verbose = True  # refresh details on stdout (the exploration trainer logs them to W&B)
 
         self.round_id = -1
 
@@ -128,12 +129,13 @@ class LCGLifecycle:
             self._theta_s_dim = sum(p.numel() for p in theta_s_named.values())
             self._frozen_named = frozen_named_parameters(denoiser, theta_s_named)
             self._denoiser_ref = denoiser
-            print(
-                f"[LCG] theta_S: parameter tensors={len(theta_s_named)} "
-                f"scalar parameters={self._theta_s_dim} "
-                f"include={list(self.cfg.theta_s.include)} exclude={list(self.cfg.theta_s.exclude)}",
-                flush=True,
-            )
+            if self.verbose:
+                print(
+                    f"[LCG] theta_S: parameter tensors={len(theta_s_named)} "
+                    f"scalar parameters={self._theta_s_dim} "
+                    f"include={list(self.cfg.theta_s.include)} exclude={list(self.cfg.theta_s.exclude)}",
+                    flush=True,
+                )
         elif denoiser is not self._denoiser_ref:
             raise RuntimeError(
                 "LCGLifecycle.refresh() was called with a different denoiser instance "
@@ -152,7 +154,7 @@ class LCGLifecycle:
         self.h_D = lcg_historical_precision(denoiser, params, dataset, self.sigma_cfg, self.cfg, round_identifier)
         self.precision_seconds = _synchronized_time(self.device) - start
         self.scoring_seconds = 0.0
-        assert_setup_valid(theta_s_named, self.h_D, d_S=self._theta_s_dim)
+        assert_setup_valid(theta_s_named, self.h_D, d_S=self._theta_s_dim, verbose=self.verbose)
         self.h_D_inv_sqrt = self.h_D.rsqrt()  # fixed for the whole round -- computed once, not per AC scoring call
 
         y_shape = torch.Size([1, self.img_channels, self.img_size, self.img_size])
@@ -171,11 +173,12 @@ class LCGLifecycle:
                 ema_decay=self.cfg.rms_ema_decay, eps=self.cfg.rms_eps,
             ))
 
-        print(
-            f"[LCG] round={self.round_id} refresh: N={dataset.num_steps} "
-            f"h_D_fingerprint={self.h_D.sum().item():.6f} banks_fingerprint={sum(s.item() for s in self.bank.sigmas):.6f}",
-            flush=True,
-        )
+        if self.verbose:
+            print(
+                f"[LCG] round={self.round_id} refresh: N={dataset.num_steps} "
+                f"h_D_fingerprint={self.h_D.sum().item():.6f} banks_fingerprint={sum(s.item() for s in self.bank.sigmas):.6f}",
+                flush=True,
+            )
 
         def hook(infos, env_rew):
             start = _synchronized_time(self.device)
@@ -186,6 +189,26 @@ class LCGLifecycle:
             return reward
 
         self.intrinsic_reward_fn = hook
+
+    @property
+    def ready(self) -> bool:
+        """A round's precision and candidate bank exist (refreshed in this process)."""
+        return self.bank is not None
+
+    def score_candidates(self, candidates) -> Tensor:
+        """Raw LCG scores of (x_obs_flat, x_act, y) candidates with this round's frozen precision
+        and bank, exactly as the PMPO hook scores imagined ones; no timing, last-batch or
+        normalization state changes (evaluation)."""
+        if not self.ready:
+            raise RuntimeError("LCG has not been refreshed in this process")
+        return score_one_jvp_bank(self._denoiser_ref, self._theta_s_named, self._frozen_named, self.h_D_inv_sqrt,
+                                  self.bank, candidates, self.cfg.candidate_chunk_size)
+
+    def scale_frozen(self, raw: Tensor) -> Optional[Tensor]:
+        """Policy reward of raw scores without updating RunningRMS (None before its first update)."""
+        if self.cfg.reward_scaling == "rms":
+            return None if self.rms is None else self.rms.apply_frozen(raw)
+        return self.scale(raw)
 
     def scale(self, raw: Tensor) -> Tensor:
         """Policy reward from raw LCG scores. fixed: raw / fixed_divisor only -- no running

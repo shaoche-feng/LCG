@@ -1,5 +1,5 @@
 """Exploration test collection and diagnostics: evaluation.should / every / collect_test,
-per-task return summaries, test-interaction accounting, isolation and resume."""
+no task-return logging, test-interaction accounting, isolation and resume."""
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +10,7 @@ from omegaconf import OmegaConf
 import exploration_trainer as trainer_module
 from data import Dataset, Episode
 from data.milestone import referenced_files
-from exploration_trainer import check_evaluation_config, ExplorationTrainer, task_return_summary
+from exploration_trainer import check_evaluation_config, ExplorationTrainer
 from test_exploration_trainer import COLLECT, compose, FakeEnv, ROOT, TASKS, TINY, UNIFORM
 from utils import rng_state
 
@@ -210,7 +210,6 @@ def test_reuse_only_after_resume_diagnoses_without_collecting(tmp_path, monkeypa
     calls = spy_calls(monkeypatch)
     resumed, logs = start(tmp_path / "split", monkeypatch, REUSE, resume=True)
     committed = [p.resolve() for p in resumed.test_dataset.episode_files()]
-    expected = task_return_summary(resumed.test_dataset)
     run(resumed)
     assert [c[0] for c in calls] == ["test_agent", "test_agent"]  # epoch 2 and final, no collection
     summaries = [row for _, row in logs if "test/fresh" in row or "final_test/fresh" in row]
@@ -220,7 +219,7 @@ def test_reuse_only_after_resume_diagnoses_without_collecting(tmp_path, monkeypa
         assert row[f"{prefix}/fresh"] == 0 and row[f"{prefix}/new_env_steps"] == 0
         assert row[f"{prefix}/total_new_env_steps"] == 12  # epoch 1's collection only
         assert row[f"{prefix}/num_episodes"] == 2
-        assert {k.split("/", 1)[1]: v for k, v in row.items() if "/return_" in k} == expected
+        assert not any(is_task_return(k) for k in row)
     assert [p.resolve() for p in resumed.test_dataset.episode_files()] == committed
     assert all(p.is_file() for p in committed)
     # Diagnostics are isolated: training continues exactly as in the fresh uninterrupted run.
@@ -238,34 +237,28 @@ def test_reuse_only_after_resume_diagnoses_without_collecting(tmp_path, monkeypa
 
 # ---------------------------------------------------------------- summaries and isolation
 
-def test_task_return_summary_uses_each_recorded_column():
-    dataset = Dataset(Path("unused"), cache_in_ram=True, save_on_disk=False)
-    returns = []
-    for scale in (1.0, 2.0, 4.0):
-        rew = scale * torch.arange(5.)
-        task_rew = torch.stack([rew, -rew + 1], 1)
-        dataset.add_episode(Episode(torch.zeros(5, 3, 8, 8), torch.zeros(5, 2), rew, torch.zeros(5, dtype=torch.long),
-                                    torch.zeros(5, dtype=torch.long), {}, task_rew=task_rew, task_names=TASKS))
-        returns.append(task_rew.sum(0).tolist())
-    stand, walk = np.array(returns).T  # stand: 10, 20, 40; walk: -5, -15, -35
-    summary = task_return_summary(dataset)
-    assert summary == {"return_stand/mean": stand.mean(), "return_stand/std": stand.std(), "return_stand/min": 10.0,
-                       "return_stand/max": 40.0, "return_walk/mean": walk.mean(), "return_walk/std": walk.std(),
-                       "return_walk/min": -35.0, "return_walk/max": -5.0}
-    assert task_return_summary(Dataset(Path("unused"), cache_in_ram=True, save_on_disk=False)) == {}
+def is_task_return(key):
+    """Downstream task-return keys (the PMPO imagined return actor_critic/train/return_* is not one)."""
+    return key == "return" or key.startswith("final_return") or "/return_" in key and not key.startswith("actor_critic/")
 
 
-def test_trainer_return_summaries_match_the_test_episodes(tmp_path, monkeypatch):
+def test_task_returns_are_not_logged_but_test_episodes_keep_task_rewards(tmp_path, monkeypatch, capsys):
     trainer, logs = start(tmp_path / "run", monkeypatch, BASE + UNIFORM + FRESH)
     run(trainer)
-    final = [row for _, row in logs if "final_test/fresh" in row][-1]
+    assert logs and not [k for _, row in logs for k in row if is_task_return(k)]
+    out = capsys.readouterr().out
+    assert "return =" not in out and "final_return" not in out and "task returns" not in out
+    # The episodes still carry every task-reward column (downstream adaptation needs them).
     episodes = [trainer.test_dataset.load_episode(i) for i in range(3)]
+    for ep in episodes:
+        assert ep.task_names == TASKS and ep.task_rew.shape == (len(ep), len(TASKS))
+        torch.testing.assert_close(ep.task_rew[:, 0], ep.rew)  # the first task drives collection
+    # The fake env labels walk = 3 * stand + 1 per step (6 steps): a real per-column record.
     walk = np.array([ep.task_rew[:, 1].double().sum().item() for ep in episodes])
-    stand = np.array([ep.rew.double().sum().item() for ep in episodes])  # the first task drives collection
-    assert final["final_test/return_walk/mean"] == pytest.approx(walk.mean(), abs=1e-12)
-    assert final["final_test/return_stand/max"] == pytest.approx(stand.max(), abs=1e-6)
-    # The fake env labels walk = 3 * stand + 1 per step (6 steps): a real per-column sum.
+    stand = np.array([ep.rew.double().sum().item() for ep in episodes])
     assert walk == pytest.approx(3 * stand + 6, abs=1e-4)
+    train = trainer.train_dataset.load_episode(0)
+    assert train.task_names == TASKS and train.task_rew.shape == (len(train), len(TASKS))
 
 
 def test_test_data_stays_out_of_training_replay_and_milestones(tmp_path, monkeypatch):

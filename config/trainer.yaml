@@ -17,6 +17,15 @@ wandb:
   group: null
   tags: null
   notes: null
+  id: null  # null: a new run id, kept in the run folder's wandb_run.json so a resume continues that run
+
+# Exploration terminal output (configs without this section use these values).
+logging:
+  progress: bar  # bar: standard tqdm bars (phase, %, counts, elapsed, remaining, rate); none: no progress output
+  epoch_summary: true  # one epoch_summary/* W&B row per epoch (not shown on the terminal)
+  # Mirror every W&B row to wandb_history.jsonl in the run folder; a resume re-logs committed rows
+  # the W&B server never received (e.g. a hard crash that also killed the upload process).
+  local_history: true
 
 initialization:
   path_to_ckpt: null
@@ -77,6 +86,14 @@ evaluation:
   # False: reuse the existing test dataset, collecting nothing (it must be non-empty).
   # Configs without this key use True (the earlier behaviour). Static datasets never collect.
   collect_test: True
+  # Fixed env reset seeds, one test episode per seed (null: a random seed per collection, the
+  # earlier behaviour). reset_seeds needs collection.test.num_episodes equal to its length,
+  # final_reset_seeds likewise num_final_episodes; both need collection.test.num_envs=1.
+  reset_seeds: null
+  final_reset_seeds: null
+  # Score the test episodes with the current frozen intrinsic scorer (learned methods; results in
+  # evaluation/*.json and W&B). Intrinsic returns are in method-specific units.
+  intrinsic: True
 
 world_model_env:
   _target_: envs.WorldModelEnvConfig

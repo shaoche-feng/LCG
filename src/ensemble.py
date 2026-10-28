@@ -200,6 +200,13 @@ class EnsembleScorer:
             return self.rms(raw)
         return raw
 
+    def scale_frozen(self, raw: Tensor) -> Optional[Tensor]:
+        """Policy reward of raw scores without updating RunningRMS (evaluation; None before its
+        first update this epoch)."""
+        if self.cfg.reward_scaling == "rms":
+            return self.rms.apply_frozen(raw)
+        return self.scale(raw)
+
     def __call__(self, infos: List[Dict], env_rew: Tensor) -> Tensor:
         raw = torch.stack([info["ensemble_disagreement"] for info in infos], dim=1)  # (envs, steps)
         raw = raw.to(device=env_rew.device, dtype=env_rew.dtype)

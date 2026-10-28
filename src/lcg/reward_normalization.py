@@ -45,6 +45,16 @@ class RunningRMS:
         scale = self.cfg.alpha / (self.s2.sqrt() + self.cfg.eps)
         return r * scale
 
+    @torch.no_grad()
+    def apply_frozen(self, r: Tensor) -> Optional[Tensor]:
+        """The current scale applied to r without updating s2 (evaluation); None before any
+        update (no scale exists yet)."""
+        if not self.cfg.enabled:
+            return r
+        if self.s2 is None:
+            return None
+        return r * (self.cfg.alpha / (self.s2.sqrt() + self.cfg.eps))
+
 
 def wrap_with_running_rms(
     hook_fn: Callable[[List[Dict], Tensor], Tensor], rms: RunningRMS

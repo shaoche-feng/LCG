@@ -21,7 +21,7 @@ class LoopState:
 @coroutine
 def make_env_loop(
     env: Union[TorchEnv, WorldModelEnv], model: nn.Module, epsilon: float = 0.0,
-    store_policy_observations: bool = False, state: Optional[LoopState] = None,
+    store_policy_observations: bool = False, state: Optional[LoopState] = None, reset_seed: Optional[int] = None,
 ) -> Generator[Tuple[torch.Tensor, ...], int, None]:
     num_steps = yield
 
@@ -34,7 +34,8 @@ def make_env_loop(
                              f"expected {tuple(history.state.shape)}")
         history.state = state.history
     else:
-        seed = random.randint(0, 2**31 - 1)
+        # A fixed reset seed (test evaluation) replaces the draw; envs get seed, seed + 1, ...
+        seed = random.randint(0, 2**31 - 1) if reset_seed is None else int(reset_seed)
         obs, info = env.reset(seed=[seed + i for i in range(env.num_envs)])
         # WorldModelEnv supplies its replay prompt; real resets repeat the first frame.
         history = FrameHistory(obs, model.frame_stack, info.get("prompt"))

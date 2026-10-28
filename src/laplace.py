@@ -186,9 +186,6 @@ class LaplaceEnsemble:
         for k in range(self.cfg.num_members):
             logs[f"laplace/member_{k}_perturbation_norm"] = float(norms[k])
             logs[f"laplace/member_{k}_relative_perturbation"] = float(norms[k] / base_norm.clamp_min(1e-12))
-        print(f"[LAPLACE] epoch={epoch} refresh: dim={self.dim} precision median={float(q[2]):.4g} "
-              f"[{float(q[0]):.4g}, {float(q[4]):.4g}] relative perturbation "
-              f"{[round(float(n / base_norm), 4) for n in norms]} precision {t1 - t0:.2f}s", flush=True)
         return logs
 
     # ---------------------------------------------------------------- members

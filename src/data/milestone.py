@@ -16,6 +16,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -114,8 +115,21 @@ def publish_milestone(
     )
     with open(tmp / MANIFEST_FILE, "w", encoding="utf-8") as f:
         yaml.safe_dump(manifest, f, sort_keys=False)
-    os.replace(tmp, final)
+    replace_directory(tmp, final)
     return final
+
+
+def replace_directory(src: Path, dst: Path, attempts: int = 20, delay: float = 0.5) -> None:
+    """os.replace, retried on PermissionError: on Windows a scanner or indexer can briefly hold a
+    freshly written file, which makes renaming its directory fail (WinError 5)."""
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 def index_sha256(dataset: Dataset) -> str:
