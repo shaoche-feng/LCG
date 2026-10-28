@@ -9,7 +9,7 @@ from agent import Agent
 from data import Dataset, Episode
 from game.keymap import ActionNames, Keymap
 from envs import WorldModelEnv
-from coroutines.frame_history import FrameHistory
+from coroutines.frame_history import FrameHistory, policy_prompt
 
 
 NamedEnv = namedtuple("NamedEnv", "name env")
@@ -85,8 +85,9 @@ class PlayEnv:
     def reset(self) -> Tuple[Tensor, None]:
         self.obs, env_info = self.env.reset()
         self.t, self.return_ = 0, 0
-        # WorldModelEnv supplies its replay prompt; real resets repeat the first frame.
-        self.history = FrameHistory(self.obs, self.agent.actor_critic.frame_stack, env_info.get("prompt"))
+        # Real resets repeat the first frame; imagined ones follow the controller's convention.
+        self.history = FrameHistory(self.obs, self.agent.actor_critic.frame_stack,
+                                    policy_prompt(self.agent.actor_critic, env_info))
         if self.recording_mode:
             self.reset_recording()
         return self.obs, None
@@ -141,7 +142,7 @@ class PlayEnv:
                 self.rec_dataset.add_episode(ep)
                 self.rec_dataset.save_to_default_path()
 
-        self.history.advance(next_obs, torch.logical_or(end, trunc), env_info.get("prompt"))
+        self.history.advance(next_obs, torch.logical_or(end, trunc), policy_prompt(self.agent.actor_critic, env_info))
         self.obs = next_obs
         self.t += 1
 

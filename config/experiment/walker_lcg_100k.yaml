@@ -33,6 +33,13 @@ evaluation:  # diagnostics retained: fresh test episodes every 10 epochs and aft
   every: 10
   collect_test: true
 
+# Exploration controller: the Gaussian H10 EMA-critic controller (config/agent/pmpo_beta.yaml)
+# with advantage-weighted PMPO, as in the ensemble, Plan2Explore and Laplace presets.
+agent:
+  actor_critic:
+    actor_objective: advantage_weighted
+    advantage_weight_cap: 5.0
+
 intrinsic_reward:
   enabled: true
   theta_s:

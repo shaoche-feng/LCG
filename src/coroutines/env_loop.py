@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from . import coroutine
-from .frame_history import FrameHistory
+from .frame_history import FrameHistory, policy_prompt
 from envs import TorchEnv, WorldModelEnv
 
 
@@ -37,8 +37,10 @@ def make_env_loop(
         # A fixed reset seed (test evaluation) replaces the draw; envs get seed, seed + 1, ...
         seed = random.randint(0, 2**31 - 1) if reset_seed is None else int(reset_seed)
         obs, info = env.reset(seed=[seed + i for i in range(env.num_envs)])
-        # WorldModelEnv supplies its replay prompt; real resets repeat the first frame.
-        history = FrameHistory(obs, model.frame_stack, info.get("prompt"))
+        # Real resets repeat the first frame. WorldModelEnv supplies its replay prompt, which seeds
+        # the policy's history unless the controller repeats the imagined start frame
+        # (imagination_history=repeat_anchor; the world model keeps its prompt either way).
+        history = FrameHistory(obs, model.frame_stack, policy_prompt(model, info))
 
     while True:
         all_ = []
@@ -80,7 +82,7 @@ def make_env_loop(
             infos.append(info)
 
             # After the final-observation bootstrap above used the ending history.
-            history.advance(next_obs, dead, info.get("prompt"))
+            history.advance(next_obs, dead, policy_prompt(model, info))
 
             obs = next_obs
             n += 1

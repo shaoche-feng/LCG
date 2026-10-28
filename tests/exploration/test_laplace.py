@@ -123,8 +123,9 @@ def test_config_group_and_preset():
     for key in ("precision_reference_size", "precision_num_mc", "damping", "beta"):
         assert preset.intrinsic_reward[key] == lcg.intrinsic_reward[key], key
     assert OmegaConf.to_container(preset.intrinsic_reward.theta_s) == OmegaConf.to_container(lcg.intrinsic_reward.theta_s)
-    # Existing presets and defaults unchanged: LCG stays sign-only and the default method is LCG.
-    assert lcg.agent.actor_critic.actor_objective == "sign" and compose([]).intrinsic_reward._target_ == "lcg.LCGConfig"
+    # LCG uses the same exploration controller (advantage-weighted) and the default method is LCG.
+    assert OmegaConf.to_container(lcg.agent) == OmegaConf.to_container(preset.agent)
+    assert lcg.agent.actor_critic.actor_objective == "advantage_weighted" and compose([]).intrinsic_reward._target_ == "lcg.LCGConfig"
     # The R1 guards hold on the real architecture (10 tensors, 217,664 scalars).
     from hydra.utils import instantiate
     den_cfg = instantiate(preset.agent.denoiser)

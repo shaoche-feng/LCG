@@ -23,7 +23,7 @@ from device_report import device_lines
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
 from lcg import LCGLifecycle, selected_named_parameters
-from models.pmpo_beta import PMPOOptimizers, summary_statistics
+from models.pmpo_beta import PMPOOptimizers, check_controller_state, controller_settings, summary_statistics
 from plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
 from laplace import LaplaceConfig, LaplaceEnsemble, LaplaceScorer
 from intrinsic_eval import aggregate, episode_record, IntrinsicEvaluator
@@ -890,8 +890,14 @@ class ExplorationTrainer(StateDictMixin):
                 settings["plan2explore"] = self.plan2explore.settings()
             if self.ensemble is not None:
                 settings["ensemble"] = self.ensemble.settings()
+        controller = None
+        if self._method is not None:  # uniform random trains no exploration policy
+            ac = self.agent.actor_critic
+            controller = dict(controller_settings(ac.cfg), actor_objective=ac.objective_settings(),
+                              entropy_coef=float(ac.cfg.entropy_coef), beta_kl=float(ac.cfg.beta_kl),
+                              prior_refresh_interval=int(ac.cfg.prior_refresh_interval))
         return dict(seed=self._seed, method=self._method or "uniform", method_name=METHOD_NAMES[self._method],
-                    method_settings=settings, source=self.source, evaluation=self.evaluation_protocol(),
+                    method_settings=settings, controller=controller, source=self.source, evaluation=self.evaluation_protocol(),
                     milestones=[m["name"] for m in self.milestones if not m["retired"]])
 
     def evaluation_protocol(self) -> Dict[str, Any]:
@@ -1156,6 +1162,10 @@ class ExplorationTrainer(StateDictMixin):
         elif state_dict["plan2explore"] is not None:
             raise ValueError("Checkpoint was trained with Plan2Explore feature predictors, the config selects "
                              f"intrinsic_reward method {self._method!r}; a resume must not change it")
+        # The controller (Beta/Gaussian, slow critic, frame-history convention, horizon) before any
+        # weights are loaded: a mismatch is refused, never reinterpreted.
+        check_controller_state(state_dict["agent"].get("actor_critic._extra_state"), self.agent.actor_critic.cfg,
+                               source="Checkpoint's exploration controller")
         check_same_packages(state_dict["source"])
         super().load_state_dict(state_dict)
         self.restore_collection_state(collection)

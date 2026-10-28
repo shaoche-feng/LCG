@@ -2,6 +2,16 @@
 import torch
 
 
+def policy_prompt(model, info):
+    """The replay prompt that seeds the policy's history at imagined resets, or None when the
+    controller repeats the imagined start frame instead (imagination_history=repeat_anchor; then
+    an imagined reset repeats its first observation, as a real one does). Real environments
+    supply no prompt. The world model's own conditioning never depends on this."""
+    if getattr(model, "repeats_imagined_anchor", False):
+        return None
+    return info.get("prompt")
+
+
 class FrameHistory:
     def __init__(self, observation, length, prompt=None):
         self.length = length

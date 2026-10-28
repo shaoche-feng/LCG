@@ -588,3 +588,341 @@ def test_env_loop_preserves_pre_reset_observation():
     torch.testing.assert_close(rollout[0], torch.ones(1, 1, 3, 8, 8))
     final_stack = torch.cat([torch.ones(1, 9, 8, 8), torch.ones(1, 3, 8, 8) * 2], 1)
     torch.testing.assert_close(rollout[7][:, 0], model.value(final_stack).squeeze(-1))
+
+# ---------------------------------------------------------------- Gaussian H10 EMA-critic controller
+# Ported from the reference (kingplus0:/home/bigking/scfeng/LCG-stage3-gaussian-h10-emacritic,
+# tests/models/test_tanh_gaussian.py and the untracked tests/models/test_ema_critic.py), plus the
+# objective, frame-history and checkpoint-compatibility checks of this migration.
+
+G = dict(actor_distribution="tanh_gaussian")
+E = dict(actor_distribution="tanh_gaussian", slow_critic_coef=1.0)
+H10 = dict(actor_distribution="tanh_gaussian", slow_critic_coef=1.0, slow_critic_rate=0.02,
+           imagination_history="repeat_anchor")
+
+
+def transformed_reference(model, raw):
+    """Independent reference: torch's own transformed distribution, per dimension."""
+    from torch.distributions import TransformedDistribution
+    from torch.distributions.transforms import AffineTransform, TanhTransform
+    dist = model.distribution(raw)
+    width = model.action_high - model.action_low
+    # cache_size=1: scoring a tensor this distribution just sampled reuses the exact pre-image.
+    return TransformedDistribution(dist, [TanhTransform(cache_size=1),
+                                          AffineTransform(model.action_low + width / 2, width / 2, cache_size=1)])
+
+
+def test_gauss_hermite_constants_equal_numpy_hermgauss():
+    """The stored rule is numpy's hermgauss(32), computed in a process without torch (on Windows
+    LAPACK aborts once torch's OpenMP runtime is loaded)."""
+    import json
+    import subprocess
+    import sys
+    from models.pmpo_beta import GAUSS_HERMITE_32
+    code = "import json, numpy as np; n, w = np.polynomial.hermite.hermgauss(32); print(json.dumps([n.tolist(), w.tolist()]))"
+    nodes, weights = json.loads(subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout)
+    assert list(GAUSS_HERMITE_32[0]) == nodes and list(GAUSS_HERMITE_32[1]) == weights
+
+
+def test_gaussian_parameterization_bounds_and_deterministic_rule():
+    from models.pmpo_beta import GAUSSIAN_STD_MIN, GAUSSIAN_STD_SPAN
+    torch.manual_seed(0)
+    model = make_controller(**G)
+    raw = torch.randn(64, 4) * 3
+    dist = model.distribution(raw)
+    mu, raw_std = raw.chunk(2, dim=-1)
+    torch.testing.assert_close(dist.mean, mu)
+    torch.testing.assert_close(dist.stddev, GAUSSIAN_STD_MIN + GAUSSIAN_STD_SPAN * torch.sigmoid(raw_std))
+    assert (dist.stddev > GAUSSIAN_STD_MIN).all() and (dist.stddev < GAUSSIAN_STD_MIN + GAUSSIAN_STD_SPAN).all()
+    actions = model.sample_action(raw)
+    assert actions.dtype == torch.float32 and actions.shape == (64, 2) and not actions.requires_grad
+    assert ((actions >= model.action_low) & (actions <= model.action_high)).all()
+    det = model.sample_action(raw, deterministic=True)
+    width = model.action_high - model.action_low
+    torch.testing.assert_close(det, model.action_low + (torch.tanh(mu) + 1) / 2 * width)
+    assert torch.equal(det, model.sample_action(raw, deterministic=True))
+    huge = torch.tensor([[50., -50., 0., 0.]])  # saturating means still give in-bounds actions
+    sat = model.sample_action(huge, deterministic=True)
+    assert ((sat >= model.action_low) & (sat <= model.action_high)).all()
+
+
+def test_gaussian_log_prob_matches_independent_transformed_distribution():
+    torch.manual_seed(1)
+    model = make_controller(**G)
+    raw = torch.randn(256, 4) * torch.tensor([1.5, 1.5, 2., 2.])
+    actions = model.sample_action(raw)
+    logp, _ = model.log_prob_and_entropy(raw, actions)
+    expected = transformed_reference(model, raw).log_prob(actions).sum(-1)
+    canonical = 2 * (actions - model.action_low) / (model.action_high - model.action_low) - 1
+    safe = (canonical.abs() < 0.999).all(-1)  # away from float32 inversion limits
+    assert safe.sum() > 100
+    torch.testing.assert_close(logp[safe], expected[safe], rtol=1e-4, atol=1e-3)
+
+
+def test_gaussian_log_prob_and_gradients_finite_at_and_near_action_limits():
+    model = make_controller(**G)
+    low, high = model.action_low, model.action_high
+    width = high - low
+    actions = torch.stack([low, high, low + 1e-6 * width, high - 1e-6 * width, low + 1e-3 * width, high - 1e-3 * width])
+    for scale in (0., 5., -12.):
+        raw = torch.zeros(len(actions), 4)
+        raw[:, :2] = scale
+        raw.requires_grad_(True)
+        logp, entropy = model.log_prob_and_entropy(raw, actions)
+        assert torch.isfinite(logp).all() and torch.isfinite(entropy).all()
+        (logp.sum() + entropy.sum()).backward()
+        assert torch.isfinite(raw.grad).all()
+    with pytest.raises(ValueError):
+        model.log_prob_and_entropy(torch.zeros(1, 4), (high + 1e-3).unsqueeze(0))
+
+
+def test_gaussian_transformed_entropy_matches_monte_carlo_and_has_gradient():
+    torch.manual_seed(2)
+    model = make_controller(**G)
+    raw = torch.tensor([[0., 0., -2., 2.], [1.5, -0.5, 1., -1.], [3., 0.2, 0., 3.]], requires_grad=True)
+    _, entropy = model.log_prob_and_entropy(raw, model.sample_action(raw, deterministic=True))
+    ref = transformed_reference(model, raw.detach())
+    mc = -ref.log_prob(ref.sample((200_000,))).sum(-1).mean(0)
+    torch.testing.assert_close(entropy.detach(), mc, rtol=0, atol=0.02)
+    entropy.sum().backward()
+    assert torch.isfinite(raw.grad).all() and raw.grad.abs().sum() > 0
+    narrow = model.entropy_per_dim(model.distribution(torch.tensor([[0., 0., -3., -3.]])))
+    wide = model.entropy_per_dim(model.distribution(torch.tensor([[0., 0., 3., 3.]])))
+    assert (wide > narrow).all()
+
+
+def test_gaussian_kl_is_analytic_between_pre_tanh_normals_and_prior_frozen():
+    from torch.distributions import kl_divergence
+    model = make_controller(**G)
+    obs = torch.randn(4, 12, 8, 8)
+    prior = model.distribution(model.prior_actor(obs))
+    same = kl_divergence(model.distribution(model.actor(obs)), prior).sum(-1)
+    torch.testing.assert_close(same, torch.zeros_like(same), atol=1e-6, rtol=0)
+    with torch.no_grad():
+        model.actor.head[-1].bias[0] += 1
+        model.actor.head[-1].bias[3] -= 1
+    p, q = model.distribution(model.actor(obs)), prior
+    kl = kl_divergence(p, q).sum(-1)
+    closed = (torch.log(q.stddev / p.stddev) + (p.stddev ** 2 + (p.mean - q.mean) ** 2) / (2 * q.stddev ** 2) - 0.5).sum(-1)
+    torch.testing.assert_close(kl, closed, rtol=1e-5, atol=1e-6)
+    assert (kl > 0).all()
+    kl.mean().backward()
+    assert all(p.grad is None and not p.requires_grad for p in model.prior_actor.parameters())
+
+
+@pytest.mark.parametrize("objective", ["sign", "advantage_weighted"])
+def test_h10_update_is_finite_with_gaussian_diagnostics_only(objective):
+    model, _ = make_system(**H10, actor_objective=objective, prior_refresh_interval=2)
+    opt = PMPOOptimizers(model, 0)
+    for _ in range(3):
+        opt.zero_grad()
+        loss, metrics = model()
+        assert torch.isfinite(loss)
+        assert all(torch.isfinite(torch.as_tensor(v)).all() for v in metrics.values())
+        assert {"pretanh_mean_mean", "pretanh_std_mean", "pretanh_std_near_floor_fraction", "tanh_inverse_limited_fraction",
+                "policy_conditional_std_0", "loss_slowreg", "loss_value_target", "slow_value_mean", "slow_value_gap"} <= set(metrics)
+        assert not any(k.startswith(("alpha_", "beta_")) for k in metrics)  # no Beta concentrations
+        loss.backward()
+        assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+        opt.step()
+
+
+def test_objective_weights_only_the_pmpo_term_kl_entropy_and_critic_unchanged():
+    """Same rollout (same seeds) under both objectives: only loss_pmpo_raw differs; the
+    advantage-weighted term equals the detached-weight formula on the captured rollout."""
+    from models.pmpo_beta import pmpo_loss
+    results = {}
+    for objective in ("sign", "advantage_weighted"):
+        model, _ = make_system(**H10, actor_objective=objective)
+        captured = {}
+        collect = model.collect_imagination
+
+        def spy(collect=collect, captured=captured):
+            captured["rollout"] = collect()
+            return captured["rollout"]
+        model.collect_imagination = spy
+        _, metrics = model()
+        obs, act, rew, end, trunc, _, old_values, bootstrap, _ = captured["rollout"]
+        from models.actor_critic import compute_lambda_returns
+        advantage = (compute_lambda_returns(rew, end, trunc, bootstrap, model.cfg.gamma, model.cfg.lambda_) - old_values).flatten()
+        logp, _ = model.log_prob_and_entropy(model.actor(obs.flatten(0, 1)), act.flatten(0, 1))
+        expected = pmpo_loss(logp, advantage, model.cfg.alpha_pmpo, objective, 5.0)
+        assert float(metrics["loss_pmpo_raw"]) == pytest.approx(float(expected), rel=1e-6, abs=1e-7)
+        results[objective] = metrics
+    for key in ("loss_kl", "loss_entropy", "kl_prior", "loss_value", "loss_value_target", "loss_slowreg", "policy_entropy"):
+        torch.testing.assert_close(torch.as_tensor(results["sign"][key]), torch.as_tensor(results["advantage_weighted"][key]),
+                                   rtol=0, atol=0)
+    assert float(results["sign"]["weight_std_positive"]) == 0
+
+
+def test_slow_critic_disabled_creates_nothing_and_settings_are_validated():
+    torch.manual_seed(0)
+    base = make_controller(**G)
+    torch.manual_seed(0)
+    off = make_controller(**G, slow_critic_coef=0.0)
+    assert not hasattr(off, "slow_value") and list(base.state_dict()) == list(off.state_dict())
+    for coef, rate in ((-1.0, 0.02), (1.0, 0.0), (1.0, 1.5)):
+        with pytest.raises(ValueError, match="slow critic"):
+            make_controller(**G, slow_critic_coef=coef, slow_critic_rate=rate)
+    with pytest.raises(ValueError, match="actor distribution"):
+        make_controller(actor_distribution="gaussian")
+
+
+def test_slow_critic_starts_as_an_exact_copy_without_gradients_outside_the_optimizer():
+    torch.manual_seed(0)
+    model = make_controller(**E)
+    for (k, s), (_, v) in zip(model.slow_value.state_dict().items(), model.value.state_dict().items()):
+        assert torch.equal(s, v), k
+    assert not any(p.requires_grad for p in model.slow_value.parameters())
+    opt = PMPOOptimizers(model, warmup_steps=0)
+    optimized = {id(p) for g in opt.actor.param_groups + opt.value.param_groups for p in g["params"]}
+    assert not optimized & {id(p) for p in model.slow_value.parameters()}
+
+
+def test_slow_critic_loss_formula_gradient_paths_and_update_after_the_critic_step():
+    import torch.nn.functional as F
+    torch.set_num_threads(1)
+    model, _ = make_system(**E)
+    opt = PMPOOptimizers(model, warmup_steps=0)
+    captured = {}
+    collect = model.collect_imagination
+
+    def spy():
+        out = collect()
+        captured["obs"] = out[0]
+        return out
+    model.collect_imagination = spy
+    with torch.no_grad():  # make the slow critic differ so the regularizer is non-trivial
+        for p in model.slow_value.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    slow_before = deepcopy(model.slow_value.state_dict())
+    loss, metrics = model()
+    flat = captured["obs"].flatten(0, 1)
+    with torch.no_grad():
+        v, vs = model.value(flat).squeeze(-1), model.slow_value(flat).squeeze(-1)
+    assert float(metrics["loss_slowreg"]) == pytest.approx(float(F.mse_loss(v, vs)), rel=1e-6)
+    assert float(metrics["loss_value"]) == pytest.approx(float(metrics["loss_value_target"]) + float(metrics["loss_slowreg"]), rel=1e-6)
+    loss.backward()
+    assert all(p.grad is None for p in model.slow_value.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.value.parameters())
+    opt.step()  # EMA with the POST-step online critic, rate 0.02
+    for k, online in model.value.state_dict().items():
+        torch.testing.assert_close(model.slow_value.state_dict()[k], 0.98 * slow_before[k] + 0.02 * online, rtol=0, atol=1e-7)
+
+
+def test_online_critic_gives_bootstraps_and_advantages_not_the_slow_critic():
+    torch.set_num_threads(1)
+    model, _ = make_system(**H10)
+    with torch.no_grad():
+        for p in model.slow_value.parameters():
+            p.add_(1.0)  # very different slow critic
+    obs, act, rew, end, trunc, _, values, bootstrap, infos = model.collect_imagination()
+    with torch.no_grad():
+        online = model.value(obs.flatten(0, 1)).squeeze(-1).view_as(values)
+        slow = model.slow_value(obs.flatten(0, 1)).squeeze(-1).view_as(values)
+    torch.testing.assert_close(values, online, rtol=0, atol=1e-6)  # batched recomputation: float rounding only
+    assert not torch.allclose(values, slow)
+    alive = ~(end + trunc).bool()[:, :-1]
+    torch.testing.assert_close(bootstrap[:, :-1][alive], online[:, 1:][alive], rtol=0, atol=1e-6)
+
+
+def test_h10_imagination_starts_from_the_repeated_anchor_frame():
+    """Every imagined start (the first state, and the state after a sampled ending or the
+    horizon cut) is its start frame repeated; otherwise the stack advances one frame."""
+    model, env = make_system(**H10)
+    obs, _, _, end, trunc = model.collect_imagination()[:5]
+    dead = (end + trunc).bool()
+    starts = 0
+    for row in range(obs.shape[0]):
+        for t in range(obs.shape[1]):
+            frames = obs[row, t].reshape(4, 3, 8, 8)
+            if t == 0 or dead[row, t - 1]:
+                starts += 1
+                for k in range(1, 4):
+                    torch.testing.assert_close(frames[k], frames[0], rtol=0, atol=0)
+            else:
+                torch.testing.assert_close(obs[row, t, :9], obs[row, t - 1, 3:], rtol=0, atol=0)
+    assert starts > obs.shape[0]  # this rollout also restarts within the horizon
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))])
+def test_h10_checkpoint_resume_is_bit_exact_with_slow_critic_and_prior_refresh(tmp_path, device):
+    torch.set_num_threads(1)
+    torch.backends.cudnn.deterministic = True
+    model, env = make_system(device, **H10, actor_objective="advantage_weighted", prior_refresh_interval=2)
+    opt = PMPOOptimizers(model, 5)
+    loss, _ = model()
+    loss.backward()
+    opt.step()
+    path = tmp_path / "pmpo.pt"
+    torch.save(dict(model=model.state_dict(), optimizer=opt.state_dict()), path)
+    restored, restored_env = make_system(device, **H10, actor_objective="advantage_weighted", prior_refresh_interval=2)
+    torch.manual_seed(99)
+    restored_opt = PMPOOptimizers(restored, 5)
+    saved = torch.load(path, map_location=device, weights_only=False)
+    assert not any(k.startswith("_gh_") for k in saved["model"])  # quadrature buffers not persisted
+    assert any(k.startswith("slow_value.") for k in saved["model"])
+    assert saved["model"]["_extra_state"]["controller"] == dict(
+        actor_distribution="tanh_gaussian", slow_critic=dict(coef=1.0, rate=0.02),
+        imagination_history="repeat_anchor", imagination_horizon=3)
+    restored.load_state_dict(saved["model"])
+    restored_opt.load_state_dict(saved["optimizer"])
+    restored_env.sampler.denoiser.load_state_dict(env.sampler.denoiser.state_dict())
+    restored_env.rew_end_model.load_state_dict(env.rew_end_model.state_dict())
+    for _ in range(2):  # crosses a prior-refresh boundary
+        opt.zero_grad(); restored_opt.zero_grad()
+        loss, metrics = model()
+        actual, actual_metrics = restored()
+        torch.testing.assert_close(actual, loss, rtol=0, atol=0)
+        for key in metrics:
+            torch.testing.assert_close(torch.as_tensor(actual_metrics[key]), torch.as_tensor(metrics[key]), rtol=0, atol=0)
+        loss.backward(); actual.backward()
+        opt.step(); restored_opt.step()
+    for (k, p), q in zip(model.state_dict().items(), restored.state_dict().values()):
+        if torch.is_tensor(p):
+            torch.testing.assert_close(p, q, rtol=0, atol=0, msg=k)
+
+
+@pytest.mark.parametrize("change,match", [
+    (dict(actor_distribution="beta", slow_critic_coef=0.0), "'actor_distribution': 'beta'"),  # Beta weights into the Gaussian actor
+    (dict(imagination_history="replay_prompt"), "imagination_history"),
+    (dict(slow_critic_rate=0.05), "slow_critic"),
+    (dict(imagination_horizon=5), "imagination_horizon"),
+])
+def test_incompatible_controller_state_is_refused_before_anything_is_loaded(change, match):
+    torch.manual_seed(1)
+    source = make_controller(**{**H10, **change})
+    torch.manual_seed(2)
+    target = make_controller(**H10)
+    before = deepcopy(target.state_dict())
+    state = {k: v for k, v in source.state_dict().items() if not k.startswith("slow_value.")}
+    if "slow_value.head.0.weight" in target.state_dict():
+        state.update({k: v for k, v in target.state_dict().items() if k.startswith("slow_value.")})
+    with pytest.raises(ValueError, match="different controller") as error:
+        target.load_state_dict(state)
+    assert match in str(error.value)
+    for k, v in target.state_dict().items():
+        if torch.is_tensor(v):
+            assert torch.equal(v, before[k]), k  # nothing was copied
+
+
+def test_legacy_controller_state_is_never_reinterpreted():
+    """State saved before controller settings were recorded is a Beta, replay-prompt controller:
+    refused by the Gaussian H10 controller, accepted only by a matching legacy-style config."""
+    legacy = make_controller()  # Beta, replay_prompt, no slow critic
+    state = legacy.state_dict()
+    del state["_extra_state"]["controller"]
+    with pytest.raises(ValueError, match="saved before controller settings were recorded"):
+        make_controller(**H10).load_state_dict(state)
+    make_controller().load_state_dict(state)
+
+
+def test_trainer_world_model_pmpo_diagnostic_and_resume_with_the_h10_controller(tmp_path, monkeypatch):
+    """The reference's trainer-level check, on this branch's default agent config (already the
+    Gaussian H10 EMA-critic controller): diagnostic rows carry Gaussian parameters only."""
+    import json
+    test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatch, True)
+    saved = (tmp_path / "config/trainer.yaml").read_text()
+    for line in ("actor_distribution: tanh_gaussian", "slow_critic_coef: 1.0", "imagination_history: repeat_anchor"):
+        assert line in saved
+    rows = [json.loads(line) for line in (tmp_path / "pmpo_diagnostic/updates.jsonl").read_text().splitlines()]
+    assert rows and all("pretanh_std_mean" in r and "alpha_mean" not in r for r in rows)

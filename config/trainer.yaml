@@ -97,7 +97,7 @@ evaluation:
 
 world_model_env:
   _target_: envs.WorldModelEnvConfig
-  horizon: 15
+  horizon: 10  # imagination horizon of the Gaussian H10 EMA-critic controller (reference H10 runs)
   num_batches_to_preload: 256
   diffusion_sampler:
     _target_: models.diffusion.DiffusionSamplerConfig

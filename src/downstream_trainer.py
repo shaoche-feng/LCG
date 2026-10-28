@@ -30,7 +30,7 @@ from data import BatchSampler, collate_segments_without_rewards
 from data.milestone import downstream_output_dir, load_milestone, state_sha256
 from data.utils import make_task_reward_collate
 from envs import DMControlEnv, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
-from models.pmpo_beta import PMPOBeta, PMPOOptimizers
+from models.pmpo_beta import PMPOBeta, PMPOOptimizers, check_controller_state
 from utils import (check_same_packages, configure_opt, get_lr_sched, rng_state, save_atomically, set_rng_state,
                    set_seed, source_identity)
 
@@ -53,6 +53,9 @@ class DownstreamTrainer:
         if every is not None and (not isinstance(every, int) or every < 1):
             raise ValueError(f"checkpointing.every must be null or a positive integer, got {every!r}")
         check_evaluation_config(cfg.evaluation)
+        if cfg.agent.actor_critic.actor_objective != "sign":
+            raise ValueError("Downstream PMPO is sign-only (agent.actor_critic.actor_objective=sign), got "
+                             f"{cfg.agent.actor_critic.actor_objective!r}")
         task_name, seed = cfg.downstream.task_name, cfg.downstream.seed
         set_seed(seed)  # downstream randomness comes only from its own seed
         torch.backends.cudnn.deterministic = True
@@ -279,6 +282,8 @@ class DownstreamTrainer:
         changed = changed_settings(normalized_saved_config(state["config"]), OmegaConf.to_container(self.cfg))
         if changed:
             raise ValueError(f"Cannot resume with different settings: {changed}")
+        check_controller_state(state["actor_critic"].get("_extra_state"), self.agent.actor_critic.cfg,
+                               source=f"{self._path_checkpoint}'s controller")  # before any weights
         self.agent.rew_end_model.load_state_dict(state["rew_end_model"])
         self.agent.actor_critic.load_state_dict(state["actor_critic"])
         self.rew_end_opt.load_state_dict(state["rew_end_opt"])

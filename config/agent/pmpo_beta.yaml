@@ -26,8 +26,22 @@ actor_critic:
   # Actor objective: sign (default; Eq. 11, no magnitude weighting) or advantage_weighted
   # (log-probabilities weighted by min(cap, |A| / mean |A|) within each sign group; KL, entropy
   # and critic unchanged). The cap of 5 is an engineering choice, not a validated optimum.
+  # Exploration presets select advantage_weighted; downstream training states sign explicitly.
   actor_objective: sign
   advantage_weight_cap: 5.0
+  # Gaussian H10 EMA-critic controller, from the reference run folder
+  # kingplus0:/home/bigking/scfeng/LCG-stage3-gaussian-h10-emacritic (a13b57c + its working tree;
+  # run overrides actor_distribution=tanh_gaussian, slow_critic_coef=1.0, world_model_env.horizon=10).
+  # tanh_gaussian: diagonal Gaussian over pre-tanh actions, std = 0.1 + 0.9 * sigmoid, squashed by
+  # tanh to the action bounds (beta: the earlier Beta actor). See PMPOBetaConfig.
+  actor_distribution: tanh_gaussian
+  # Slow EMA critic regularization: value_loss += coef * MSE(V, sg(V_slow)); after every critic
+  # step V_slow = (1 - rate) V_slow + rate V. The online critic gives the bootstraps and advantages.
+  slow_critic_coef: 1.0
+  slow_critic_rate: 0.02
+  # Imagined resets: the policy's frame stack repeats the start frame (the reference's convention;
+  # the world model keeps its real replay prompt). replay_prompt: the stack starts from the prompt.
+  imagination_history: repeat_anchor
   # Snapshot before updates 0,500,1000,...; held fixed for 500 fresh-rollout updates.
   # A moving prior refreshed every 10 updates was validated to collapse (beta
   # concentration runaway, entropy collapse, action-boundary drift, near-state-

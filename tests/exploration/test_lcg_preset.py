@@ -34,8 +34,17 @@ def test_walker_lcg_100k_preset_resolves_the_agreed_settings():
         a, b = OmegaConf.to_container(cfg[key]), OmegaConf.to_container(uniform[key])
         if key == "collection":
             a["train"].pop("mode"), b["train"].pop("mode")
+        if key == "agent":  # uniform trains no policy; LCG's exploration objective is advantage-weighted
+            assert a["actor_critic"].pop("actor_objective") == "advantage_weighted"
+            b["actor_critic"].pop("actor_objective")
         assert a == b, key
     assert (uniform.collection.train.mode, cfg.common.seed) == ("uniform", uniform.common.seed)
+    # The Gaussian H10 EMA-critic controller of the reference H10 runs.
+    ac = cfg.agent.actor_critic
+    assert (ac.actor_distribution, ac.imagination_horizon, ac.slow_critic_coef, ac.slow_critic_rate) == (
+        "tanh_gaussian", 10, 1.0, 0.02)
+    assert (ac.imagination_history, ac.advantage_weight_cap, ac.entropy_coef, ac.prior_refresh_interval) == (
+        "repeat_anchor", 5.0, 0.01, 500)
 
 
 def test_lcg_preset_rejects_a_mismatched_parameter_block_before_any_work(tmp_path, monkeypatch):

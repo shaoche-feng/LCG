@@ -401,3 +401,45 @@ def test_resume_after_an_interrupted_metrics_row(tmp_path, monkeypatch):
     identical(training_state(full), training_state(resumed), "final training state")
     identical(full_rng, rng_state(), "global RNG progression")
     assert last_rows(output / "metrics.jsonl")[0] == last_rows(full_output / "metrics.jsonl")[0]
+
+# ---------------------------------------------------------------- Gaussian H10 EMA-critic controller
+
+def test_resume_restores_the_slow_critic_and_refuses_another_controller_before_any_weights(tmp_path, monkeypatch):
+    milestone = build_milestone(tmp_path)
+    original_policy = DownstreamTrainer.policy_update
+
+    def policy_update(self):
+        original_policy(self)
+        if self.num_updates["actor_critic"] == 3:  # checkpoint at 2
+            raise Crash()
+
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", policy_update)
+    with pytest.raises(Crash):
+        make(milestone, monkeypatch).run()
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", original_policy)
+    path = tmp_path / "run/downstream/steps_000026/walk/.seed_0.tmp/checkpoints/state.pt"
+    saved = torch.load(path, weights_only=False)
+    assert saved["actor_critic"]["_extra_state"]["controller"] == dict(
+        actor_distribution="tanh_gaussian", slow_critic=dict(coef=1.0, rate=0.02),
+        imagination_history="repeat_anchor", imagination_horizon=2)
+    resumed = make(milestone, monkeypatch, resume=True)
+    restored = resumed.agent.actor_critic.state_dict()
+    for k, v in saved["actor_critic"].items():
+        if torch.is_tensor(v):
+            assert torch.equal(restored[k].cpu(), v.cpu()), k
+    assert any(k.startswith("slow_value.") for k in saved["actor_critic"])
+    assert not states_equal_modules(resumed.agent.actor_critic.slow_value, resumed.agent.actor_critic.value)
+    # A state saved by an older (Beta, unrecorded) controller under the same settings is refused
+    # before the reward model or the controller is loaded.
+    legacy = deepcopy(saved)
+    del legacy["actor_critic"]["_extra_state"]["controller"]
+    torch.save(legacy, path)
+    loaded = []
+    monkeypatch.setattr(torch.nn.Module, "load_state_dict", lambda self, *a, **k: loaded.append(type(self).__name__))
+    with pytest.raises(ValueError, match="saved before controller settings were recorded"):
+        make(milestone, monkeypatch, resume=True)
+    assert "RewEndModel" not in loaded and "PMPOBeta" not in loaded
+
+
+def states_equal_modules(a, b):
+    return all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))

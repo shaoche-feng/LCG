@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from envs import TorchEnv, WorldModelEnv
-from models.pmpo_beta import PMPOBeta, PMPOBetaConfig
+from models.pmpo_beta import PMPOBeta, PMPOBetaConfig, check_controller_state
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
 from models.rew_end_model import RewEndModel, RewEndModelConfig
 from utils import extract_state_dict
@@ -96,6 +96,9 @@ class Agent(nn.Module):
                 "checkpoint workflow (scripts/resume.sh)."
             )
         sd = {k: extract_state_dict(sd, k) for k in ("denoiser", "rew_end_model", "actor_critic")}
+        if load_actor_critic:  # a different controller is refused before anything is loaded
+            check_controller_state(sd["actor_critic"].get("_extra_state"), self.actor_critic.cfg,
+                                   source=f"Controller in {path_to_ckpt}")
         if load_denoiser:
             self.denoiser.load_state_dict(sd["denoiser"])
         if load_rew_end_model:

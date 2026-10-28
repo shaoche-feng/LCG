@@ -486,3 +486,126 @@ def test_viewer_seeds_world_model_history_from_prompts(tmp_path, monkeypatch):
     hook.remove()
     torch.testing.assert_close(observed[0], stack([2, 2, 2, 3]), rtol=0, atol=0)
     torch.testing.assert_close(observed[1], stack([22, 23, 24, 25]), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------- repeat-anchor imagination
+# The Gaussian H10 EMA-critic reference controller ignores the replay prompt for the policy's
+# frame stack: an imagined reset repeats its start frame, exactly as a real reset does.
+
+
+def test_policy_prompt_follows_the_controller_convention():
+    from coroutines.frame_history import policy_prompt
+    prompt = prompt_frames([1, 2])
+    assert policy_prompt(make_controller(), {"prompt": prompt}) is prompt
+    assert policy_prompt(make_controller(imagination_history="repeat_anchor"), {"prompt": prompt}) is None
+    for model in (make_controller(), make_controller(imagination_history="repeat_anchor")):
+        assert policy_prompt(model, {}) is None  # real environments supply no prompt
+    with pytest.raises(ValueError, match="imagination_history"):
+        make_controller(imagination_history="replay")
+
+
+@pytest.mark.parametrize("ending", ["end", "trunc"])
+@pytest.mark.parametrize("length", [2, 4, 6])
+def test_env_loop_repeat_anchor_starts_imagined_history_from_the_repeated_start_frame(length, ending):
+    model = make_controller(imagination_history="repeat_anchor")
+    loop = make_env_loop(PromptEnv(length, ending), model, store_policy_observations=True)
+    with torch.no_grad():
+        states, _, _, _, _, raw, values, bootstrap, _ = loop.send(3)
+    loop.close()
+
+    def shifted(state, value):
+        return torch.cat([state[:, 3:], frame(value)], 1)
+    # Start frames: each prompt's last frame (env 1's prompt is padded, its last frame is valid).
+    initial0, initial1 = stack([length] * 4), stack([10 + length] * 4)
+    expected = [[initial0, shifted(initial0, 101), stack([30 + length] * 4)],
+                [initial1, shifted(initial1, 201), shifted(shifted(initial1, 201), 202)]]
+    for env in range(2):
+        for t in range(3):
+            torch.testing.assert_close(states[env, t][None], expected[env][t], rtol=0, atol=0)
+    with torch.no_grad():
+        for t in range(3):  # Stored states reproduce the generation-time predictions.
+            torch.testing.assert_close(model.actor(states[:, t]), raw[:, t], rtol=0, atol=0)
+            torch.testing.assert_close(model.value(states[:, t]).squeeze(-1), values[:, t], rtol=0, atol=0)
+        # The cut env bootstraps from its ending history and final observation, as before.
+        torch.testing.assert_close(bootstrap[0, 1], model.value(shifted(expected[0][1], 102))[0, 0], rtol=0, atol=0)
+        torch.testing.assert_close(bootstrap[1, 1], values[1, 2], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("length", [2, 4])
+def test_repeat_anchor_keeps_world_model_prompt_conditioning_and_replay_draws(length):
+    """Only the policy's stack changes: the world model is conditioned on the same replay
+    frames and actions, drawn the same number of times, under either convention."""
+    from types import SimpleNamespace
+    from torch.utils.data import DataLoader, IterableDataset
+    from coroutines.frame_history import policy_prompt
+    from envs import WorldModelEnv, WorldModelEnvConfig
+    from models.diffusion import Denoiser, DenoiserConfig, DiffusionSamplerConfig
+    from models.diffusion.inner_model import InnerModelConfig
+
+    class Replay(IterableDataset):
+        def __iter__(self):
+            k = 0
+            while True:
+                frames, valid = prompt_frames([0.1 * (k + 1) + 0.01 * j for j in range(length)], k % 2)
+                yield SimpleNamespace(obs=frames[0], act=torch.full((length, 2), 0.1 * k), mask=valid[0])
+                k += 1
+
+    def collate(samples):
+        return SimpleNamespace(obs=torch.stack([s.obs for s in samples]), act=torch.stack([s.act for s in samples]),
+                               mask_padding=torch.stack([s.mask for s in samples]))
+
+    def run(convention):
+        torch.manual_seed(0)
+        denoiser = Denoiser(DenoiserConfig(
+            inner_model=InnerModelConfig(img_channels=3, num_steps_conditioning=length, cond_channels=24, depths=[1],
+                                         channels=[8], attn_depths=[False], continuous_action_dim=2),
+            sigma_data=0.5, sigma_offset_noise=0.3))
+        env = WorldModelEnv(denoiser, None, DataLoader(Replay(), batch_size=2, collate_fn=collate),
+                            WorldModelEnvConfig(horizon=2, num_batches_to_preload=1,
+                                                diffusion_sampler=DiffusionSamplerConfig(num_steps_denoising=2)))
+        model = make_controller(imagination_history=convention)
+        torch.manual_seed(1)
+        obs, info = env.reset()
+        conditioning = (env.obs_buffer.clone(), env.act_buffer.clone())
+        history = FrameHistory(obs, 4, policy_prompt(model, info))
+        return conditioning, history.state, info["prompt"], obs
+
+    (obs_a, act_a), state_a, prompt_a, start_a = run("replay_prompt")
+    (obs_b, act_b), state_b, prompt_b, start_b = run("repeat_anchor")
+    torch.testing.assert_close(obs_a, obs_b, rtol=0, atol=0)
+    torch.testing.assert_close(act_a, act_b, rtol=0, atol=0)
+    torch.testing.assert_close(start_a, prompt_a[0][:, -1], rtol=0, atol=0)  # the anchor is the prompt's last frame
+    torch.testing.assert_close(state_b, start_b.repeat(1, 4, 1, 1), rtol=0, atol=0)
+    frames, valid = prompt_a
+    expected = [prompt_stack(frames[i, :, 0, 0, 0].tolist(), int((~valid[i]).sum())) for i in range(2)]
+    torch.testing.assert_close(state_a, torch.cat(expected), rtol=0, atol=0)
+
+
+def test_real_collection_history_is_unchanged_by_the_imagination_convention():
+    """Real resets repeat their first observation under either convention, and real histories
+    then advance one frame per step."""
+
+    class RealEnv:
+        num_envs, action_dim = 1, 2
+        action_low, action_high = torch.tensor([-3., 0.5]), torch.tensor([2., 7.])
+
+        def reset(self, **kwargs):
+            self.t = 0
+            return frame(1), {}
+
+        def step(self, action):
+            self.t += 1
+            return frame(1 + self.t), torch.zeros(1), torch.zeros(1, dtype=torch.long), torch.zeros(1, dtype=torch.long), {}
+
+    stored = []
+    for convention in ("replay_prompt", "repeat_anchor"):
+        torch.manual_seed(0)
+        loop = make_env_loop(RealEnv(), make_controller(imagination_history=convention), store_policy_observations=True)
+        with torch.no_grad():
+            states = loop.send(3)[0]
+        loop.close()
+        stored.append(states)
+    for states in stored:
+        torch.testing.assert_close(states[0, 0][None], stack([1, 1, 1, 1]), rtol=0, atol=0)
+        torch.testing.assert_close(states[0, 2][None], stack([1, 1, 2, 3]), rtol=0, atol=0)
+    torch.testing.assert_close(stored[0], stored[1], rtol=0, atol=0)

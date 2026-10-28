@@ -66,11 +66,12 @@ def test_defaults_presets_and_single_denoiser_methods():
     assert (preset.agent.actor_critic.actor_objective, preset.agent.actor_critic.advantage_weight_cap) == (
         "advantage_weighted", 5.0)
     assert preset.intrinsic_reward.fixed_divisor == 1.0 and preset.intrinsic_reward.reward_scaling == "fixed"
-    # The global default and the other presets keep sign-only and LCG.
+    # The global default stays sign-only; every learned exploration preset (LCG included) uses
+    # advantage-weighted PMPO; uniform trains no policy (its unused setting is the default).
     assert compose([]).agent.actor_critic.actor_objective == "sign"
-    for name in ("walker_lcg_100k", "walker_uniform_100k"):
+    for name, objective in (("walker_lcg_100k", "advantage_weighted"), ("walker_uniform_100k", "sign")):
         other = compose([f"+experiment={name}"])
-        assert other.agent.actor_critic.actor_objective == "sign"
+        assert other.agent.actor_critic.actor_objective == objective
         assert OmegaConf.select(other, "intrinsic_reward.method", default="lcg") == "lcg"
     # Same budget and per-member denoiser schedule as the LCG preset.
     lcg = compose(["+experiment=walker_lcg_100k"])

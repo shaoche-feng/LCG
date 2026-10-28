@@ -6,10 +6,16 @@
 # Outputs: <run>/downstream/steps_N/<task>/seed_<seed>/ (never overwritten); training runs in
 # .seed_<seed>.tmp/ beside it. Budgets below are placeholders; final values are undecided.
 defaults:
-  - _self_
   - env: dm_control  # env.train is replaced by the milestone's
   - agent: pmpo_beta  # agent.denoiser is replaced by the milestone's; reward model and PMPO are fresh
   - override hydra/job_logging: stdout
+  - _self_  # last, so the explicit downstream controller settings below take precedence
+
+# Downstream controller: the Gaussian H10 EMA-critic controller of config/agent/pmpo_beta.yaml with
+# the sign-only PMPO objective, stated explicitly (exploration presets use advantage_weighted).
+agent:
+  actor_critic:
+    actor_objective: sign
 
 hydra:
   run:
@@ -35,7 +41,7 @@ common:
 
 world_model_env:
   _target_: envs.WorldModelEnvConfig
-  horizon: 15
+  horizon: 10  # imagination horizon of the Gaussian H10 EMA-critic controller (reference H10 runs)
   num_batches_to_preload: 256
   diffusion_sampler:
     _target_: models.diffusion.DiffusionSamplerConfig
@@ -65,7 +71,9 @@ rew_end_model:
   training:
     steps: 1000
     batch_size: 32
-    seq_length: ${eval:'${world_model_env.horizon} + ${agent.denoiser.inner_model.num_steps_conditioning}'}
+    # 19 = the reference H10 runs' rew_end_model.training.seq_length override (the H15 value
+    # 15 + 4 conditioning frames, kept when they moved to horizon 10).
+    seq_length: 19
     sample_weights: null  # episodes by length, anchor step uniform within the episode
     lr_warmup_steps: 100
     max_grad_norm: 100.0

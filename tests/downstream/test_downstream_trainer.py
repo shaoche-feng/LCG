@@ -280,13 +280,14 @@ def test_imagination_uses_burn_in_horizon_truncation_and_bootstrap(tmp_path, mon
     with torch.no_grad():
         successor = torch.cat((states[:, 1][:, 3:], infos[1]["final_observation"]), 1)
         torch.testing.assert_close(bootstrap[:, 1], model.value(successor).squeeze(-1), rtol=0, atol=0)
-    # The new episode's stack is the latest valid prompt frames, the earliest valid one
-    # repeated before them (prompts may be padded before an episode start).
+    # The new episode's policy stack repeats its start frame (imagination_history=repeat_anchor,
+    # the reference controller's convention); the start frame is the new prompt's last frame,
+    # which the world model keeps conditioning on with the whole prompt.
+    assert model.cfg.imagination_history == "repeat_anchor"
     (frames_, valid), = prompts
-    first = valid.shape[1] - valid.sum(1, keepdim=True)
-    index = torch.maximum(torch.arange(valid.shape[1] - 4, valid.shape[1]), first)
-    expected = frames_[torch.arange(len(frames_))[:, None], index].flatten(1, 2)
-    torch.testing.assert_close(states[:, 2], expected, rtol=0, atol=0)
+    assert valid[:, -1].all()
+    torch.testing.assert_close(states[:, 2], frames_[:, -1].repeat(1, 4, 1, 1), rtol=0, atol=0)
+    torch.testing.assert_close(env.obs_buffer[:, :-1], frames_[:, 1:], rtol=0, atol=0)  # prompt advanced one step
 
 
 # ---------------------------------------------------------------- entry point
@@ -300,3 +301,24 @@ def test_entry_point_runs_through_hydra(tmp_path):
     out = tmp_path / "run/downstream/steps_000026/run/seed_1"
     assert (out / "summary.yaml").is_file() and OmegaConf.load(out / "summary.yaml").task_index == 2
     assert not list(ROOT.glob("*.log"))  # no Hydra log file written into the repository
+
+# ---------------------------------------------------------------- Gaussian H10 EMA-critic controller
+
+def test_downstream_controller_is_a_fresh_sign_only_h10_controller(tmp_path, monkeypatch):
+    cfg = compose("downstream", ["initialization.milestone_path=x", "downstream.task_name=walk"])
+    ac = cfg.agent.actor_critic
+    assert (ac.actor_objective, ac.actor_distribution, ac.slow_critic_coef, ac.slow_critic_rate,
+            ac.imagination_history, cfg.world_model_env.horizon, cfg.rew_end_model.training.seq_length) == (
+        "sign", "tanh_gaussian", 1.0, 0.02, "repeat_anchor", 10, 19)
+    trainer = make_trainer(build_milestone(tmp_path), monkeypatch)
+    model = trainer.agent.actor_critic
+    assert model.objective_settings() == dict(mode="sign") and model.gaussian and model.repeats_imagined_anchor
+    # Fresh: no update, prior and diagnostic snapshot equal the new actor, the slow critic the
+    # new critic, empty optimizer state. The milestone holds a denoiser and replay only.
+    assert int(model.updates) == 0 and not trainer.actor_critic_opt.actor.state and not trainer.actor_critic_opt.value.state
+    for copy, source in ((model.prior_actor, model.actor), (model.initial_actor, model.actor), (model.slow_value, model.value)):
+        assert states_equal(copy.state_dict(), source.state_dict())
+    assert not any("actor" in p.name or "value" in p.name for p in Path(trainer.milestone.path).rglob("*"))
+    with pytest.raises(ValueError, match="Downstream PMPO is sign-only"):
+        make_trainer(build_milestone(tmp_path / "other"), monkeypatch,
+                     extra=["agent.actor_critic.actor_objective=advantage_weighted"])
