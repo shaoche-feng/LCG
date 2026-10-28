@@ -9,7 +9,7 @@ from torch import Tensor
 from data import Dataset
 from models.diffusion.denoiser import Denoiser, SigmaDistributionConfig
 
-from .forward_jvp import make_jvp_bank, score_one_jvp_bank
+from .forward_jvp import JVPBank, make_jvp_bank, score_one_jvp_bank
 from .intrinsic_reward import make_lcg_intrinsic_reward_fn
 from .precision import assert_setup_valid, historical_precision
 from .reward_normalization import RunningRMS, RunningRMSConfig
@@ -85,10 +85,11 @@ class LCGLifecycle:
     round. `round_identifier` (passed into refresh() by the caller, e.g. Trainer.epoch)
     seeds both the historical-precision draw and the candidate bank draw (in separate
     namespaces, offset by 1_000_000) -- it must be a value the CALLER already persists
-    and restores across checkpoint/resume, since LCGLifecycle itself is not checkpointed:
-    using a purely internal, non-persisted counter here would silently restart the seed
-    sequence from 0 after every resume, reusing seeds (and therefore historical
-    subsets/candidate banks) that a pre-resume round already used."""
+    and restores across checkpoint/resume: using a purely internal, non-persisted counter here
+    would silently restart the seed sequence from 0 after every resume, reusing seeds (and
+    therefore historical subsets/candidate banks) that a pre-resume round already used.
+    state_dict()/load_state_dict() checkpoint only the current round's frozen scorer (h_D, the
+    candidate bank, RunningRMS), so a resume can evaluate with it without refreshing."""
 
     def __init__(self, cfg: LCGConfig, sigma_cfg: SigmaDistributionConfig, img_channels: int, img_size: int, device: torch.device):
         self.cfg = cfg
@@ -120,7 +121,34 @@ class LCGLifecycle:
         assert self.cfg.enabled
         self.round_id = round_identifier
         seed = round_identifier
+        self._select_theta_s(denoiser)
 
+        theta_s_named = self._theta_s_named
+        params = list(theta_s_named.values())
+
+        start = _synchronized_time(self.device)
+        self.h_D = lcg_historical_precision(denoiser, params, dataset, self.sigma_cfg, self.cfg, round_identifier)
+        self.precision_seconds = _synchronized_time(self.device) - start
+        self.scoring_seconds = 0.0
+        assert_setup_valid(theta_s_named, self.h_D, d_S=self._theta_s_dim, verbose=self.verbose)
+        self.h_D_inv_sqrt = self.h_D.rsqrt()  # fixed for the whole round -- computed once, not per AC scoring call
+
+        y_shape = torch.Size([1, self.img_channels, self.img_size, self.img_size])
+        self.bank = make_jvp_bank(
+            self.sigma_cfg, y_shape, self._theta_s_dim, self.device,
+            num_samples=self.cfg.candidate_num_mc, seed=seed + 1_000_000,
+        )
+        self.rms = self._new_rms()
+
+        if self.verbose:
+            print(
+                f"[LCG] round={self.round_id} refresh: N={dataset.num_steps} "
+                f"h_D_fingerprint={self.h_D.sum().item():.6f} banks_fingerprint={sum(s.item() for s in self.bank.sigmas):.6f}",
+                flush=True,
+            )
+        self.intrinsic_reward_fn = self._make_hook(denoiser)
+
+    def _select_theta_s(self, denoiser: Denoiser) -> None:
         # theta_S selection and frozen parameter caching is done once per lifecycle instance.
         # The denoiser instance must be the same across refreshes.
         if self._theta_s_named is None:
@@ -146,39 +174,18 @@ class LCGLifecycle:
                 "mid-run, construct a new LCGLifecycle for it instead."
             )
 
-        theta_s_named = self._theta_s_named
-        frozen_named = self._frozen_named
-        params = list(theta_s_named.values())
+    def _new_rms(self) -> Optional[RunningRMS]:
+        if self.cfg.reward_scaling != "rms":
+            return None
+        return RunningRMS(RunningRMSConfig(enabled=True, alpha=self.cfg.rms_alpha,
+                                           ema_decay=self.cfg.rms_ema_decay, eps=self.cfg.rms_eps))
 
-        start = _synchronized_time(self.device)
-        self.h_D = lcg_historical_precision(denoiser, params, dataset, self.sigma_cfg, self.cfg, round_identifier)
-        self.precision_seconds = _synchronized_time(self.device) - start
-        self.scoring_seconds = 0.0
-        assert_setup_valid(theta_s_named, self.h_D, d_S=self._theta_s_dim, verbose=self.verbose)
-        self.h_D_inv_sqrt = self.h_D.rsqrt()  # fixed for the whole round -- computed once, not per AC scoring call
-
-        y_shape = torch.Size([1, self.img_channels, self.img_size, self.img_size])
-        self.bank = make_jvp_bank(
-            self.sigma_cfg, y_shape, self._theta_s_dim, self.device,
-            num_samples=self.cfg.candidate_num_mc, seed=seed + 1_000_000,
-        )
+    def _make_hook(self, denoiser: Denoiser):
+        """The PMPO hook of the current round (precision, bank and RunningRMS)."""
         base_hook = make_lcg_intrinsic_reward_fn(
-            denoiser, theta_s_named, frozen_named, self.h_D_inv_sqrt, self.bank, chunk_size=self.cfg.candidate_chunk_size,
+            denoiser, self._theta_s_named, self._frozen_named, self.h_D_inv_sqrt, self.bank,
+            chunk_size=self.cfg.candidate_chunk_size,
         )
-
-        self.rms = None
-        if self.cfg.reward_scaling == "rms":
-            self.rms = RunningRMS(RunningRMSConfig(
-                enabled=True, alpha=self.cfg.rms_alpha,
-                ema_decay=self.cfg.rms_ema_decay, eps=self.cfg.rms_eps,
-            ))
-
-        if self.verbose:
-            print(
-                f"[LCG] round={self.round_id} refresh: N={dataset.num_steps} "
-                f"h_D_fingerprint={self.h_D.sum().item():.6f} banks_fingerprint={sum(s.item() for s in self.bank.sigmas):.6f}",
-                flush=True,
-            )
 
         def hook(infos, env_rew):
             start = _synchronized_time(self.device)
@@ -188,11 +195,49 @@ class LCGLifecycle:
             self.last_raw, self.last_scaled = raw.detach(), reward.detach()
             return reward
 
-        self.intrinsic_reward_fn = hook
+        return hook
+
+    def settings(self) -> Dict:
+        """What a saved round's scores depend on besides the denoiser; a restore must match."""
+        c = self.cfg
+        return dict(reward_scaling=c.reward_scaling_settings(), candidate_num_mc=c.candidate_num_mc,
+                    candidate_chunk_size=c.candidate_chunk_size, precision_reference_size=c.precision_reference_size,
+                    precision_num_mc=c.precision_num_mc, damping=c.damping, beta=c.beta,
+                    theta_s=dict(include=list(c.theta_s.include), exclude=list(c.theta_s.exclude)),
+                    image=[self.img_channels, self.img_size])
+
+    def state_dict(self) -> Optional[Dict]:
+        """The current round's frozen scorer (None before the first refresh), on CPU: everything
+        evaluation needs to score exactly as this round's PMPO hook did."""
+        if not self.ready:
+            return None
+        bank = {name: [t.cpu() for t in getattr(self.bank, name)] for name in ("sigmas", "epsilons", "epsilons_offset", "etas")}
+        return dict(settings=self.settings(), round_id=self.round_id, theta_s_names=list(self._theta_s_named),
+                    theta_s_dim=self._theta_s_dim, h_D=self.h_D.cpu(), bank=bank,
+                    rms_s2=None if self.rms is None or self.rms.s2 is None else self.rms.s2.cpu())
+
+    def load_state_dict(self, state: Dict, denoiser: Denoiser) -> None:
+        """Restore a saved round on this denoiser (its weights already loaded): nothing is
+        recomputed or redrawn; the PMPO hook is rebuilt around the restored state."""
+        if state["settings"] != self.settings():
+            raise ValueError(f"Checkpoint's LCG scorer was built with {state['settings']}, the config gives "
+                             f"{self.settings()}; a resume must not change them")
+        self._select_theta_s(denoiser)
+        if list(self._theta_s_named) != state["theta_s_names"] or self._theta_s_dim != state["theta_s_dim"]:
+            raise ValueError("Checkpoint's LCG theta_S selection differs from this denoiser's")
+        self.round_id = state["round_id"]
+        self.h_D = state["h_D"].to(self.device)
+        self.h_D_inv_sqrt = self.h_D.rsqrt()
+        self.bank = JVPBank(*(tuple(t.to(self.device) for t in state["bank"][name])
+                              for name in ("sigmas", "epsilons", "epsilons_offset", "etas")))
+        self.rms = self._new_rms()
+        if self.rms is not None and state["rms_s2"] is not None:
+            self.rms.s2 = state["rms_s2"].to(self.device)
+        self.intrinsic_reward_fn = self._make_hook(denoiser)
 
     @property
     def ready(self) -> bool:
-        """A round's precision and candidate bank exist (refreshed in this process)."""
+        """A round's precision and candidate bank exist (refreshed, or restored from a checkpoint)."""
         return self.bank is not None
 
     def score_candidates(self, candidates) -> Tensor:
@@ -200,7 +245,7 @@ class LCGLifecycle:
         and bank, exactly as the PMPO hook scores imagined ones; no timing, last-batch or
         normalization state changes (evaluation)."""
         if not self.ready:
-            raise RuntimeError("LCG has not been refreshed in this process")
+            raise RuntimeError("LCG has no refreshed or restored round")
         return score_one_jvp_bank(self._denoiser_ref, self._theta_s_named, self._frozen_named, self.h_D_inv_sqrt,
                                   self.bank, candidates, self.cfg.candidate_chunk_size)
 

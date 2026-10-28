@@ -25,7 +25,10 @@ from test_laplace import LAP
 from test_plan2explore import P2E
 from test_test_diagnostics import assert_same_training, BASE, Crash, crash_at_test_agent, FRESH, REUSE, run, \
     same, training_rows, yaml_value
-from utils import rng_state
+from laplace import LaplaceEnsemble
+from lcg.lifecycle import LCGLifecycle
+from plan2explore import Plan2Explore
+from utils import history_records, repair_history, rng_state
 
 SEEDS = [3001, 3002, 3003, 3004]
 SEEDED = ["evaluation.should=true", "evaluation.every=1", "evaluation.collect_test=true",
@@ -57,8 +60,8 @@ class SeedEnv(FakeEnv):
 class FakeWandb:
     """Stands in for the wandb module: records init kwargs, axes, config, summary and logs."""
 
-    def __init__(self, run_id="fakerun1", starting_step=0):
-        self.run, self.run_id, self.starting_step = None, run_id, starting_step
+    def __init__(self, run_id="fakerun1", starting_step=0, offline=False):
+        self.run, self.run_id, self.starting_step, self.offline = None, run_id, starting_step, offline
         self.inits, self.metrics, self.config_updates, self.logged = [], [], [], []
         self.summary = {}
         self.config = SimpleNamespace(update=lambda d, **kw: self.config_updates.append(d))
@@ -67,7 +70,7 @@ class FakeWandb:
         self.inits.append(kwargs)
         self.run = SimpleNamespace(id=kwargs.get("id") or self.run_id, project=kwargs.get("project"), entity=None,
                                    name=kwargs.get("name"), group=kwargs.get("group"), url="https://wandb.test/run",
-                                   starting_step=self.starting_step)
+                                   starting_step=self.starting_step, offline=self.offline)
 
     def save(self, *args, **kwargs):
         pass
@@ -618,11 +621,12 @@ def test_resume_keeps_wandb_run_counters_and_seed_labels(tmp_path, monkeypatch):
     assert resumed.resume_count == 1
 
 
-@pytest.mark.parametrize("server", ["lost", "ahead"])
+@pytest.mark.parametrize("server", ["lost", "ahead", "offline"])
 def test_resume_backfills_rows_the_wandb_server_lost_and_counts_replayed_ones(tmp_path, monkeypatch, capsys, server):
     """A hard crash can kill W&B's upload process: the server then holds fewer rows than the
     checkpoint committed (backfilled from the local mirror), or more (an uncommitted epoch that is
-    replayed: counted)."""
+    replayed: counted). Offline W&B reports no server rows: nothing is backfilled (a new offline
+    file per segment; re-logging would duplicate rows when synced)."""
     crash_at_test_agent(monkeypatch, epoch=2)
     crashed, logs = launch(tmp_path / "run", monkeypatch, TINY, BASE + SEEDED + ["wandb.mode=offline"], fake_wandb=FakeWandb())
     with pytest.raises(Crash):
@@ -631,20 +635,24 @@ def test_resume_backfills_rows_the_wandb_server_lost_and_counts_replayed_ones(tm
     epoch1 = [row for e, row in logs if e == 1]
     assert committed == len(epoch1) > 0
     monkeypatch.undo()
-    starting = 3 if server == "lost" else committed + 7
-    fake = FakeWandb(starting_step=starting)
+    starting = committed + 7 if server == "ahead" else 3 if server == "lost" else 0
+    fake = FakeWandb(starting_step=starting, offline=server == "offline")
     capsys.readouterr()
     resumed, logs = launch(tmp_path / "run", monkeypatch, None, [], resume=True, fake_wandb=fake)
     resume_row = resumed._start_logs[-1]
     lines = terminal_lines(capsys.readouterr().out)  # essential resume messages stay visible
     assert "  Resumed at epoch 1 (resume #1)" in lines
-    message = (f"W&B: backfilled {committed - 3} committed rows the server did not receive before the crash"
-               if server == "lost" else
-               "W&B: 7 rows logged after the checkpoint are on the server; their epochs are replayed")
+    message = dict(lost=f"W&B: backfilled {committed - 3} committed rows the server did not receive before the crash",
+                   ahead="W&B: 7 rows logged after the checkpoint are on the server; their epochs are replayed",
+                   offline="W&B offline: the server's row count is unknown, so no rows are backfilled "
+                           "(wandb_history.jsonl keeps every committed row)")[server]
     assert message in lines
-    assert resume_row["resume/wandb_server_rows"] == starting and resume_row["resume/wandb_committed_rows"] == committed
+    assert resume_row["resume/wandb_committed_rows"] == committed
+    assert resume_row.get("resume/wandb_server_rows") == (None if server == "offline" else starting)
     backfilled = [r for r in fake.logged if r.get("resume/backfilled") == 1]
-    if server == "lost":
+    if server == "offline":
+        assert not backfilled and resumed.wandb_steps == committed
+    elif server == "lost":
         # Exactly the committed rows the server lacks, in order, with their epoch and values.
         assert resume_row["resume/backfilled_rows"] == committed - 3 and resumed.wandb_steps == committed
         expected = [{"epoch": 1, **{k: float(v) for k, v in row.items() if np.ndim(v) == 0}, "resume/backfilled": 1}
@@ -657,3 +665,233 @@ def test_resume_backfills_rows_the_wandb_server_lost_and_counts_replayed_ones(tm
     # The mirror's latest entry per step continues from the reconciled step.
     steps = [json.loads(line)["step"] for line in Path("wandb_history.jsonl").read_text().splitlines()]
     assert steps[-1] == resumed.wandb_steps - 1
+
+
+# ---------------------------------------------------------------- interrupted W&B mirror
+
+def history_line(step, value=0.0, segment=0):
+    return (json.dumps(dict(step=step, epoch=1, segment=segment, values={"x": value})) + "\n").encode()
+
+
+def test_history_repair_keeps_committed_rows_and_moves_an_interrupted_tail(tmp_path):
+    path = tmp_path / "wandb_history.jsonl"
+    committed = history_line(0) + history_line(1)
+    uncommitted = history_line(2, segment=1)  # a complete row of the interrupted segment: kept
+    tail = b'{"step": 3, "epoch": 1, "segment": 1, "val'
+    path.write_bytes(committed + uncommitted + tail)
+    action = repair_history(path, len(committed))
+    assert "interrupted-1" in action
+    assert (tmp_path / "wandb_history.jsonl.interrupted-1").read_bytes() == tail  # byte-for-byte
+    assert path.read_bytes() == committed + uncommitted
+    # Idempotent; a later interruption gets its own recovery file, the first is never overwritten.
+    assert repair_history(path, len(committed)) is None and path.read_bytes() == committed + uncommitted
+    with open(path, "ab") as f:
+        f.write(b'{"step": 3')
+    assert "interrupted-2" in repair_history(path, len(committed))
+    assert (tmp_path / "wandb_history.jsonl.interrupted-1").read_bytes() == tail
+    assert (tmp_path / "wandb_history.jsonl.interrupted-2").read_bytes() == b'{"step": 3'
+    # Appending after the repair keeps every line a whole record.
+    with open(path, "ab") as f:
+        f.write(history_line(3, segment=1))
+    assert [r["step"] for r in history_records(path)] == [0, 1, 2, 3]
+    assert [r["step"] for r in history_records(path, end=len(committed))] == [0, 1]
+
+
+def test_history_repair_completes_a_record_that_only_lost_its_newline(tmp_path):
+    path = tmp_path / "wandb_history.jsonl"
+    data = history_line(0) + history_line(1)[:-1]
+    path.write_bytes(data)
+    assert "newline" in repair_history(path, len(history_line(0)))
+    assert path.read_bytes() == data + b"\n" and not list(tmp_path.glob("*.interrupted-*"))
+    assert repair_history(path, len(history_line(0))) is None and path.read_bytes() == data + b"\n"
+
+
+@pytest.mark.parametrize("case", ["interior", "short", "boundary", "missing", "committed_tail"])
+def test_history_repair_rejects_damaged_or_missing_committed_rows(tmp_path, case):
+    path = tmp_path / "wandb_history.jsonl"
+    rows = history_line(0) + history_line(1)
+    committed, data = len(rows), rows
+    if case == "interior":  # an earlier cut row that was appended to without repair
+        data = history_line(0) + history_line(1)[:20] + history_line(2)
+        match = rf"record 2 \(byte offset {len(history_line(0))}\) is not valid JSON"
+    elif case == "short":  # committed rows missing from the end
+        data, match = history_line(0), "committed rows are missing"
+    elif case == "boundary":
+        committed, match = committed - 3, "no record boundary"
+    elif case == "committed_tail":  # the cut record lies inside the committed bytes
+        data, match = rows[:-5], "committed rows are missing"
+    else:
+        data, match = None, "is missing"
+    if data is not None:
+        path.write_bytes(data)
+    with pytest.raises(ValueError, match=match):
+        repair_history(path, committed)
+    assert (path.read_bytes() if data is not None else None) == data  # nothing changed
+    assert not list(tmp_path.glob("*.interrupted-*"))
+
+
+def test_resume_repairs_the_mirror_and_backfills_only_committed_rows(tmp_path, monkeypatch, capsys):
+    """A hard kill: committed rows, then rows of the interrupted segment (one rewriting a committed
+    step) and a cut record. The resume keeps the cut bytes, backfills the rows the server lost from
+    the committed records only, and the journal stays whole through a second crash and resume."""
+    crash_at_test_agent(monkeypatch, epoch=2)
+    crashed, logs = launch(tmp_path / "run", monkeypatch, TINY, BASE + SEEDED + ["wandb.mode=offline"], fake_wandb=FakeWandb())
+    with pytest.raises(Crash):
+        crashed._run()
+    state = torch.load(tmp_path / "run/checkpoints/state.pt", weights_only=False)
+    committed, committed_bytes = state["wandb_steps"], state["wandb_history_bytes"]
+    path = tmp_path / "run/wandb_history.jsonl"
+    assert path.stat().st_size == committed_bytes
+    epoch1 = [row for e, row in logs if e == 1]
+    tail = b'{"step": 99, "epoch": 2, "segm'
+    with open(path, "ab") as f:  # the interrupted segment
+        f.write(history_line(committed - 1, value=-1.0, segment=0) + history_line(committed, value=-2.0) + tail)
+    monkeypatch.undo()
+    crash_at_test_agent(monkeypatch, epoch=2)
+    fake = FakeWandb(starting_step=3)
+    capsys.readouterr()
+    resumed, _ = launch(tmp_path / "run", monkeypatch, None, [], resume=True, fake_wandb=fake)
+    out = capsys.readouterr().out
+    assert "W&B mirror: kept the interrupted last record of wandb_history.jsonl" in out
+    assert (tmp_path / "run/wandb_history.jsonl.interrupted-1").read_bytes() == tail
+    backfilled = [r for r in fake.logged if r.get("resume/backfilled") == 1]
+    expected = [{"epoch": 1, **{k: float(v) for k, v in row.items() if np.ndim(v) == 0}, "resume/backfilled": 1}
+                for row in epoch1[3:]]
+    assert backfilled == expected  # the committed values, not the interrupted segment's -1.0 / -2.0
+    assert resumed._start_logs[-1]["resume/backfilled_rows"] == committed - 3
+    with pytest.raises(Crash):  # a second crash in the same epoch
+        resumed._run()
+    monkeypatch.undo()
+    fake = FakeWandb(starting_step=committed)  # nothing lost this time: no backfill, no replay
+    resumed, _ = launch(tmp_path / "run", monkeypatch, None, [], resume=True, fake_wandb=fake)
+    assert "resume/backfilled_rows" not in resumed._start_logs[-1]
+    run(resumed)
+    records = list(history_records(path))  # every line a whole record after appends and repairs
+    assert records[-1]["step"] == resumed.wandb_steps - 1
+    assert list(tmp_path.glob("run/wandb_history.jsonl.interrupted-*")) == [tmp_path / "run/wandb_history.jsonl.interrupted-1"]
+
+
+# ---------------------------------------------------------------- final-only resume
+
+def crash_before_final_evaluation(monkeypatch):
+    original = ExplorationTrainer.test_diagnostics
+
+    def crash(self, final=False):
+        if final:
+            raise Crash()
+        return original(self, final)
+
+    monkeypatch.setattr(ExplorationTrainer, "test_diagnostics", crash)
+
+
+def forbid_training_and_refresh(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("training, scorer refresh, posterior redraw or head fitting in a final-only resume")
+    for owner, name in ((ExplorationTrainer, "train_agent"), (ExplorationTrainer, "train_component"),
+                        (ExplorationTrainer, "collect_initial_dataset"), (LCGLifecycle, "refresh"),
+                        (LaplaceEnsemble, "refresh"), (Plan2Explore, "refresh")):
+        monkeypatch.setattr(owner, name, fail)
+
+
+def scale_state(trainer):
+    """RunningRMS s2 of the method's scorer (None: no running scale)."""
+    rms = (trainer._lcg_lifecycle or trainer._ensemble_scorer or SimpleNamespace(rms=None)).rms
+    return None if rms is None else rms.s2.clone()
+
+
+METHOD_SETUPS = dict(lcg=(TINY, []), ensemble=(ENS, ["intrinsic_reward.reward_scaling=rms"]), laplace=(LAP, []),
+                     plan2explore=(P2E, []), uniform=(TINY, UNIFORM))
+
+
+@pytest.mark.parametrize("method", list(METHOD_SETUPS))
+def test_final_only_resume_evaluates_with_the_restored_frozen_scorer(tmp_path, monkeypatch, capsys, method):
+    tiny, extra = METHOD_SETUPS[method]
+    overrides = BASE + SEEDED + extra
+    full, logs_full = launch(tmp_path / "full", monkeypatch, tiny, overrides)
+    run(full)
+    monkeypatch.undo()
+    crash_before_final_evaluation(monkeypatch)
+    crashed, _ = launch(tmp_path / "split", monkeypatch, tiny, overrides)
+    with pytest.raises(Crash):
+        crashed._run()
+    s2 = scale_state(crashed)
+    monkeypatch.undo()
+    forbid_training_and_refresh(monkeypatch)
+    resumed, logs = launch(tmp_path / "split", monkeypatch, None, [], resume=True)
+    if method in ("lcg", "ensemble"):  # a non-default running scale, restored exactly
+        assert s2 is not None and torch.equal(scale_state(resumed), s2)
+    if method == "lcg":
+        lcg, ref = resumed._lcg_lifecycle, full._lcg_lifecycle
+        assert lcg.ready and lcg.round_id == ref.round_id == 2 and torch.equal(lcg.h_D, ref.h_D)
+        assert all(torch.equal(a, b) for name in ("sigmas", "epsilons", "epsilons_offset", "etas")
+                   for a, b in zip(getattr(lcg.bank, name), getattr(ref.bank, name)))
+        assert resumed.agent.actor_critic.intrinsic_reward_fn is lcg.intrinsic_reward_fn  # wired as after a refresh
+    run(resumed)
+    # Only the final evaluation ran: per-seed raw and scaled returns equal the uninterrupted run's.
+    assert {e for e, _ in logs} == {2}
+    final, final_full = merged(logs, "final_test_eval/"), merged(logs_full, "final_test_eval/")
+    assert final == final_full
+    if method != "uniform":
+        for seed in (11, 12):
+            assert f"final_test_eval/seed_{seed}/intrinsic_raw_return" in final
+            assert f"final_test_eval/seed_{seed}/intrinsic_scaled_return" in final
+    assert_same_training(full, resumed)  # weights, optimizers, counters, replay, training RNG
+    assert scale_state(resumed) is None if s2 is None else torch.equal(scale_state(resumed), s2)  # not updated
+    assert resumed.final_test_done
+    # Another resume does not repeat the completed final evaluation.
+    monkeypatch.undo()
+    forbid_training_and_refresh(monkeypatch)
+    again, logs_again = launch(tmp_path / "split", monkeypatch, None, [], resume=True)
+    run(again)
+    assert not merged(logs_again, "final_test_eval/")
+
+
+@pytest.mark.parametrize("method", ["lcg", "ensemble"])
+def test_older_checkpoint_without_scorer_state(tmp_path, monkeypatch, capsys, method):
+    """Before the final evaluation: the missing frozen state is reported, never re-created.
+    Mid-run: the next epoch's refresh rebuilds it, so the run matches an uninterrupted one."""
+    tiny, extra = METHOD_SETUPS[method]
+    overrides = BASE + SEEDED + extra
+
+    def strip(path):
+        state = torch.load(path, weights_only=False)
+        del state["lcg_scorer"], state["ensemble_scorer"], state["wandb_history_bytes"]
+        torch.save(state, path)
+
+    crash_before_final_evaluation(monkeypatch)
+    crashed, _ = launch(tmp_path / "final", monkeypatch, tiny, overrides)
+    with pytest.raises(Crash):
+        crashed._run()
+    strip(tmp_path / "final/checkpoints/state.pt")
+    monkeypatch.undo()
+    forbid_training_and_refresh(monkeypatch)
+    capsys.readouterr()
+    resumed, logs = launch(tmp_path / "final", monkeypatch, None, [], resume=True)
+    run(resumed)
+    out = "\n".join(terminal_lines(capsys.readouterr().out))
+    block = merged(logs, "final_test_eval/")
+    saved = json.loads(Path("evaluation/final_epoch_00002.json").read_text())
+    if method == "lcg":
+        assert block["final_test_eval/intrinsic_scored"] == 0 and not any("intrinsic_raw" in k for k in block)
+        assert "Final intrinsic evaluation: N/A (the checkpoint predates saved LCG scorer state" in out
+        assert "predates saved LCG scorer state" in saved["intrinsic"]["reason"]
+    else:  # raw disagreement from the restored members; the lost RunningRMS scale is not invented
+        assert "final_test_eval/seed_11/intrinsic_raw_return" in block
+        assert not any("intrinsic_scaled" in k for k in block)
+        assert "Warning: no frozen reward scale; the checkpoint predates the saved RunningRMS scale" in out
+
+    # Mid-run with an older checkpoint: training refreshes the scorer before any evaluation.
+    monkeypatch.undo()
+    full, logs_full = launch(tmp_path / "full", monkeypatch, tiny, overrides)
+    run(full)
+    monkeypatch.undo()
+    crash_at_test_agent(monkeypatch, epoch=2)
+    crashed, _ = launch(tmp_path / "mid", monkeypatch, tiny, overrides)
+    with pytest.raises(Crash):
+        crashed._run()
+    strip(tmp_path / "mid/checkpoints/state.pt")
+    monkeypatch.undo()
+    resumed, logs = launch(tmp_path / "mid", monkeypatch, None, [], resume=True)
+    run(resumed)
+    assert merged(logs, "final_test_eval/") == merged(logs_full, "final_test_eval/")
+    assert_same_training(full, resumed)

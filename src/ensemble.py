@@ -207,6 +207,20 @@ class EnsembleScorer:
             return self.rms.apply_frozen(raw)
         return self.scale(raw)
 
+    def state_dict(self) -> Dict:
+        """The frozen scale (RunningRMS s2 when reward_scaling=rms): with it a resume scores
+        evaluation exactly as before the checkpoint. Members and banks are checkpointed elsewhere."""
+        s2 = None if self.rms is None or self.rms.s2 is None else self.rms.s2.cpu()
+        return dict(settings=self.cfg.reward_scaling_settings(), rms_s2=s2)
+
+    def load_state_dict(self, state: Dict, device: torch.device) -> None:
+        if state["settings"] != self.cfg.reward_scaling_settings():
+            raise ValueError(f"Checkpoint's {self.metric_prefix} scorer was built with {state['settings']}, the config "
+                             f"gives {self.cfg.reward_scaling_settings()}; a resume must not change them")
+        self.reset()
+        if self.rms is not None and state["rms_s2"] is not None:
+            self.rms.s2 = state["rms_s2"].to(device)
+
     def __call__(self, infos: List[Dict], env_rew: Tensor) -> Tensor:
         raw = torch.stack([info["ensemble_disagreement"] for info in infos], dim=1)  # (envs, steps)
         raw = raw.to(device=env_rew.device, dtype=env_rew.dtype)

@@ -3,6 +3,7 @@ from pathlib import Path
 import shutil
 import time
 import json
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from hydra.utils import instantiate
@@ -38,6 +39,8 @@ from utils import (
     keep_agent_copies_every,
     Logs,
     process_confusion_matrices_if_any_and_compute_classification_metrics,
+    history_records,
+    repair_history,
     phase,
     Progress,
     rng_state,
@@ -378,6 +381,7 @@ class ExplorationTrainer(StateDictMixin):
 
         # Real-environment intrinsic evaluation with the method's frozen scorer (learned methods).
         self._intrinsic = None
+        self._scorer_restore_note = None  # set when a resumed checkpoint lacks frozen scorer state
         if self._method is not None:
             noise = (self._ensemble_cfg or self._laplace_cfg).num_noise_samples if self._method in (
                 "ensemble_disagreement", "laplace_disagreement") else 1
@@ -400,6 +404,8 @@ class ExplorationTrainer(StateDictMixin):
         self.test_episode_seeds = []  # reset seed of each current test episode (None: drawn at random)
         self.resume_count = 0  # resumes of this run folder (logging only)
         self.wandb_steps = 0  # W&B rows logged (and mirrored) up to this checkpoint
+        self.wandb_history_bytes = 0  # wandb_history.jsonl length at this checkpoint: its committed records
+        self._committed_history_bytes = None  # on resume: the loaded checkpoint's value (backfill reads only these)
 
         self._path_milestones = Path("milestones")
         self._start_logs = []
@@ -407,6 +413,8 @@ class ExplorationTrainer(StateDictMixin):
         if cfg.common.resume:
             self.load_state_checkpoint()
             self.resume_count += 1
+            if self._rank == 0 and self._local_history:
+                self.repair_wandb_history()
             self._start_logs.append({"resume/from_epoch": self.epoch, "resume/count": self.resume_count})
         if self._should_test and not self._collect_test:
             self.check_reusable_test_dataset()
@@ -733,8 +741,22 @@ class ExplorationTrainer(StateDictMixin):
                     values = {k: float(v) for k, v in row.items() if np.ndim(v) == 0 and not isinstance(v, str)}
                     f.write(json.dumps(dict(step=self.wandb_steps + i, epoch=self.epoch, segment=self.resume_count,
                                             values=values)) + "\n")
+                f.flush()
+                os.fsync(f.fileno())  # on disk before the checkpoint that commits these rows
+                self.wandb_history_bytes = f.tell()
         wandb_log(rows, self.epoch)
         self.wandb_steps += len(rows)
+
+    def repair_wandb_history(self) -> None:
+        """On resume, before anything is appended or backfilled: keep an interrupted last record
+        in a recovery file (or complete one that only lost its newline) and check that every
+        record the checkpoint committed is intact (utils.repair_history)."""
+        self._committed_history_bytes = self.wandb_history_bytes
+        action = repair_history(self._path_history, self._committed_history_bytes)
+        if action is not None:
+            say(f"W&B mirror: {action}")
+        # Rows after the committed offset (an interrupted segment) stay; the next commit covers them.
+        self.wandb_history_bytes = self._path_history.stat().st_size if self._path_history.is_file() else 0
 
     def reconcile_wandb_history(self) -> Dict[str, int]:
         """On resume: W&B's starting step is the number of rows its server holds. Committed rows
@@ -743,17 +765,25 @@ class ExplorationTrainer(StateDictMixin):
         now replayed) are counted, never silently duplicated. Returns the counts."""
         server = int(getattr(wandb.run, "starting_step", 0) or 0)
         committed = self.wandb_steps
+        if getattr(wandb.run, "offline", False) and committed is not None:
+            # Offline W&B knows no server rows (starting_step 0) and writes a new offline file per
+            # segment: backfilling would re-log every committed row, duplicated when both are synced.
+            say("W&B offline: the server's row count is unknown, so no rows are backfilled "
+                f"({self._path_history} keeps every committed row)")
+            return {"resume/wandb_committed_rows": committed}
         stats = {"resume/wandb_server_rows": server}
         if committed is None:  # checkpoint from before the mirror
             self.wandb_steps = server
             return stats
         stats["resume/wandb_committed_rows"] = committed
         if server < committed and self._local_history and self._path_history.is_file():
+            # Only records the checkpoint committed (before its byte offset; checkpoints from before
+            # the offset: all complete records). Within them the last write of a step is the
+            # committed one: a replayed epoch rewrites its steps after the interrupted attempt.
             latest = {}
-            for line in self._path_history.read_text(encoding="utf-8").splitlines():
-                record = json.loads(line)
+            for record in history_records(self._path_history, end=self._committed_history_bytes):
                 if server <= record["step"] < committed:
-                    latest[record["step"]] = record  # the last write of a step is the committed one
+                    latest[record["step"]] = record
             missing = [s for s in range(server, committed) if s not in latest]
             if missing:
                 raise RuntimeError(f"W&B rows {missing[:5]}... are missing from {self._path_history}; cannot backfill")
@@ -889,6 +919,8 @@ class ExplorationTrainer(StateDictMixin):
             reason = "disabled (evaluation.intrinsic=false)"
         else:
             reason = self._intrinsic.unavailable_reason()
+            if reason is not None and self._scorer_restore_note is not None:
+                reason = self._scorer_restore_note
         records = []
         for i in range(td.num_episodes):
             episode = td.load_episode(i)
@@ -910,6 +942,9 @@ class ExplorationTrainer(StateDictMixin):
         say(evaluation_heading(final, reason if self._method is not None else None))
         for r in records:
             say(evaluation_line(r, scored=reason is None))
+        if reason is None and any("intrinsic_scaled_return" not in r for r in records):
+            say(f"Warning: no frozen reward scale{'; ' + self._scorer_restore_note if self._scorer_restore_note else ''}"
+                "; scaled returns are N/A")
         result = dict(kind=kind, block=block, epoch=self.epoch, final=final, fresh=fresh,
                       train_env_steps=int(self.train_dataset.num_steps), total_test_env_steps=int(self.num_test_steps),
                       pmpo_updates=int(self.agent.actor_critic.updates.item()), protocol=self.evaluation_protocol(),
@@ -1077,6 +1112,11 @@ class ExplorationTrainer(StateDictMixin):
         state["lcg_reward_scaling"] = self._lcg_reward_scaling
         state["collection"] = self.collection_state()
         state["rng"] = rng_state()
+        # Frozen intrinsic scorer of the latest refresh (what a resume needs to evaluate without
+        # refreshing). Members, Laplace banks and Plan2Explore heads are checkpointed with their
+        # own fields; LCG's round and the full ensemble's RunningRMS scale only here.
+        state["lcg_scorer"] = None if self._lcg_lifecycle is None else self._lcg_lifecycle.state_dict()
+        state["ensemble_scorer"] = None if self._ensemble_scorer is None else self._ensemble_scorer.state_dict()
         return state
 
     def load_state_dict(self, state_dict: dict) -> None:
@@ -1091,10 +1131,13 @@ class ExplorationTrainer(StateDictMixin):
             raise ValueError(f"Checkpoint was trained with LCG reward scaling {scaling}, the config now gives "
                              f"{self._lcg_reward_scaling}; a resume must not switch it")
         self._rng_to_restore = state_dict.pop("rng")
+        # Absent in checkpoints from before frozen scorer state was saved (MISSING, not None).
+        lcg_state, scale_state = state_dict.pop("lcg_scorer", MISSING), state_dict.pop("ensemble_scorer", MISSING)
         diagnostic_state = state_dict.pop("pmpo_diagnostic", None)
         state_dict.setdefault("test_episode_seeds", None)  # before seed labels: unknown (never relabeled)
         state_dict.setdefault("resume_count", 0)
         state_dict.setdefault("wandb_steps", None)  # before the mirror: no backfill
+        state_dict.setdefault("wandb_history_bytes", None)  # before committed offsets: all complete records count
         state_dict.setdefault("ensemble", None)  # checkpoints from before ensembles: single denoiser
         saved = (state_dict["ensemble"] or {}).get("settings")
         expected = self.ensemble.settings() if self.ensemble is not None else None
@@ -1116,9 +1159,39 @@ class ExplorationTrainer(StateDictMixin):
         check_same_packages(state_dict["source"])
         super().load_state_dict(state_dict)
         self.restore_collection_state(collection)
+        self.restore_scorers(lcg_state, scale_state)
         if self._pmpo_diagnostic is not None:
             # After the agent: the history is validated against the restored PMPOBeta.updates.
             self._pmpo_diagnostic.load_state_dict(diagnostic_state)
+
+    def restore_scorers(self, lcg_state: Any, scale_state: Any) -> None:
+        """After the weights: the latest refresh's frozen scorer, wired as the refresh left it.
+        Nothing is refreshed, redrawn, refitted or trained; the next epoch's refresh replaces it
+        as usual. A checkpoint without this state (older code) keeps the scorer unavailable and
+        says why at evaluation; missing state is never re-created."""
+        actor_critic = self.agent.actor_critic
+        if self._lcg_lifecycle is None and lcg_state not in (MISSING, None):
+            raise ValueError("Checkpoint has an LCG scorer, the config selects another method")
+        if self._ensemble_scorer is None and scale_state not in (MISSING, None):
+            raise ValueError("Checkpoint has an ensemble-disagreement scorer, the config selects another method")
+        if self._lcg_lifecycle is not None:
+            if lcg_state is MISSING:
+                self._scorer_restore_note = ("the checkpoint predates saved LCG scorer state (precision, candidate bank, "
+                                             "RunningRMS); the frozen scorer cannot be restored and is not re-created")
+            elif lcg_state is not None:
+                self._lcg_lifecycle.load_state_dict(lcg_state, self.agent.denoiser)
+                actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
+        if self._ensemble_scorer is not None:
+            if scale_state is MISSING:
+                if self._ensemble_scorer.cfg.reward_scaling == "rms":
+                    self._scorer_restore_note = ("the checkpoint predates the saved RunningRMS scale of the "
+                                                 f"{METHOD_NAMES[self._method]} scorer; scaled returns cannot be reproduced")
+            elif scale_state is not None:
+                self._ensemble_scorer.load_state_dict(scale_state, self._device)
+            if self.epoch > 0 and (self.laplace is None or self.laplace.perturbations is not None):
+                actor_critic.set_intrinsic_reward_fn(self._ensemble_scorer)
+        if self.plan2explore is not None and self.plan2explore.heads is not None:
+            actor_critic.set_intrinsic_reward_fn(self.plan2explore)
 
     def collection_state(self) -> Optional[Dict[str, Any]]:
         """The train collector at this epoch boundary: unfinished episode ids, the current
@@ -1307,6 +1380,9 @@ EPOCH_AXIS_METRICS = ("epoch_summary/*", "progress/*", "timing/*", "duration", "
                       "ensemble/*", "plan2explore/*", "laplace/*", "lcg/*", "classification_metrics/*", "length")
 INTRINSIC_UNITS_NOTE = ("Intrinsic returns are in each method's own units (LCG score, pixel variance, feature "
                         "variance, ...); they compare checkpoints within one method, never methods with each other.")
+
+
+MISSING = object()  # a checkpoint field that older code did not save
 
 
 def without_task_returns(rows: Logs) -> Logs:

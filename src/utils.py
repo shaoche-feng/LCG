@@ -271,6 +271,88 @@ def wandb_log(logs: Logs, epoch: int):
         wandb.log({"epoch": epoch, **d})
 
 
+# The local W&B row mirror (wandb_history.jsonl): one JSON record per line, {"step", "epoch",
+# "segment", "values"}, appended and fsynced before the checkpoint that commits it. A checkpoint
+# stores the file's byte length at its commit: records before that offset are committed, records
+# after it come from an interrupted segment. Read line by line (the file can be large).
+
+def parse_history_record(line: bytes, path: Path, number: int, offset: int) -> Dict:
+    try:
+        record = json.loads(line)
+    except ValueError as error:
+        raise ValueError(f"{path}: record {number} (byte offset {offset}) is not valid JSON ({error}); "
+                         "not resuming over a corrupt W&B mirror") from None
+    if not (isinstance(record, dict) and isinstance(record.get("step"), int) and isinstance(record.get("values"), dict)):
+        raise ValueError(f"{path}: record {number} (byte offset {offset}) is not a W&B mirror record")
+    return record
+
+
+def history_records(path: Path, end: Optional[int] = None):
+    """Yield every complete record in file order, up to byte `end` (a record boundary; None: the
+    whole file). Corruption raises ValueError with its location."""
+    offset = 0
+    with open(path, "rb") as f:
+        for number, line in enumerate(f, start=1):
+            if end is not None and offset >= end:
+                break
+            if not line.endswith(b"\n"):
+                raise ValueError(f"{path}: record {number} (byte offset {offset}) is incomplete")
+            yield parse_history_record(line, path, number, offset)
+            offset += len(line)
+    if end is not None and offset != end:
+        raise ValueError(f"{path}: the checkpoint committed {end} bytes but the complete records end at byte {offset}")
+
+
+def repair_history(path: Path, committed_bytes: Optional[int]) -> Optional[str]:
+    """Make the mirror safe to append to and backfill from, as recover_metrics_log does for the
+    downstream log: an interrupted last record is kept byte-for-byte in <name>.interrupted-<n> and
+    truncated away; a whole last record that only lost its newline gets it. Raises ValueError on
+    corruption before the last line, or if records the checkpoint committed are missing, cut or do
+    not end on a record boundary. Returns what was done (None: nothing). Idempotent."""
+    if not path.is_file():
+        if committed_bytes:
+            raise ValueError(f"{path} is missing but the checkpoint committed {committed_bytes} bytes of W&B rows")
+        return None
+    boundary, offset, tail, number = committed_bytes in (None, 0), 0, None, 0
+    with open(path, "rb") as f:
+        for number, line in enumerate(f, start=1):
+            if not line.endswith(b"\n"):
+                tail = line  # only the last line can lack its newline
+                break
+            parse_history_record(line, path, number, offset)
+            offset += len(line)
+            boundary = boundary or offset == committed_bytes
+    if committed_bytes is not None and (offset < committed_bytes or not boundary):
+        raise ValueError(f"{path}: the checkpoint committed {committed_bytes} bytes of W&B rows, but the complete "
+                         f"records end at byte {offset}{'' if offset < committed_bytes else ' with no record boundary there'}; "
+                         "committed rows are missing or damaged, not resuming over them")
+    if tail is None:
+        return None
+    try:
+        parse_history_record(tail, path, number, offset)
+    except ValueError:
+        pass
+    else:
+        with open(path, "ab") as f:
+            f.write(b"\n")
+            f.flush()
+            os.fsync(f.fileno())
+        return f"completed the last record of {path.name} (its newline was missing)"
+    n = 1
+    while True:
+        recovery = path.with_name(f"{path.name}.interrupted-{n}")
+        try:
+            with open(recovery, "xb") as f:  # exclusive: never overwrites an earlier recovery
+                f.write(tail)
+                f.flush()
+                os.fsync(f.fileno())
+            break
+        except FileExistsError:
+            n += 1
+    os.truncate(path, offset)
+    return f"kept the interrupted last record of {path.name} ({len(tail)} bytes) in {recovery.name} and removed it"
+
+
 # ---------------------------------------------------------------- terminal output
 
 PROGRESS_MODES = ("bar", "none")
