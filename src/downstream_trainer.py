@@ -77,6 +77,8 @@ class DownstreamTrainer:
         # The milestone's own env and denoiser configuration define the models.
         cfg = deepcopy(cfg)
         with open_dict(cfg):
+            if cfg.initialization.pop("milestones_dir", None) is not None:  # launcher-level (downstream_main)
+                raise ValueError("A downstream trainer takes one milestone; initialization.milestones_dir is for downstream_main.py")
             cfg.env.train = manifest["model"]["env"]
             cfg.agent.denoiser = manifest["model"]["denoiser"]
         OmegaConf.resolve(cfg)

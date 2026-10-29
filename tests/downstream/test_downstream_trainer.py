@@ -1,5 +1,6 @@
 """Step 5 (first increment): downstream reward-model and PMPO training on a frozen milestone."""
 import hashlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -7,13 +8,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import yaml
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
+import downstream_main
 import downstream_trainer as downstream_module
 from coroutines.env_loop import make_env_loop
 from data import Dataset, Episode
-from data.milestone import publish_milestone
+from data.milestone import discover_milestones, publish_milestone
 from data.segment import SegmentId
 from data.utils import make_task_reward_collate
 from downstream_trainer import DownstreamTrainer
@@ -50,13 +53,32 @@ def frames(n, generator):
     return levels.float().div(255).mul(2).sub(1)  # on the uint8 grid, as TorchEnv produces
 
 
-def build_milestone(root, column_offsets=(0.0, 0.0, 0.0)):
+def build_milestone(root, column_offsets=(0.0, 0.0, 0.0), early=()):
     """A labeled walker milestone: two finished (truncated) episodes and one unfinished
-    episode at the cut. column_offsets shift each task's reward column."""
+    episode at the cut. column_offsets shift each task's reward column. early: also publish
+    milestones of the same run after that many finished episodes (1: steps_000010, 2: steps_000020)."""
     g = torch.Generator().manual_seed(0)
     run = root / "run"
+    cfg = compose("trainer", TINY_DENOISER)
+    denoiser_cfg = instantiate(cfg.agent.denoiser)
+    denoiser_cfg.inner_model.continuous_action_dim = 6
+    torch.manual_seed(1)
+    denoiser = Denoiser(denoiser_cfg)
+
+    def publish(dataset, successors, epoch):
+        steps = dataset.num_steps
+        manifest = dict(created_by="test", domain="walker", task_names=list(TASKS), collected_steps=steps,
+                        num_episodes=dataset.num_episodes, epoch=epoch, counters=dict(denoiser_batches=5, pmpo_updates=0),
+                        exploration=dict(collection_mode="uniform", intrinsic_reward_enabled=False),
+                        model=dict(denoiser=OmegaConf.to_container(cfg.agent.denoiser, resolve=True),
+                                   env=OmegaConf.to_container(cfg.env.train, resolve=True)),
+                        run_config="../../config/trainer.yaml", source=dict(git_commit=None))
+        return publish_milestone(run / "milestones", f"steps_{steps:06d}", denoiser.state_dict(), dataset, successors, manifest)
+
     dataset = Dataset(run / "dataset/train", "train_dataset")
-    for length, finished in ((10, True), (10, True), (6, False)):
+    for k, (length, finished) in enumerate(((10, True), (10, True), (6, False))):
+        if k in early:
+            publish(dataset, {}, epoch=k)
         obs, act = frames(length, g), torch.rand(length, 6, generator=g) * 2 - 1
         base = torch.rand(length, generator=g)
         task_rew = torch.stack([base * (i + 1) + column_offsets[i] for i in range(3)], 1)
@@ -66,18 +88,7 @@ def build_milestone(root, column_offsets=(0.0, 0.0, 0.0)):
         dataset.add_episode(Episode(obs, act, task_rew[:, 0].clone(), torch.zeros(length, dtype=torch.long), trunc,
                                     info, task_rew=task_rew, task_names=TASKS))
     successor = frames(1, g)[0]
-    cfg = compose("trainer", TINY_DENOISER)
-    denoiser_cfg = instantiate(cfg.agent.denoiser)
-    denoiser_cfg.inner_model.continuous_action_dim = 6
-    torch.manual_seed(1)
-    denoiser = Denoiser(denoiser_cfg)
-    manifest = dict(created_by="test", domain="walker", task_names=list(TASKS), collected_steps=26, num_episodes=3,
-                    epoch=2, counters=dict(denoiser_batches=5, pmpo_updates=0),
-                    exploration=dict(collection_mode="uniform", intrinsic_reward_enabled=False),
-                    model=dict(denoiser=OmegaConf.to_container(cfg.agent.denoiser, resolve=True),
-                               env=OmegaConf.to_container(cfg.env.train, resolve=True)),
-                    run_config="../../config/trainer.yaml", source=dict(git_commit=None))
-    return publish_milestone(run / "milestones", "steps_000026", denoiser.state_dict(), dataset, {2: successor}, manifest)
+    return publish(dataset, {2: successor}, epoch=2)
 
 
 def make_trainer(milestone, monkeypatch, task="walk", extra=()):
@@ -301,6 +312,299 @@ def test_entry_point_runs_through_hydra(tmp_path):
     out = tmp_path / "run/downstream/steps_000026/run/seed_1"
     assert (out / "summary.yaml").is_file() and OmegaConf.load(out / "summary.yaml").task_index == 2
     assert not list(ROOT.glob("*.log"))  # no Hydra log file written into the repository
+    config = OmegaConf.load(out / "config.yaml")  # a normal single-milestone configuration
+    assert "milestones_dir" not in config.initialization and config.initialization.milestone_path == milestone.as_posix()
+
+
+# ---------------------------------------------------------------- folder mode (downstream_main.py)
+
+def fake_hydra(overrides, config_dirs=(), hydra_overrides=(), config_path=ROOT / "config", config_name="downstream"):
+    """The parts of HydraConfig.get() that child_command_base reads, as `python src/downstream_main.py
+    [--config-path=...] [--config-dir=...] --config-name=... <hydra_overrides> <overrides>` records them."""
+    sources = [dict(path="hydra.conf", schema="pkg", provider="hydra"),
+               dict(path=str(config_path), schema="file", provider="main"),
+               *(dict(path=str(d), schema="file", provider="command-line") for d in config_dirs),
+               dict(path="", schema="structured", provider="schema")]
+    return OmegaConf.create(dict(runtime=dict(config_sources=sources), job=dict(config_name=config_name),
+                                 overrides=dict(hydra=[*hydra_overrides, "hydra.mode=RUN"], task=list(overrides))))
+
+
+def folder_cfg(milestones_dir, *extra, task="walk"):
+    """The launcher's configuration, child command base and overrides, as downstream_main.main has them."""
+    overrides = [f"initialization.milestones_dir={Path(milestones_dir).as_posix()}", f"downstream.task_name={task}",
+                 "common.devices=cpu", *TINY_DOWNSTREAM, *extra]
+    cfg = compose("downstream", overrides)
+    base = downstream_main.child_command_base(fake_hydra(overrides))
+    return cfg, Path(downstream_main.pop_milestones_dir(cfg)), base, overrides
+
+
+class FakeRun:
+    """Records child commands instead of starting processes; exit codes in order (default 0)."""
+    def __init__(self, *codes):
+        self.codes, self.commands = list(codes), []
+
+    def __call__(self, command):
+        self.commands.append(command)
+        return subprocess.CompletedProcess(command, self.codes.pop(0) if self.codes else 0)
+
+
+def test_exactly_one_milestone_source_and_no_launcher_field_in_trainer_configs(tmp_path, monkeypatch):
+    for overrides in (["initialization.milestone_path=x", "initialization.milestones_dir=y"], []):
+        with pytest.raises(ValueError, match="exactly one of initialization.milestone_path"):
+            downstream_main.pop_milestones_dir(compose("downstream", ["downstream.task_name=walk", *overrides]))
+    cfg = compose("downstream", ["initialization.milestone_path=x", "downstream.task_name=walk"])
+    assert downstream_main.pop_milestones_dir(cfg) is None and "milestones_dir" not in cfg.initialization
+    milestone = build_milestone(tmp_path)
+    trainer = make_trainer(milestone, monkeypatch)  # composed directly: the field is dropped as well
+    assert "milestones_dir" not in trainer.cfg.initialization
+    assert "milestones_dir" not in OmegaConf.load(trainer._work_dir / "config.yaml").initialization
+    with pytest.raises(ValueError, match="takes one milestone"):
+        make_trainer(milestone, monkeypatch, extra=["downstream.seed=5", "initialization.milestones_dir=y"])
+
+
+def test_discovery_orders_by_recorded_steps_and_rejects_bad_folders(tmp_path):
+    milestones = build_milestone(tmp_path, early=(1, 2)).parent
+    # Folder names that sort the other way round: the manifests' collected_steps decide.
+    for old, new in (("steps_000010", "c_first"), ("steps_000020", "b_second"), ("steps_000026", "a_third")):
+        (milestones / old).rename(milestones / new)
+    found = discover_milestones(milestones)
+    assert [(p.name, m["collected_steps"]) for p, m in found] == [("c_first", 10), ("b_second", 20), ("a_third", 26)]
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        discover_milestones(tmp_path / "nowhere")
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(ValueError, match="contains no milestones"):
+        discover_milestones(tmp_path / "empty")
+    shutil.copytree(milestones / "b_second", milestones / "b_copy")
+    with pytest.raises(ValueError, match="ambiguous duplicate step counts 20 recorded by b_copy, b_second"):
+        discover_milestones(milestones)
+    shutil.rmtree(milestones / "b_copy")
+    for name, make_bad, message in (("notes", lambda p: p.mkdir(), "notes: No milestone manifest"),
+                                    (".steps_000030.tmp", lambda p: p.mkdir(), "interrupted or in-progress"),
+                                    ("stray.txt", lambda p: p.write_text("x"), "stray.txt: not a milestone folder")):
+        make_bad(milestones / name)
+        with pytest.raises(ValueError, match=f"Malformed milestones folder(.|\\n)*{message}"):
+            discover_milestones(milestones)
+        shutil.rmtree(milestones / name) if (milestones / name).is_dir() else (milestones / name).unlink()
+    manifest = milestones / "a_third/manifest.yaml"
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text(text.replace("collected_steps: 26", "collected_steps: many"), encoding="utf-8")
+    with pytest.raises(ValueError, match="a_third: manifest has no integer collected_steps"):
+        discover_milestones(milestones)
+
+
+def test_preflight_rejects_tasks_files_conflicts_and_modes_before_any_launch(tmp_path):
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    run = FakeRun()
+
+    def rejected(match, *extra, task="walk"):
+        cfg, folder, base, overrides = folder_cfg(milestones, *extra, task=task)
+        with pytest.raises(ValueError, match=match):
+            downstream_main.run_milestones(cfg, folder, base, run=run)
+        assert not run.commands and not (tmp_path / "run/downstream/steps_000020").exists()
+
+    rejected("Nothing was started(.|\\n)*steps_000020 has no reward labels(.|\\n)*steps_000026 has no reward labels", task="jump")
+    for mode in ("resume", "evaluate"):
+        rejected(f"supports only downstream.mode=train, got '{mode}'. {mode} takes one milestone", f"downstream.mode={mode}")
+    denoiser = milestones / "steps_000026/denoiser.pt"
+    original = denoiser.read_bytes()
+    denoiser.write_bytes(original + b"x")
+    rejected("Nothing was started(.|\\n)*steps_000026: denoiser file .* does not match its checksum")
+    denoiser.write_bytes(original)
+
+    # Conflicts at the LAST milestone are found before the first one trains, and left untouched.
+    later = tmp_path / "run/downstream/steps_000026/walk"
+    (later / "seed_0").mkdir(parents=True)
+    (later / ".seed_0.tmp").mkdir()
+    (later / ".seed_0.tmp/metrics.jsonl").write_text("{}\n")
+    before = tree_hashes(tmp_path / "run")
+    rejected("Nothing was started. 2 problem(.|\\n)*steps_000026: downstream output .*seed_0 already exists; not overwriting"
+             "(.|\\n)*steps_000026: incomplete downstream output .*\\.seed_0\\.tmp from an earlier attempt")
+    assert tree_hashes(tmp_path / "run") == before and sorted(p.name for p in later.iterdir()) == [".seed_0.tmp", "seed_0"]
+    cfg, folder, base, overrides = folder_cfg(milestones, "downstream.seed=1")  # another seed has no conflict
+    assert downstream_main.run_milestones(cfg, folder, base, run=run) == 0 and len(run.commands) == 2
+
+
+def test_children_get_their_own_milestone_with_identical_settings_and_failure_stops_the_batch(tmp_path, capsys):
+    milestones = build_milestone(tmp_path, early=(1, 2)).parent
+    (milestones / "steps_000010").rename(milestones / "z_steps_10")  # order comes from the manifests
+    cfg, folder, base, overrides = folder_cfg(milestones, "downstream.seed=7", "rew_end_model.optimizer.lr=0.0003")
+    run = FakeRun()
+    assert downstream_main.run_milestones(cfg, folder, base, run=run) == 0
+    assert [c[-2:] for c in run.commands] == [[f"initialization.milestone_path={(milestones / name).resolve().as_posix()}",
+                                               "downstream.mode=train"] for name in ("z_steps_10", "steps_000020", "steps_000026")]
+    assert [c[:-2] for c in run.commands] == [base] * 3
+    assert base[:4] == [sys.executable, str(ROOT / "src/downstream_main.py"), f"--config-path={ROOT / 'config'}",
+                        "--config-name=downstream"]
+    # The same task, seed and settings; the folder field is cleared, not just omitted.
+    assert base[4:] == [*overrides[1:], "++initialization.milestones_dir=null"]
+    out = capsys.readouterr().out
+    assert "task walk | adaptation seed 7 | member 0 | mode train" in out
+    assert out.index("1. z_steps_10 (10 collected steps)") < out.index("2. steps_000020") < out.index("3. steps_000026")
+    assert "All 3 completed." in out
+
+    # The second milestone fails after a checkpoint (as a crashed child leaves it); the first completed.
+    completed = tmp_path / "run/downstream/z_steps_10/walk/seed_7"
+    work = tmp_path / "run/downstream/steps_000020/walk/.seed_7.tmp"
+
+    def crash_after_checkpoint(command):
+        if len(run.commands) == 1:
+            completed.mkdir(parents=True)
+            (completed / "summary.yaml").write_text("done\n")
+        else:
+            (work / "checkpoints").mkdir(parents=True)
+            (work / "checkpoints/state.pt").write_bytes(b"checkpoint")
+        return subprocess.CompletedProcess(command, 0 if len(run.commands) == 1 else 3)
+
+    run = FakeRun()
+    calls = run.__call__
+    run_and_crash = lambda command: (calls(command), crash_after_checkpoint(command))[1]
+    assert downstream_main.run_milestones(cfg, folder, base, run=run_and_crash) == 1
+    assert len(run.commands) == 2
+    out = capsys.readouterr().out.split("Downstream batch summary")[1]
+    assert "z_steps_10: completed" in out and "steps_000026: not started" in out
+    assert "steps_000020: FAILED (exit code 3)" in out and f"resumable work folder {work} kept; resume it with:" in out
+    resume = downstream_main.milestone_command(base, milestones / "steps_000020", "resume")
+    assert downstream_main.shell(resume) in out and resume[-1] == "downstream.mode=resume" and "downstream.seed=7" in resume
+    assert (completed / "summary.yaml").is_file() and (work / "checkpoints/state.pt").is_file()  # both preserved
+    assert "Stopped at the failure; later milestones were not started." in out
+
+
+def test_folder_mode_runs_independent_single_milestone_trainings(tmp_path):
+    """Two real child processes; the later milestone's result equals the single-milestone command's."""
+    milestones = build_milestone(tmp_path / "a", early=(2,)).parent
+    shutil.copytree(tmp_path / "a/run", tmp_path / "b/run")
+    command = [sys.executable, str(ROOT / "src/downstream_main.py"), f"initialization.milestones_dir={milestones.as_posix()}",
+               "downstream.task_name=run", "downstream.seed=1", "common.devices=cpu", *TINY_DOWNSTREAM]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+    print(result.stdout)  # the batch plan and summary (shown with pytest -s)
+    assert "Downstream batch summary (task run, adaptation seed 1)" in result.stdout and "All 2 completed." in result.stdout
+    configs = {}
+    for name, steps in (("steps_000020", 20), ("steps_000026", 26)):
+        out = tmp_path / f"a/run/downstream/{name}/run/seed_1"
+        summary = OmegaConf.load(out / "summary.yaml")
+        assert (summary.milestone.collected_steps, summary.seed, summary.task_name) == (steps, 1, "run")
+        assert (out / summary.milestone.path).resolve() == (milestones / name).resolve()
+        assert summary.num_updates == {"rew_end_model": 4, "actor_critic": 3}
+        config = OmegaConf.to_container(OmegaConf.load(out / "config.yaml"))
+        assert "milestones_dir" not in config["initialization"]
+        assert Path(config["initialization"].pop("milestone_path")).resolve() == (milestones / name).resolve()
+        configs[name] = config
+    assert configs["steps_000020"] == configs["steps_000026"]  # identical settings apart from the milestone
+
+    # No warm start: the later milestone's run equals the single-milestone command on a copy of the run folder
+    # (a fresh process as well: an in-process run can differ through process-global state left by other tests).
+    single = [sys.executable, str(ROOT / "src/downstream_main.py"),
+              f"initialization.milestone_path={(tmp_path / 'b/run/milestones/steps_000026').as_posix()}",
+              "downstream.task_name=run", "downstream.seed=1", "common.devices=cpu", *TINY_DOWNSTREAM]
+    result = subprocess.run(single, cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+    reference = tmp_path / "b/run/downstream/steps_000026/run/seed_1"
+    batch = tmp_path / "a/run/downstream/steps_000026/run/seed_1"
+    for name in ("rew_end_model.pt", "actor_critic.pt"):
+        assert states_equal(torch.load(batch / name, weights_only=False), torch.load(reference / name, weights_only=False))
+    assert (batch / "metrics.jsonl").read_bytes() == (reference / "metrics.jsonl").read_bytes()
+
+
+def test_child_command_keeps_the_configuration_source_and_clears_the_folder_field():
+    hydra_cfg = fake_hydra(["+initialization.milestones_dir=/runs/a/milestones", "downstream.task_name=run",
+                            "downstream.seed=4", "downstream.mode=train", "initialization.member_index=0",
+                            "rew_end_model.training.steps=7"],
+                           config_dirs=["/extra/conf"], hydra_overrides=["hydra.job.chdir=false"],
+                           config_path="/custom/config", config_name="batch")
+    base = downstream_main.child_command_base(hydra_cfg)
+    assert base == [sys.executable, str(ROOT / "src/downstream_main.py"), f"--config-path={Path('/custom/config').resolve()}",
+                    f"--config-dir={Path('/extra/conf').resolve()}", "--config-name=batch", "hydra.job.chdir=false",
+                    "downstream.task_name=run", "downstream.seed=4", "initialization.member_index=0",
+                    "rew_end_model.training.steps=7", "++initialization.milestones_dir=null"]
+    command = downstream_main.milestone_command(base, Path("/runs/a/milestones/steps_000020"), "evaluate")
+    assert command[len(base):] == [f"initialization.milestone_path={Path('/runs/a/milestones/steps_000020').resolve().as_posix()}",
+                                   "downstream.mode=evaluate"]
+    assert downstream_main.hydra_quote(Path("/a b/it's")) == "'" + Path("/a b/it's").resolve().as_posix().replace("'", "\\'") + "'"
+
+
+def yaml_batch_config(path, milestones):
+    """A full downstream config file that sets the folder, a non-default task and seed and the tiny
+    training settings itself: the children only finish quickly if they read it."""
+    data = yaml.safe_load((ROOT / "config/downstream.yaml").read_text(encoding="utf-8"))
+    settings = OmegaConf.from_dotlist([*TINY_DOWNSTREAM, f"initialization.milestones_dir={milestones.as_posix()}",
+                                       "downstream.task_name=run", "downstream.seed=3", "rew_end_model.optimizer.lr=0.0003"])
+    merged = OmegaConf.merge(OmegaConf.create({k: v for k, v in data.items() if k != "defaults"}), settings)
+    text = yaml.safe_dump(dict(defaults=data["defaults"], **OmegaConf.to_container(merged)), sort_keys=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("source", ["config-dir", "config-path"])
+def test_folder_mode_from_a_config_file_with_a_custom_config_source(tmp_path, source):
+    """milestones_dir set in YAML (not on the command line), loaded through --config-dir or --config-path."""
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    if source == "config-dir":
+        yaml_batch_config(tmp_path / "conf/batch.yaml", milestones)  # env/agent groups come from the primary path
+        args = [f"--config-dir={tmp_path / 'conf'}"]
+    else:
+        shutil.copytree(ROOT / "config", tmp_path / "conf")
+        yaml_batch_config(tmp_path / "conf/batch.yaml", milestones)
+        args = [f"--config-path={tmp_path / 'conf'}"]
+    command = [sys.executable, str(ROOT / "src/downstream_main.py"), *args, "--config-name=batch", "common.devices=cpu"]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "task run | adaptation seed 3" in result.stdout and "All 2 completed." in result.stdout
+    for name in ("steps_000020", "steps_000026"):
+        out = tmp_path / f"run/downstream/{name}/run/seed_3"
+        config = OmegaConf.load(out / "config.yaml")
+        # Exactly one milestone source: its own milestone_path, no folder field.
+        assert "milestones_dir" not in config.initialization
+        assert Path(config.initialization.milestone_path).resolve() == (milestones / name).resolve()
+        assert (config.downstream.task_name, config.downstream.seed, config.rew_end_model.optimizer.lr,
+                config.rew_end_model.training.steps, config.actor_critic.training.steps) == ("run", 3, 0.0003, 4, 3)
+        assert OmegaConf.load(out / "summary.yaml").num_updates == {"rew_end_model": 4, "actor_critic": 3}
+
+
+def test_failure_after_publication_reports_the_outputs_and_their_evaluate_command(tmp_path, capsys):
+    """A child that fails after publishing its training outputs (as in a failed evaluation): the batch
+    stops, nothing is deleted, and the printed evaluate command (same task, seed, member and
+    settings) evaluates the published output."""
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    cfg, folder, base, _ = folder_cfg(milestones, "downstream.seed=2", "initialization.member_index=0",
+                                      "evaluation.seeds=[9]", "evaluation.max_steps=3")
+    output = tmp_path / "run/downstream/steps_000020/walk/seed_2"
+    commands = []
+
+    def train_then_fail(command):  # trains for real (evaluation.after_training=false), then reports a failure
+        commands.append(command)
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr[-3000:]
+        return subprocess.CompletedProcess(command, 1)
+
+    assert downstream_main.run_milestones(cfg, folder, base, run=train_then_fail) == 1
+    assert len(commands) == 1 and not (tmp_path / "run/downstream/steps_000026").exists()
+    out = capsys.readouterr().out.split("Downstream batch summary")[1]
+    evaluate = downstream_main.milestone_command(base, milestones / "steps_000020", "evaluate")
+    assert f"steps_000020: FAILED (exit code 1) after" in out and f"training outputs were published at {output}" in out
+    assert downstream_main.shell(evaluate) in out and "steps_000026: not started" in out
+    assert (output / "summary.yaml").is_file() and not (output / "evaluations").exists()  # nothing deleted
+    assert evaluate[len(base) - 1:] == ["++initialization.milestones_dir=null",
+                                        f"initialization.milestone_path={(milestones / 'steps_000020').resolve().as_posix()}",
+                                        "downstream.mode=evaluate"]
+    assert {"downstream.task_name=walk", "downstream.seed=2", "initialization.member_index=0", "evaluation.seeds=[9]"} <= set(evaluate)
+    result = subprocess.run(evaluate, cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+    (evaluation,) = (output / "evaluations").iterdir()
+    assert OmegaConf.load(evaluation).seeds == [9]
+
+
+def test_folder_mode_failing_child_gives_a_nonzero_exit_and_starts_nothing_later(tmp_path):
+    """A real child that fails (rejected by the trainer, after the launcher's preflight passed)."""
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    command = [sys.executable, str(ROOT / "src/downstream_main.py"), f"initialization.milestones_dir={milestones.as_posix()}",
+               "downstream.task_name=walk", "common.devices=cpu", *TINY_DOWNSTREAM, "checkpointing.every=0"]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 1 and "checkpointing.every must be null or a positive integer" in result.stderr
+    assert "steps_000020: FAILED (exit code 1)" in result.stdout and "no work folder was created" in result.stdout
+    assert "steps_000026: not started" in result.stdout
+    assert not (tmp_path / "run/downstream/steps_000026").exists()
 
 # ---------------------------------------------------------------- Gaussian H10 EMA-critic controller
 

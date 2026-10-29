@@ -3,6 +3,8 @@
 #                 downstream.task_name=walk downstream.seed=0
 #   resume:   the same command with downstream.mode=resume (same settings; the run folder may move)
 #   evaluate: the same command with downstream.mode=evaluate (a completed output's final policy)
+#   folder:   initialization.milestones_dir=<run>/milestones instead of milestone_path: every milestone
+#             in the folder, in collection order, one independent run (child process) each; train only
 # Outputs: <run>/downstream/steps_N/<task>/seed_<seed>/ (never overwritten); training runs in
 # .seed_<seed>.tmp/ beside it. Budgets below are placeholders; final values are undecided.
 defaults:
@@ -26,6 +28,9 @@ hydra:
 
 initialization:
   milestone_path: ???
+  # Launcher-level (exactly one of the two): every milestone in this folder. Removed before a trainer
+  # sees the configuration, so each run's saved config names only its own milestone_path.
+  milestones_dir: null
   # Ensemble milestones hold several denoisers; this one (fixed in advance, never chosen by
   # evaluation results) is loaded as the frozen denoiser. Single-model milestones: only 0.
   member_index: 0

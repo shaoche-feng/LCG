@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import yaml
@@ -148,6 +148,45 @@ def read_manifest(milestone_path: Path) -> Dict[str, Any]:
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"{path}: schema_version {manifest.get('schema_version')}, expected {SCHEMA_VERSION}")
     return manifest
+
+
+def discover_milestones(milestones_dir: Path) -> List[Tuple[Path, Dict[str, Any]]]:
+    """(path, manifest) of every immediate child milestone of a folder, ordered by the manifests'
+    collected_steps (not by folder name). Every entry must be a published milestone: an empty
+    folder, any other entry (including an interrupted publish `.<name>.tmp`) and two milestones
+    recording the same step count are rejected. Only manifests are read; load_milestone checks files."""
+    milestones_dir = Path(milestones_dir)
+    if not milestones_dir.is_dir():
+        raise FileNotFoundError(f"Milestones folder {milestones_dir} does not exist")
+    found, problems = [], []
+    for path in sorted(milestones_dir.iterdir()):
+        if not path.is_dir():
+            problems.append(f"{path.name}: not a milestone folder")
+        elif path.name.startswith("."):
+            problems.append(f"{path.name}: an interrupted or in-progress milestone publish")
+        else:
+            try:
+                manifest = read_manifest(path)
+            except (OSError, ValueError, yaml.YAMLError) as error:
+                problems.append(f"{path.name}: {error}")
+                continue
+            steps = manifest.get("collected_steps")
+            if isinstance(steps, bool) or not isinstance(steps, int):
+                problems.append(f"{path.name}: manifest has no integer collected_steps ({steps!r})")
+            else:
+                found.append((path, manifest))
+    if problems:
+        raise ValueError(f"Malformed milestones folder {milestones_dir}:\n  " + "\n  ".join(problems))
+    if not found:
+        raise ValueError(f"Milestones folder {milestones_dir} contains no milestones")
+    by_steps = {}
+    for path, manifest in found:
+        by_steps.setdefault(manifest["collected_steps"], []).append(path.name)
+    duplicates = {steps: names for steps, names in by_steps.items() if len(names) > 1}
+    if duplicates:
+        raise ValueError(f"Milestones folder {milestones_dir}: ambiguous duplicate step counts "
+                         + "; ".join(f"{steps} recorded by {', '.join(names)}" for steps, names in sorted(duplicates.items())))
+    return sorted(found, key=lambda item: item[1]["collected_steps"])
 
 
 def referenced_files(milestone_path: Path) -> List[Path]:
