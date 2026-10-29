@@ -1,5 +1,7 @@
 """Step 5 (first increment): downstream reward-model and PMPO training on a frozen milestone."""
 import hashlib
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -339,12 +341,13 @@ def folder_cfg(milestones_dir, *extra, task="walk"):
 
 
 class FakeRun:
-    """Records child commands instead of starting processes; exit codes in order (default 0)."""
+    """Records child commands (and environments) instead of starting processes; exit codes in order (default 0)."""
     def __init__(self, *codes):
-        self.codes, self.commands = list(codes), []
+        self.codes, self.commands, self.envs = list(codes), [], []
 
-    def __call__(self, command):
+    def __call__(self, command, env=None):
         self.commands.append(command)
+        self.envs.append(env)
         return subprocess.CompletedProcess(command, self.codes.pop(0) if self.codes else 0)
 
 
@@ -439,9 +442,14 @@ def test_children_get_their_own_milestone_with_identical_settings_and_failure_st
     # The same task, seed and settings; the folder field is cleared, not just omitted.
     assert base[4:] == [*overrides[1:], "++initialization.milestones_dir=null"]
     out = capsys.readouterr().out
-    assert "task walk | adaptation seed 7 | member 0 | mode train" in out
-    assert out.index("1. z_steps_10 (10 collected steps)") < out.index("2. steps_000020") < out.index("3. steps_000026")
-    assert "All 3 completed." in out
+    assert out.count("Downstream task adaptation") == 1 and "Downstream batch summary" not in out  # no success summary
+    assert "Downstream batch: 3 milestones\n  Domain: walker; task: walk\n  Adaptation seed: 7\n  Milestones:\n" in out
+    assert out.index("  1. z_steps_10 | 10 training env steps\n") < out.index("  2. steps_000020 | 20 training env steps\n") \
+        < out.index("  3. steps_000026 | 26 training env steps\n") < out.index("\n\n=== Milestone 1/3: z_steps_10 ===\n") \
+        < out.index("\n\n=== Milestone 2/3: steps_000020 ===\n") < out.index("\n\n=== Milestone 3/3: steps_000026 ===\n")
+    # Children print only their milestone's lines (presentation only: not in the command or the config).
+    assert all(env[downstream_main.BATCH_CHILD_ENV] == "1" for env in run.envs)
+    assert not any(downstream_main.BATCH_CHILD_ENV in part for command in run.commands for part in command)
 
     # The second milestone fails after a checkpoint (as a crashed child leaves it); the first completed.
     completed = tmp_path / "run/downstream/z_steps_10/walk/seed_7"
@@ -458,7 +466,7 @@ def test_children_get_their_own_milestone_with_identical_settings_and_failure_st
 
     run = FakeRun()
     calls = run.__call__
-    run_and_crash = lambda command: (calls(command), crash_after_checkpoint(command))[1]
+    run_and_crash = lambda command, env=None: (calls(command, env), crash_after_checkpoint(command))[1]
     assert downstream_main.run_milestones(cfg, folder, base, run=run_and_crash) == 1
     assert len(run.commands) == 2
     out = capsys.readouterr().out.split("Downstream batch summary")[1]
@@ -478,8 +486,8 @@ def test_folder_mode_runs_independent_single_milestone_trainings(tmp_path):
                "downstream.task_name=run", "downstream.seed=1", "common.devices=cpu", *TINY_DOWNSTREAM]
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[-3000:]
-    print(result.stdout)  # the batch plan and summary (shown with pytest -s)
-    assert "Downstream batch summary (task run, adaptation seed 1)" in result.stdout and "All 2 completed." in result.stdout
+    print(result.stdout)  # the banner, plan and milestone blocks (shown with pytest -s)
+    assert "Downstream batch: 2 milestones" in result.stdout and "Downstream batch summary" not in result.stdout
     configs = {}
     for name, steps in (("steps_000020", 20), ("steps_000026", 26)):
         out = tmp_path / f"a/run/downstream/{name}/run/seed_1"
@@ -550,7 +558,8 @@ def test_folder_mode_from_a_config_file_with_a_custom_config_source(tmp_path, so
     command = [sys.executable, str(ROOT / "src/downstream_main.py"), *args, "--config-name=batch", "common.devices=cpu"]
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[-3000:]
-    assert "task run | adaptation seed 3" in result.stdout and "All 2 completed." in result.stdout
+    assert "  Domain: walker; task: run\n  Adaptation seed: 3\n" in result.stdout
+    assert "Downstream batch: 2 milestones" in result.stdout and "=== Milestone 2/2: steps_000026 ===" in result.stdout
     for name in ("steps_000020", "steps_000026"):
         out = tmp_path / f"run/downstream/{name}/run/seed_3"
         config = OmegaConf.load(out / "config.yaml")
@@ -572,9 +581,9 @@ def test_failure_after_publication_reports_the_outputs_and_their_evaluate_comman
     output = tmp_path / "run/downstream/steps_000020/walk/seed_2"
     commands = []
 
-    def train_then_fail(command):  # trains for real (evaluation.after_training=false), then reports a failure
+    def train_then_fail(command, env=None):  # trains for real (evaluation.after_training=false), then reports a failure
         commands.append(command)
-        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, env=env)
         assert result.returncode == 0, result.stderr[-3000:]
         return subprocess.CompletedProcess(command, 1)
 
@@ -605,6 +614,171 @@ def test_folder_mode_failing_child_gives_a_nonzero_exit_and_starts_nothing_later
     assert "steps_000020: FAILED (exit code 1)" in result.stdout and "no work folder was created" in result.stdout
     assert "steps_000026: not started" in result.stdout
     assert not (tmp_path / "run/downstream/steps_000026").exists()
+
+# ---------------------------------------------------------------- terminal format
+
+EVALUATED = [o for o in TINY_DOWNSTREAM if o != "evaluation.after_training=false"] + [
+    "evaluation.seeds=[3001,3002]", "evaluation.max_steps=3"]
+RULE = "=" * 78
+# A closed bar: description, 100%, completed/total, [elapsed<remaining, rate]; the rate with a space
+# before its unit, inverted below one per second (s/update, s/ep).
+BAR = re.compile(r"^(?P<desc>.+): 100%\|[^|]*\| (?P<n>\d+)/(?P=n) \[[\d:]+<[\d:]+, "
+                 r"(?:\d+\.\d\d (?P<plural>[a-z]+)/s|\d+\.\d\d s/(?P<singular>[a-z]+))\]$")
+
+
+def screen_lines(raw):
+    """What stays on screen: line endings normalized, and of a bar's in-place redraws (carriage
+    returns) only the last."""
+    text = raw.decode("utf-8").replace("\r\n", "\n")
+    return [line.rsplit("\r", 1)[-1] for line in text.split("\n")]
+
+
+def downstream_screen(*args):
+    """A real downstream_main.py run (as typed in a terminal, not as a folder's child); its screen lines."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    env.pop(downstream_main.BATCH_CHILD_ENV, None)
+    result = subprocess.run([sys.executable, str(ROOT / "src/downstream_main.py"), "common.devices=cpu", *args],
+                            cwd=ROOT, capture_output=True, env=env)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")[-3000:]
+    return screen_lines(result.stdout)
+
+
+def banner(label, source, root, training=True, seeds="2 seeds (3001\u20133002)"):
+    lines = [RULE, "Downstream task adaptation", f"  {label}: {Path(source).resolve()}", "  Compute device: CPU", None]
+    if training:
+        lines.append("  Training budget: 4 reward-predictor updates + 3 policy updates (per milestone)")
+    return lines + [f"  Evaluation: {seeds} | maximum 3 steps per episode", f"  Output root: {Path(root).resolve()}", RULE, ""]
+
+
+def check_block(lines, output, seeds, training=True):
+    """One milestone's lines after its heading, in order and without blank lines: the training bars
+    (if any), the evaluation bar, the summary from the saved evaluation (max, median, mean, min, std)
+    and the saved paths. Returns the lines after the block."""
+    phases = [("Reward-predictor training", 4, "update"), ("Task-policy training", 3, "update")] if training else []
+    span = f"{seeds[0]}-{seeds[-1]}" if seeds == list(range(seeds[0], seeds[-1] + 1)) and len(seeds) > 1 else ", ".join(map(str, seeds))
+    phases.append((f"Evaluation episodes (seeds {span})", len(seeds), "ep"))
+    for line, (desc, n, unit) in zip(lines, phases):
+        bar = BAR.match(line)
+        assert bar and bar["desc"] == desc and int(bar["n"]) == n, line
+        assert bar["plural"] == dict(update="updates", ep="ep")[unit] or bar["singular"] == unit, line
+    (evaluation,) = [p for p in (output / "evaluations").iterdir() if OmegaConf.load(p).seeds == seeds]
+    result = OmegaConf.to_container(OmegaConf.load(evaluation))
+    returns = np.array([e["episode_return"] for e in result["episodes"]])  # per-seed returns stay in the file
+    assert [e["seed"] for e in result["episodes"]] == seeds
+    assert [result[f"return_{k}"] for k in ("max", "median", "mean", "min", "std")] == [
+        float(returns.max()), float(np.median(returns)), float(returns.mean()), float(returns.min()), float(returns.std())]
+    rest = lines[len(phases):]
+    assert rest[0] == "Evaluation summary: " + " | ".join(
+        f"{k} {result[f'return_{k}']:.2f}" for k in ("max", "median", "mean", "min", "std"))
+    assert rest[1] == f"Evaluation saved: > {evaluation.resolve()}"
+    if training:
+        assert rest[2] == f"Downstream outputs saved: > {output.resolve()}"
+    return rest[2 + training:]
+
+
+def test_terminal_format_single_milestone_folder_and_evaluate_only(tmp_path):
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    root, single = tmp_path / "run/downstream", milestones / "steps_000026"
+
+    lines = downstream_screen(f"initialization.milestone_path={single.as_posix()}", "downstream.task_name=walk", *EVALUATED)
+    expected = banner("Milestone directory", single, root)
+    assert lines[4].startswith("  Rendering device: ")
+    assert lines[:len(expected)] == expected[:4] + [lines[4]] + expected[5:]
+    rest = lines[len(expected):]
+    assert rest[:6] == ["Downstream batch: 1 milestone", "  Domain: walker; task: walk", "  Adaptation seed: 0",
+                        "  Milestones:", "  1. steps_000026 | 26 training env steps", ""]
+    assert rest[6] == "=== Milestone 1/1: steps_000026 ==="
+    assert check_block(rest[7:], root / "steps_000026/walk/seed_0", [3001, 3002]) == [""]  # nothing after the saved paths
+
+    # Evaluate-only: the same banner without the training budget, then only the evaluation.
+    lines = downstream_screen(f"initialization.milestone_path={single.as_posix()}", "downstream.task_name=walk",
+                              "downstream.mode=evaluate", *EVALUATED, "evaluation.seeds=[5,9]")
+    expected = banner("Milestone directory", single, root, training=False, seeds="2 seeds (5, 9)")
+    assert lines[:4] + lines[5:len(expected)] == expected[:4] + expected[5:]
+    rest = lines[len(expected):]
+    assert rest[:4] == ["Downstream batch: 1 milestone", "  Domain: walker; task: walk", "  Adaptation seed: 0",
+                        "  Mode: evaluate only (completed output)"]
+    assert rest[4:8] == ["  Milestones:", "  1. steps_000026 | 26 training env steps", "", "=== Milestone 1/1: steps_000026 ==="]
+    assert check_block(rest[8:], root / "steps_000026/walk/seed_0", [5, 9], training=False) == [""]
+
+    # Folder: one banner and plan; one block per milestone, a blank line between them; the children's
+    # output is not duplicated and no success summary follows the last saved paths.
+    lines = downstream_screen(f"initialization.milestones_dir={milestones.as_posix()}", "downstream.task_name=walk",
+                              "downstream.seed=1", *EVALUATED)
+    expected = banner("Milestones folder", milestones, root)
+    assert lines[:4] + lines[5:len(expected)] == expected[:4] + expected[5:]
+    rest = lines[len(expected):]
+    assert rest[:7] == ["Downstream batch: 2 milestones", "  Domain: walker; task: walk", "  Adaptation seed: 1", "  Milestones:",
+                        "  1. steps_000020 | 20 training env steps", "  2. steps_000026 | 26 training env steps", ""]
+    assert rest[7] == "=== Milestone 1/2: steps_000020 ==="
+    rest = check_block(rest[8:], root / "steps_000020/walk/seed_1", [3001, 3002])
+    assert rest[:2] == ["", "=== Milestone 2/2: steps_000026 ==="]
+    assert check_block(rest[2:], root / "steps_000026/walk/seed_1", [3001, 3002]) == [""]
+    assert sum(line == "Downstream task adaptation" for line in lines) == 1
+
+
+def test_evaluate_only_needs_only_the_saved_output_not_the_milestone(tmp_path):
+    """A completed output is evaluated after its source milestone and replay were moved away: the
+    banner comes from the output's config.yaml and summary.yaml; nothing reads the milestone."""
+    milestones = build_milestone(tmp_path).parent
+    single, root = milestones / "steps_000026", tmp_path / "run/downstream"
+    output = root / "steps_000026/walk/seed_0"
+    downstream_screen(f"initialization.milestone_path={single.as_posix()}", "downstream.task_name=walk", *TINY_DOWNSTREAM)
+    shutil.move(str(tmp_path / "run/milestones"), str(tmp_path / "moved_milestones"))
+    shutil.move(str(tmp_path / "run/dataset"), str(tmp_path / "moved_dataset"))
+    assert not single.exists() and (output / "summary.yaml").is_file()
+    trained = tree_hashes(output)
+
+    evaluate = [f"initialization.milestone_path={single.as_posix()}", "downstream.task_name=walk", "downstream.mode=evaluate",
+                *EVALUATED, "evaluation.seeds=[5,9]"]
+    lines = downstream_screen(*evaluate)
+    expected = banner("Milestone directory", single, root, training=False, seeds="2 seeds (5, 9)")
+    expected[2] += " (not found; evaluation uses the saved output)"
+    assert lines[:4] + lines[5:len(expected)] == expected[:4] + expected[5:]
+    rest = lines[len(expected):]
+    assert rest[:7] == ["Downstream batch: 1 milestone", "  Domain: walker; task: walk", "  Adaptation seed: 0",
+                        "  Mode: evaluate only (completed output)", "  Milestones:",
+                        "  1. steps_000026 | 26 training env steps", ""]  # recorded in summary.yaml
+    assert rest[7] == "=== Milestone 1/1: steps_000026 ==="
+    assert check_block(rest[8:], output, [5, 9], training=False) == [""]
+    assert {k: v for k, v in tree_hashes(output).items() if "evaluations" not in k} == trained  # outputs untouched
+
+    # Overwrite protection: the same policy and protocol again is refused, the file is unchanged.
+    (evaluation,) = (output / "evaluations").iterdir()
+    before = evaluation.read_bytes()
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    result = subprocess.run([sys.executable, str(ROOT / "src/downstream_main.py"), "common.devices=cpu", *evaluate],
+                            cwd=ROOT, capture_output=True, env=env)
+    assert result.returncode != 0 and b"already exists; not overwriting it" in result.stderr
+    assert evaluation.read_bytes() == before
+
+    # Historical metadata not in the summary is labelled, not guessed.
+    summary = yaml.safe_load((output / "summary.yaml").read_text(encoding="utf-8"))
+    del summary["milestone"]["collected_steps"]
+    (output / "summary.yaml").write_text(yaml.safe_dump(summary, sort_keys=False), encoding="utf-8")
+    lines = downstream_screen(*evaluate[:-1], "evaluation.seeds=[7]")
+    assert "  1. steps_000026 | training env steps not recorded in the saved output" in lines
+    assert check_block(lines[lines.index("=== Milestone 1/1: steps_000026 ===") + 1:], output, [7], training=False) == [""]
+
+    # No completed output: no banner, the existing error.
+    result = subprocess.run([sys.executable, str(ROOT / "src/downstream_main.py"), "common.devices=cpu", *evaluate,
+                             "downstream.seed=5"], cwd=ROOT, capture_output=True, env=env)
+    assert result.returncode != 0 and b"No completed downstream output" in result.stderr
+    assert b"Downstream task adaptation" not in result.stdout
+
+
+def test_folder_plan_singular_and_member_lines(tmp_path, capsys):
+    milestones = build_milestone(tmp_path).parent  # one milestone
+    cfg, folder, base, _ = folder_cfg(milestones, "downstream.seed=4", "initialization.member_index=0")
+    assert downstream_main.run_milestones(cfg, folder, base, run=FakeRun()) == 0
+    out = capsys.readouterr().out
+    assert f"  Milestones folder: {milestones.resolve()}\n" in out and "Milestone directory" not in out
+    assert ("  Evaluation: none after training (evaluation.after_training=false)\n" in out
+            and "Downstream batch: 1 milestone\n  Domain: walker; task: walk\n  Adaptation seed: 4\n  Milestones:\n"
+                "  1. steps_000026 | 26 training env steps\n\n=== Milestone 1/1: steps_000026 ===\n" in out)
+    assert "Ensemble member" not in out  # single-model milestone, member 0
+    assert out.endswith("=== Milestone 1/1: steps_000026 ===\n")  # the (fake) child printed nothing; no summary
+
 
 # ---------------------------------------------------------------- Gaussian H10 EMA-critic controller
 

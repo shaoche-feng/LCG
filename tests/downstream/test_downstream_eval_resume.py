@@ -1,6 +1,7 @@
 """Step 5 (part 2): real-task evaluation and faithful downstream checkpoint/resume."""
 from copy import deepcopy
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from downstream_trainer import (DownstreamTrainer, evaluate_policy, evaluate_sav
                                 recover_metrics_log)
 from envs import DMControlEnv
 from test_downstream_trainer import TINY_DOWNSTREAM, build_milestone, compose, tree_hashes
-from utils import rng_state
+from utils import configure_progress, rng_state
 
 RESUMABLE = [o for o in TINY_DOWNSTREAM if not o.startswith(("rew_end_model.training.steps", "actor_critic.training.steps"))]
 RESUMABLE += ["rew_end_model.training.steps=6", "actor_critic.training.steps=4", "checkpointing.every=2"]
@@ -172,7 +173,7 @@ def run_uninterrupted(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("crash", ["reward_phase", "phase_transition", "pmpo_phase"])
-def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, crash):
+def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, capsys, crash):
     full, full_rng, full_output = run_uninterrupted(tmp_path, monkeypatch)
     milestone = build_milestone(tmp_path / "split")
     sources = tree_hashes(tmp_path / "split/run/milestones", tmp_path / "split/run/dataset")
@@ -202,8 +203,15 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, crash):
     resumed = make(milestone, monkeypatch, resume=True)
     expected_phase = {"reward_phase": "rew_end_model", "phase_transition": "actor_critic", "pmpo_phase": "actor_critic"}
     assert resumed.phase == expected_phase[crash]
+    capsys.readouterr()
     output = resumed.run()
     resumed_rng = rng_state()
+    # Bars start at the restored counts; a phase completed before the crash gets none.
+    out = capsys.readouterr().out
+    starts = {desc: re.search(rf"{desc}: +\d+%\|[^|]*\| (\d+/\d+) ", out) for desc in ("Reward-predictor training", "Task-policy training")}
+    expected = {"reward_phase": ("2/6", "0/4"), "phase_transition": (None, "0/4"), "pmpo_phase": (None, "2/4")}[crash]
+    assert tuple(m and m[1] for m in starts.values()) == expected
+    assert out.rstrip("\n").rsplit("\n", 1)[-1] == f"Downstream outputs saved: > {output.resolve()}"
     if crash != "reward_phase":
         assert not reward_calls  # a resumed PMPO phase does not retrain the reward model
     identical(training_state(full), training_state(resumed), "final training state")
@@ -218,6 +226,29 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, crash):
         assert len(replayed) == len(set(replayed)) + 1  # update 3 logged before the crash and again
     assert any(r["phase"] == "resume" for r in all_rows)
     assert tree_hashes(tmp_path / "split/run/milestones", tmp_path / "split/run/dataset") == sources
+
+
+def test_terminal_output_changes_no_training_state_metrics_or_evaluation(tmp_path, monkeypatch, capsys):
+    """Presentation only: with progress output off, the same run ends in the same training state and
+    global RNG, writes the same metrics log and the same evaluation file."""
+    protocol = ["evaluation.after_training=true", "evaluation.seeds=[5,6]", "evaluation.max_steps=4"]
+    runs = {}
+    for mode in ("bar", "none"):
+        configure_progress(mode)
+        try:
+            trainer = make(build_milestone(tmp_path / mode), monkeypatch, protocol)
+            output = trainer.run()
+        finally:
+            configure_progress("bar")
+        (evaluation,) = (output / "evaluations").iterdir()
+        runs[mode] = (training_state(trainer), rng_state(), (output / "metrics.jsonl").read_bytes(), evaluation.name,
+                      evaluation.read_bytes())
+        out = capsys.readouterr().out
+        assert ("Task-policy training: 100%" in out) == (mode == "bar") and "Evaluation summary: max " in out
+        assert "episode_return" not in out and "seed 5" not in out  # no per-seed rows on screen
+    identical(runs["bar"][0], runs["none"][0], "training state")
+    identical(runs["bar"][1], runs["none"][1], "global RNG")
+    assert runs["bar"][2:] == runs["none"][2:]  # metrics.jsonl, evaluation file name and contents
 
 
 def test_interrupted_checkpoint_write_and_moved_run_folder(tmp_path, monkeypatch):

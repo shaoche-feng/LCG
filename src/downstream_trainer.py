@@ -21,7 +21,6 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 import yaml
 
 from agent import Agent
@@ -31,8 +30,8 @@ from data.milestone import downstream_output_dir, load_milestone, state_sha256
 from data.utils import make_task_reward_collate
 from envs import DMControlEnv, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from models.pmpo_beta import PMPOBeta, PMPOOptimizers, check_controller_state
-from utils import (check_same_packages, configure_opt, get_lr_sched, rng_state, save_atomically, set_rng_state,
-                   set_seed, source_identity)
+from utils import (Progress, check_same_packages, configure_opt, get_lr_sched, rng_state, save_atomically, say,
+                   set_rng_state, set_seed, source_identity)
 
 # Bumped when the checkpoint contents needed for faithful resume change. 2: milestone
 # replay content checksum (dataset.pt, which lists every episode file's checksum).
@@ -60,8 +59,7 @@ class DownstreamTrainer:
         set_seed(seed)  # downstream randomness comes only from its own seed
         torch.backends.cudnn.deterministic = True
         use_cuda = cfg.common.devices != "cpu" and torch.cuda.is_available()
-        self._device = torch.device("cuda", 0) if use_cuda else torch.device("cpu")
-        print(f"Starting on {self._device}")
+        self._device = torch.device("cuda", 0) if use_cuda else torch.device("cpu")  # reported by downstream_main
 
         # The exact milestone: validated denoiser, replay versions and task labels.
         # Ensemble milestones: one configured member (default 0) is the frozen denoiser.
@@ -140,25 +138,31 @@ class DownstreamTrainer:
     # ------------------------------------------------------------------ training
 
     def run(self) -> Path:
+        # Phases completed before a resume are skipped (no bar).
         if self.phase == "rew_end_model":
             self.train_reward_model()
         if self.phase == "actor_critic":
             self.train_policy()
         output_dir = self.save()
-        if self.cfg.evaluation.after_training:
-            result = evaluate_policy(self.agent.actor_critic, self.cfg.env.train, self.milestone.task_name,
-                                     self.cfg.evaluation.seeds, self.cfg.evaluation.max_steps)
-            save_evaluation(output_dir, result, self.agent.actor_critic.state_dict())
+        try:
+            if self.cfg.evaluation.after_training:
+                result = evaluate_policy(self.agent.actor_critic, self.cfg.env.train, self.milestone.task_name,
+                                         self.cfg.evaluation.seeds, self.cfg.evaluation.max_steps)
+                report_evaluation(result, save_evaluation(output_dir, result, self.agent.actor_critic.state_dict()))
+        finally:  # also when the evaluation fails: the published outputs stay
+            say(f"Downstream outputs saved: > {output_dir.resolve()}")
         return output_dir
 
     def train_reward_model(self) -> None:
         steps = self.cfg.rew_end_model.training.steps
         self.agent.rew_end_model.train()
-        with tqdm(total=steps, initial=self.num_updates["rew_end_model"], desc="Training rew_end_model (task reward)") as pbar:
-            while self.num_updates["rew_end_model"] < steps:
-                self.reward_model_update()
-                pbar.update(1)
-                self.maybe_checkpoint("rew_end_model", steps)
+        pbar = Progress(total=steps, initial=self.num_updates["rew_end_model"], desc="Reward-predictor training",
+                        unit="updates")
+        while self.num_updates["rew_end_model"] < steps:
+            self.reward_model_update()
+            pbar.update(1)
+            self.maybe_checkpoint("rew_end_model", steps)
+        pbar.close()
         # Frozen from here: PMPO only reads its predictions.
         self.agent.rew_end_model.requires_grad_(False).eval()
         self.phase = "actor_critic"
@@ -167,11 +171,12 @@ class DownstreamTrainer:
     def train_policy(self) -> None:
         steps = self.cfg.actor_critic.training.steps
         self.agent.actor_critic.train()
-        with tqdm(total=steps, initial=self.num_updates["actor_critic"], desc="Training actor_critic (PMPO, predicted task reward)") as pbar:
-            while self.num_updates["actor_critic"] < steps:
-                self.policy_update()
-                pbar.update(1)
-                self.maybe_checkpoint("actor_critic", steps)
+        pbar = Progress(total=steps, initial=self.num_updates["actor_critic"], desc="Task-policy training", unit="updates")
+        while self.num_updates["actor_critic"] < steps:
+            self.policy_update()
+            pbar.update(1)
+            self.maybe_checkpoint("actor_critic", steps)
+        pbar.close()
         self.phase = "done"
         self.save_checkpoint()
 
@@ -233,7 +238,6 @@ class DownstreamTrainer:
             yaml.safe_dump(summary, f, sort_keys=False)
         os.replace(self._work_dir, self.output_dir)
         shutil.rmtree(self.output_dir / "checkpoints", ignore_errors=True)  # training is complete
-        print(f"Downstream outputs: {self.output_dir}")
         return self.output_dir
 
     # ------------------------------------------------------------------ checkpoints
@@ -328,7 +332,7 @@ def recover_metrics_log(path: Path) -> Optional[Path]:
     tmp = path.with_suffix(".tmp")
     tmp.write_bytes(data[:len(data) - len(tail)])
     tmp.replace(path)
-    print(f"Recovered an interrupted metrics row into {recovery}")
+    say(f"Recovered an interrupted metrics row into {recovery}")
     return recovery
 
 
@@ -387,6 +391,7 @@ def evaluate_policy(model: PMPOBeta, env_cfg: DictConfig, task_name: str, seeds:
     modes = {name: module.training for name, module in model.named_modules()}  # mixed (e.g. frozen prior)
     model.eval()
     episodes = []
+    pbar = Progress(total=len(seeds), desc=f"Evaluation episodes (seeds {seed_span(seeds, '-')})", unit="ep")
     try:
         for seed in seeds:
             env = DMControlEnv(env_cfg.domain_name, [task_name], size=env_cfg.size, camera_id=env_cfg.camera_id,
@@ -406,7 +411,9 @@ def evaluate_policy(model: PMPOBeta, env_cfg: DictConfig, task_name: str, seeds:
                                      truncated=bool(truncated), step_limit=not (terminated or truncated)))
             finally:
                 env.close()
+            pbar.update(1)
     finally:
+        pbar.close()
         for name, module in model.named_modules():
             module.training = modes[name]
         set_rng_state(rng)
@@ -437,8 +444,22 @@ def save_evaluation(output_dir: Path, result: Dict[str, Any], policy_state: Dict
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.safe_dump(dict(result, policy_sha256_prefix=policy), f, sort_keys=False)
     tmp.replace(path)
-    print(f"Evaluation: mean return {result['return_mean']:.2f} over {len(result['seeds'])} seeds -> {path}")
     return path
+
+
+def seed_span(seeds: List[int], dash: str) -> str:
+    """Evaluation seeds as shown in the terminal: "3001-3030" for a consecutive run, else listed."""
+    seeds = [int(s) for s in seeds]
+    if len(seeds) > 1 and seeds == list(range(seeds[0], seeds[0] + len(seeds))):
+        return f"{seeds[0]}{dash}{seeds[-1]}"
+    return ", ".join(map(str, seeds))
+
+
+def report_evaluation(result: Dict[str, Any], path: Path) -> None:
+    """The terminal summary of an evaluation (per-seed returns stay in its file)."""
+    values = " | ".join(f"{name} {result[f'return_{name}']:.2f}" for name in ("max", "median", "mean", "min", "std"))
+    say(f"Evaluation summary: {values}")
+    say(f"Evaluation saved: > {Path(path).resolve()}")
 
 
 def evaluate_saved_output(cfg: DictConfig) -> Path:
@@ -458,4 +479,6 @@ def evaluate_saved_output(cfg: DictConfig) -> Path:
     model.load_state_dict(torch.load(output_dir / "actor_critic.pt", map_location=device, weights_only=False))
     model.to(device)
     result = evaluate_policy(model, saved.env.train, task_name, cfg.evaluation.seeds, cfg.evaluation.max_steps)
-    return save_evaluation(output_dir, result, model.state_dict())
+    path = save_evaluation(output_dir, result, model.state_dict())
+    report_evaluation(result, path)
+    return path

@@ -5,22 +5,28 @@ import shlex
 import subprocess
 import sys
 import time
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
+import yaml
 
-from data.milestone import discover_milestones, downstream_output_dir, load_milestone
-from downstream_trainer import DownstreamTrainer, evaluate_saved_output
-from utils import setup_visible_cuda_devices
+from data.milestone import discover_milestones, downstream_output_dir, load_milestone, milestone_members, read_manifest
+from device_report import device_lines
+from downstream_trainer import DownstreamTrainer, evaluate_saved_output, seed_span
+from utils import say, setup_visible_cuda_devices
 
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)  # replace: importable after another registration (tests)
 
 # Not passed on to a child run: the launcher-level milestone source and the mode (set per command).
 LAUNCHER_KEYS = ("initialization.milestones_dir", "initialization.milestone_path", "downstream.mode")
+# Set (to 1) in the environment of a folder launch's children, which then print only their milestone's
+# progress and results: the launcher prints the banner, plan and headings once. Terminal output only;
+# not part of the configuration, so saved configs and recovery commands are unaffected.
+BATCH_CHILD_ENV = "LCG_DOWNSTREAM_BATCH_CHILD"
 
 
 @hydra.main(config_path="../config", config_name="downstream", version_base="1.3")
@@ -29,12 +35,20 @@ def main(cfg: DictConfig) -> None:
     if mode not in ("train", "resume", "evaluate"):
         raise ValueError(f"downstream.mode must be train, resume or evaluate, got {mode!r}")
     milestones_dir = pop_milestones_dir(cfg)
+    setup_visible_cuda_devices(cfg.common.devices)  # children inherit it (and set the same value)
     if milestones_dir is not None:
         code = run_milestones(cfg, Path(milestones_dir), child_command_base(HydraConfig.get()))
         if code:
             raise SystemExit(code)
         return
-    setup_visible_cuda_devices(cfg.common.devices)
+    if os.environ.get(BATCH_CHILD_ENV) != "1":
+        path = Path(cfg.initialization.milestone_path)
+        # Evaluate-only needs only the completed output (its config, summary and policy), not the milestone.
+        info = saved_output_milestone(cfg, path) if mode == "evaluate" else read_manifest(path)
+        if info is not None:  # None: no completed output; evaluate_saved_output reports it
+            announce(cfg, "Milestone directory", path, [(path, info)])
+            say()
+            say(f"=== Milestone 1/1: {path.name} ===")
     if mode == "evaluate":
         evaluate_saved_output(cfg)
     else:
@@ -96,23 +110,23 @@ def run_milestones(cfg: DictConfig, milestones_dir: Path, base: List[str],
     task, seed = cfg.downstream.task_name, cfg.downstream.seed
     member = OmegaConf.select(cfg, "initialization.member_index", default=0)
     selected = preflight(milestones_dir, task, seed, member, base)
-
-    print(f"Downstream batch: {len(selected)} milestones from {milestones_dir}")
-    print(f"  task {task} | adaptation seed {seed} | member {member} | mode train | sequential, one process per milestone")
-    for i, (path, steps, output) in enumerate(selected, start=1):
-        print(f"  {i}. {path.name} ({steps:,} collected steps) -> {output}")
+    announce(cfg, "Milestones folder", milestones_dir, [(path, manifest) for path, manifest, _ in selected])
 
     results = []
-    for i, (path, steps, output) in enumerate(selected, start=1):
-        print(f"\n=== Downstream {i}/{len(selected)}: {path.name} ({steps:,} collected steps) ===", flush=True)
+    child_env = dict(os.environ, **{BATCH_CHILD_ENV: "1"})
+    for i, (path, manifest, output) in enumerate(selected, start=1):
+        say()
+        say(f"=== Milestone {i}/{len(selected)}: {path.name} ===")
         start = time.time()
-        code = run(milestone_command(base, path, "train")).returncode
+        code = run(milestone_command(base, path, "train"), env=child_env).returncode
         results.append((code, time.time() - start))
         if code != 0:
             break
+    if results[-1][0] == 0:  # each milestone's saved-path lines are the record of success
+        return 0
 
     print(f"\nDownstream batch summary (task {task}, adaptation seed {seed}):")
-    for i, (path, steps, output) in enumerate(selected):
+    for i, (path, manifest, output) in enumerate(selected):
         if i >= len(results):
             print(f"  {path.name}: not started")
             continue
@@ -122,9 +136,65 @@ def run_milestones(cfg: DictConfig, milestones_dir: Path, base: List[str],
         else:
             print(f"  {path.name}: FAILED (exit code {code}) after {seconds / 60:.1f} min; "
                   f"{failure_state(path, output, base)}")
-    failed = results[-1][0] != 0
-    print("Stopped at the failure; later milestones were not started." if failed else f"All {len(selected)} completed.")
-    return 1 if failed else 0
+    print("Stopped at the failure; later milestones were not started.", flush=True)
+    return 1
+
+
+def banner_device(cfg: DictConfig) -> torch.device:
+    """The trainer's compute device (DownstreamTrainer, evaluate_saved_output) under this configuration."""
+    return torch.device("cuda", 0) if cfg.common.devices != "cpu" and torch.cuda.is_available() else torch.device("cpu")
+
+
+def saved_output_milestone(cfg: DictConfig, path: Path) -> Optional[Dict[str, Any]]:
+    """Evaluate-only: the banner's milestone information from the completed output's saved config.yaml
+    (domain) and summary.yaml (recorded collected steps; None if not recorded), without reading the
+    milestone itself, which may have moved or been deleted. None if there is no completed output."""
+    output = downstream_output_dir(path, cfg.downstream.task_name, cfg.downstream.seed,
+                                   OmegaConf.select(cfg, "initialization.member_index", default=0))
+    if not (output / "summary.yaml").is_file() or not (output / "config.yaml").is_file():
+        return None
+    summary = yaml.safe_load((output / "summary.yaml").read_text(encoding="utf-8")) or {}
+    saved = OmegaConf.load(output / "config.yaml")
+    return dict(domain=saved.env.train.domain_name,
+                collected_steps=(summary.get("milestone") or {}).get("collected_steps"))
+
+
+def announce(cfg: DictConfig, label: str, source: Path, milestones: List[Tuple[Path, Dict[str, Any]]]) -> None:
+    """The banner and the batch plan, once per command: settings, verified devices (device_report:
+    physical GPUs by UUID, never from the process-local index) and the milestones in order. Reads
+    nothing itself: `milestones` holds each milestone's manifest, or for evaluate-only the
+    saved_output_milestone information (steps None: not recorded)."""
+    mode, task, seed, e = cfg.downstream.mode, cfg.downstream.task_name, cfg.downstream.seed, cfg.evaluation
+    member = OmegaConf.select(cfg, "initialization.member_index", default=0)
+    where = f"{Path(source).resolve()}" + ("" if Path(source).exists() else " (not found; evaluation uses the saved output)")
+    lines = ["=" * 78, "Downstream task adaptation", f"  {label}: {where}",
+             *(f"  {line}" for line in device_lines(banner_device(cfg)))]
+    if mode != "evaluate":
+        lines.append(f"  Training budget: {cfg.rew_end_model.training.steps:,} reward-predictor updates + "
+                     f"{cfg.actor_critic.training.steps:,} policy updates (per milestone)")
+    if mode == "evaluate" or e.after_training:
+        lines.append(f"  Evaluation: {plural(len(e.seeds), 'seed')} ({seed_span(e.seeds, '–')}) | "
+                     f"maximum {e.max_steps:,} steps per episode")
+    else:
+        lines.append("  Evaluation: none after training (evaluation.after_training=false)")
+    root = downstream_output_dir(milestones[0][0], task, seed, member).parents[2]  # <run>/downstream
+    lines += [f"  Output root: {root.resolve()}", "=" * 78, "",
+              f"Downstream batch: {plural(len(milestones), 'milestone')}",
+              f"  Domain: {', '.join(sorted({m['domain'] for _, m in milestones}))}; task: {task}",
+              f"  Adaptation seed: {seed}"]
+    if member or any(milestone_members(m) > 1 for _, m in milestones):
+        lines.append(f"  Ensemble member: {member}")
+    if mode != "train":
+        lines.append(f"  Mode: {dict(resume='resume from the checkpoint', evaluate='evaluate only (completed output)')[mode]}")
+    lines.append("  Milestones:")
+    lines += [f"  {i}. {path.name} | " + (f"{m['collected_steps']:,} training env steps" if m["collected_steps"] is not None
+                                          else "training env steps not recorded in the saved output")
+              for i, (path, m) in enumerate(milestones, start=1)]
+    say("\n".join(lines))
+
+
+def plural(n: int, noun: str) -> str:
+    return f"{n:,} {noun}{'' if n == 1 else 's'}"
 
 
 def failure_state(path: Path, output: Path, base: List[str]) -> str:
@@ -140,8 +210,9 @@ def failure_state(path: Path, output: Path, base: List[str]) -> str:
     return "no work folder was created"
 
 
-def preflight(milestones_dir: Path, task: str, seed: int, member: int, base: List[str]) -> List[Tuple[Path, int, Path]]:
-    """(milestone, collected steps, output folder) in collection order, after checking every
+def preflight(milestones_dir: Path, task: str, seed: int, member: int,
+              base: List[str]) -> List[Tuple[Path, Dict[str, Any], Path]]:
+    """(milestone, manifest, output folder) in collection order, after checking every
     milestone's files and task labels (load_milestone) and that no output or incomplete attempt
     exists for any of them, so nothing fails on these grounds after training has started."""
     problems, selected = [], []
@@ -157,7 +228,7 @@ def preflight(milestones_dir: Path, task: str, seed: int, member: int, base: Lis
         if work.exists():
             problems.append(f"{path.name}: incomplete downstream output {work} from an earlier attempt; delete it to "
                             f"rerun, or resume it with: {shell(milestone_command(base, path, 'resume'))}")
-        selected.append((path, manifest["collected_steps"], output))
+        selected.append((path, manifest, output))
     if problems:
         raise ValueError(f"Nothing was started. {len(problems)} problem(s) in {milestones_dir}:\n  " + "\n  ".join(problems))
     return selected

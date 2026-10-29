@@ -408,7 +408,7 @@ class Progress:
     Display only: phase timings in W&B are measured separately."""
 
     def __init__(self, iterable=None, total: Optional[int] = None, desc: str = "", unit: str = "steps",
-                 disable: bool = False) -> None:
+                 disable: bool = False, initial: int = 0) -> None:
         import sys
         from tqdm import tqdm
 
@@ -425,7 +425,7 @@ class Progress:
         bar_format = ("{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_text}]"
                       if total else "{desc}: {n_fmt} " + unit + " [{elapsed}, {rate_text}]")
         self._bar = Bar(iterable, total=total, desc=desc, unit=unit, bar_format=bar_format, file=sys.stdout,
-                        leave=True, dynamic_ncols=True, disable=disable)
+                        leave=True, dynamic_ncols=True, disable=disable, initial=initial)  # initial: resumed count
         if not disable:
             _terminal["blank"] = False
 
