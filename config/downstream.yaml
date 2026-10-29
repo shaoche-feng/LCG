@@ -44,6 +44,19 @@ common:
   devices: 0  # GPU index or cpu
   seed: ${downstream.seed}  # read by agent.actor_critic.seed
 
+# W&B: one run per milestone x task x adaptation seed x denoiser member (a folder launch starts one per child;
+# the launcher none). disabled (default) | offline | online. A resume continues the run named in the work
+# folder's wandb_run.json; evaluate-only adds to the output's run when it has one. Logging settings may
+# change on resume; they change no training.
+wandb:
+  mode: disabled
+  project: null
+  entity: null
+  name: null  # run-name prefix; null: the exploration run folder's name. Run: <prefix>-<milestone>-<task>-seed<s>[-member<k>]
+  group: null  # null: <prefix>-<task>-seed<s>[-member<k>] (all milestones of one exploration run, task and seed)
+  tags: null
+  notes: null
+
 world_model_env:
   _target_: envs.WorldModelEnvConfig
   horizon: 10  # imagination horizon of the Gaussian H10 EMA-critic controller (reference H10 runs)
@@ -73,6 +86,9 @@ evaluation:
 
 # Phase 1: reward/end model on the selected task's recorded rewards.
 rew_end_model:
+  # W&B diagnostics only (reward_model/train/debug/: loss_total, loss_end, grad_norm, prediction_mae);
+  # the end head is trained as before either way.
+  debug_metrics: false
   training:
     steps: 1000
     batch_size: 32

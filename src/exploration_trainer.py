@@ -24,7 +24,7 @@ from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
 from lcg import LCGLifecycle, selected_named_parameters
 from models.pmpo_beta import (PMPOOptimizers, check_controller_state, controller_settings, metric_path,
-                              summary_statistics)
+                              reward_statistics)
 from plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
 from laplace import LaplaceConfig, LaplaceEnsemble, LaplaceScorer
 from intrinsic_eval import aggregate, episode_record, IntrinsicEvaluator
@@ -691,12 +691,7 @@ class ExplorationTrainer(StateDictMixin):
             return {}
         metrics = {}
         for kind, values in (("raw", scorer.last_raw), ("scaled", scorer.last_scaled)):
-            values, prefix = values.float(), f"intrinsic_{kind}_reward"
-            metrics.update({f"{prefix}_mean": values.mean(), f"{prefix}_max": values.max()})
-            if self.agent.actor_critic.debug_metrics:
-                stats = summary_statistics(values, prefix)
-                metrics.update({k: v for k, v in stats.items() if not k.endswith(("_mean", "_max"))})
-                metrics[f"{prefix}_p99"] = torch.quantile(values.flatten(), 0.99)
+            metrics.update(reward_statistics(values, f"intrinsic_{kind}_reward", self.agent.actor_critic.debug_metrics))
         return metrics
 
     # ---------------------------------------------------------------- run logging (terminal, W&B)

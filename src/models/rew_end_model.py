@@ -32,6 +32,9 @@ class RewEndModel(nn.Module):
         if cfg.continuous_action_dim is None or cfg.continuous_action_dim < 1:
             raise ValueError("An environment-derived continuous action dimension is required")
         self.cfg = cfg
+        # Diagnostics only (set by the downstream trainer): also report the masked prediction MAE.
+        # Losses, updates and state are identical either way.
+        self.debug_metrics = False
 
         self.encoder = RewEndEncoder(2 * cfg.img_channels, cfg.cond_channels, cfg.depths, cfg.channels, cfg.attn_depths)
         self.act_emb = nn.Linear(cfg.continuous_action_dim, cfg.cond_channels)
@@ -91,10 +94,15 @@ class RewEndModel(nn.Module):
             "loss_rew": loss_rew.detach(),
             "loss_end": loss_end.detach(),
             "loss_total": loss.detach(),
+            # Over exactly the valid (unpadded) transitions of loss_rew.
+            "predicted_reward_mean": pred_rew.detach().mean(),
+            "target_reward_mean": target_rew.mean(),
             "confusion_matrix": {
                 "end": multiclass_confusion_matrix(logits_end, target_end, num_classes=2),
             },
         }
+        if self.debug_metrics:
+            metrics["prediction_mae"] = (pred_rew.detach() - target_rew).abs().mean()
         return loss, metrics
 
 

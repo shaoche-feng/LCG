@@ -15,7 +15,7 @@ from coroutines.frame_history import FrameHistory
 from downstream_trainer import (DownstreamTrainer, evaluate_policy, evaluate_saved_output, frame_tensor,
                                 recover_metrics_log)
 from envs import DMControlEnv
-from test_downstream_trainer import TINY_DOWNSTREAM, build_milestone, compose, tree_hashes
+from test_downstream_trainer import FakeWandb, TINY_DOWNSTREAM, build_milestone, compose, tree_hashes
 from utils import configure_progress, rng_state
 
 RESUMABLE = [o for o in TINY_DOWNSTREAM if not o.startswith(("rew_end_model.training.steps", "actor_critic.training.steps"))]
@@ -474,3 +474,134 @@ def test_resume_restores_the_slow_critic_and_refuses_another_controller_before_a
 
 def states_equal_modules(a, b):
     return all(torch.equal(x, y) for x, y in zip(a.state_dict().values(), b.state_dict().values()))
+
+
+# ---------------------------------------------------------------- W&B logging and resume
+
+def wandb_run(milestone, monkeypatch, fake, extra=(), resume=False):
+    monkeypatch.setattr(downstream_module, "wandb", fake)
+    return make(milestone, monkeypatch, ["wandb.mode=online", *extra], resume=resume)
+
+
+def test_logging_and_debug_flags_change_no_training(tmp_path, monkeypatch):
+    """W&B on with both debug flags versus W&B off: the same training state, global RNG, weights,
+    evaluation and metrics.jsonl values (debug adds keys only)."""
+    protocol = ["evaluation.after_training=true", "evaluation.seeds=[5,6]", "evaluation.max_steps=4"]
+    plain = make(build_milestone(tmp_path / "plain"), monkeypatch, protocol)
+    plain_output = plain.run()
+    plain_rng = rng_state()
+    logged = wandb_run(build_milestone(tmp_path / "logged"), monkeypatch, FakeWandb(),
+                       [*protocol, "rew_end_model.debug_metrics=true", "agent.actor_critic.debug_metrics=true"])
+    logged_output = logged.run()
+    logged_rng = rng_state()
+
+    a, b = training_state(plain), training_state(logged)
+    assert a["actor_critic"]["_extra_state"]["fixed_obs"] is None and b["actor_critic"]["_extra_state"]["fixed_obs"] is not None
+    for state in (a, b):
+        state["actor_critic"]["_extra_state"].pop("fixed_obs")
+    identical(a, b, "training state")
+    identical(plain_rng, logged_rng, "global RNG")
+    for name in ("rew_end_model.pt", "actor_critic.pt"):
+        x, y = (torch.load(o / name, weights_only=False) for o in (plain_output, logged_output))
+        for state in (x, y):
+            state.get("_extra_state", {}).pop("fixed_obs", None)
+        identical(x, y, name)
+    (a,), (b,) = (plain_output / "evaluations").iterdir(), (logged_output / "evaluations").iterdir()
+    assert a.name == b.name and a.read_bytes() == b.read_bytes()
+    plain_rows, logged_rows = (last_rows(o / "metrics.jsonl")[0] for o in (plain_output, logged_output))
+    assert plain_rows.keys() == logged_rows.keys()
+    for key, row in plain_rows.items():
+        assert all(logged_rows[key][k] == v for k, v in row.items()), key  # debug adds keys, changes none
+        assert set(logged_rows[key]) > set(row)
+
+
+@pytest.mark.parametrize("server", ["equal", "lost_rows", "beyond_checkpoint", "beyond_mismatch", "beyond_unverified",
+                                    "offline"])
+def test_resume_continues_the_wandb_run_without_duplicate_updates(tmp_path, monkeypatch, capsys, server):
+    """A crash at PMPO update 3 (checkpoint at 2: 6 + 2 = 8 committed rows) and a resume. Whatever the
+    server kept, every update appears once in the run, with the uninterrupted run's values."""
+    reference = FakeWandb()
+    wandb_run(build_milestone(tmp_path / "full"), monkeypatch, reference).run()
+    milestone = build_milestone(tmp_path / "split")
+    original = DownstreamTrainer.policy_update
+
+    def crash(self):
+        original(self)
+        if self.num_updates["actor_critic"] == 3:
+            raise Crash()
+
+    first = FakeWandb()
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", crash)
+    with pytest.raises(Crash):
+        wandb_run(milestone, monkeypatch, first).run()
+    assert [s for s, _ in first.logged] == list(range(9)) and first.summary["status"] == "failed" and first.finished == [1]
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", original)
+    if server in ("beyond_mismatch", "beyond_unverified"):
+        # The interrupted segment's local record of PMPO update 3 (W&B step 8, on the server): changed (as if
+        # the replay came out differently) or missing (cut by the crash).
+        log = tmp_path / "split/run/downstream/steps_000026/walk/.seed_0.tmp/metrics.jsonl"
+        rows = [json.loads(line) for line in log.read_text().splitlines()]
+        assert (rows[-1]["phase"], rows[-1]["update"]) == ("actor_critic", 3)
+        if server == "beyond_mismatch":
+            rows[-1]["loss_actor"] += 1.0
+        else:
+            rows.pop()
+        log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    capsys.readouterr()
+
+    held = dict(equal=8, lost_rows=5, beyond_checkpoint=9, beyond_mismatch=9, beyond_unverified=9, offline=0)[server]
+    second = FakeWandb(starting_step=held, offline=server == "offline", summary=dict(status="running"))
+    output = wandb_run(milestone, monkeypatch, second, resume=True).run()
+    assert second.inits[0]["id"] == "dsrun1" and second.inits[0]["resume"] == "allow"  # the same run
+    event = second.summary["resume"]
+    assert (event["committed_rows"], event["previous_status"], event["count"]) == (8, "running", 1)
+
+    server_rows = {s: r for s, r in first.logged if s < held} if server != "offline" else {}
+    combined = dict(server_rows)
+    for step, row in second.logged:
+        if server != "offline":
+            assert step not in combined, f"step {step} logged twice"
+        combined[step] = row
+    expected = {s: r for s, r in reference.logged if server != "offline" or s >= 8}  # offline: this segment's rows
+    assert combined == expected  # every update once, with the uninterrupted run's values
+    if server == "lost_rows":
+        assert event["backfilled_rows"] == 3 and [s for s, _ in second.logged[:3]] == [5, 6, 7]
+    out = capsys.readouterr().out
+    if server.startswith("beyond"):  # the replayed update is compared, never logged twice
+        outcome = dict(beyond_checkpoint="matched", beyond_mismatch="mismatched", beyond_unverified="unverified")[server]
+        assert event["server_rows_beyond_checkpoint"] == 1
+        assert {k: v for k, v in event.items() if k.startswith("replayed_")} == {f"replayed_{outcome}": 1}
+        assert 8 not in [s for s, _ in second.logged]
+    warning = "W&B warning: replayed actor_critic update 3 (W&B step 8) differs from the value the interrupted segment sent"
+    assert (warning in out) == (server == "beyond_mismatch")
+    if server == "offline":
+        assert "nothing backfilled" in event["note"] and [s for s, _ in second.logged][0] == 8
+    assert second.summary["status"] == "completed" and json.loads((output / "wandb_run.json").read_text())["id"] == "dsrun1"
+
+
+def test_resume_of_a_run_without_wandb_starts_one_and_backfills_its_committed_updates(tmp_path, monkeypatch):
+    """Legacy: a checkpoint written without W&B (and metrics rows without the new reward keys)."""
+    milestone = build_milestone(tmp_path)
+    original = DownstreamTrainer.policy_update
+
+    def crash(self):
+        original(self)
+        if self.num_updates["actor_critic"] == 3:
+            raise Crash()
+
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", crash)
+    with pytest.raises(Crash):
+        make(milestone, monkeypatch).run()
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", original)
+    work = tmp_path / "run/downstream/steps_000026/walk/.seed_0.tmp"
+    path = work / "metrics.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in rows:  # as written before these keys existed
+        for key in ("predicted_reward_mean", "target_reward_mean", "task_reward_mean", "task_reward_max"):
+            row.pop(key, None)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    fake = FakeWandb()
+    wandb_run(milestone, monkeypatch, fake, resume=True).run()
+    event = fake.summary["resume"]
+    assert event["previous_status"] == "no earlier W&B run" and event["backfilled_rows"] == 8
+    assert [s for s, _ in fake.logged] == list(range(10))  # 8 committed rows backfilled, then PMPO updates 3 and 4

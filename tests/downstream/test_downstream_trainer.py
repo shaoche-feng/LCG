@@ -1,11 +1,13 @@
 """Step 5 (first increment): downstream reward-model and PMPO training on a frozen milestone."""
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -779,6 +781,294 @@ def test_folder_plan_singular_and_member_lines(tmp_path, capsys):
     assert "Ensemble member" not in out  # single-model milestone, member 0
     assert out.endswith("=== Milestone 1/1: steps_000026 ===\n")  # the (fake) child printed nothing; no summary
 
+
+# ---------------------------------------------------------------- W&B logging (fake W&B module)
+
+class FakeWandb:
+    """Stands in for the wandb module of downstream_trainer: init kwargs, axes, (step, row) logs, summary
+    and finish codes. starting_step and summary model what the W&B server holds for a resumed run."""
+
+    def __init__(self, run_id="dsrun1", starting_step=0, offline=False, summary=None):
+        self.run, self.run_id, self.starting_step, self.offline = None, run_id, starting_step, offline
+        self.inits, self.metrics, self.hidden, self.logged, self.finished = [], [], [], [], []
+        self.summary = dict(summary or {})
+
+    def Settings(self, **kwargs):
+        return SimpleNamespace(**kwargs)
+
+    def init(self, **kwargs):
+        self.inits.append(kwargs)
+        self.run = SimpleNamespace(id=kwargs.get("id") or self.run_id, project=kwargs.get("project"),
+                                   entity=kwargs.get("entity"), name=kwargs.get("name"), group=kwargs.get("group"),
+                                   url=f"https://wandb.test/{kwargs.get('id') or self.run_id}",
+                                   starting_step=self.starting_step, offline=self.offline)
+
+    def define_metric(self, name, step_metric=None, hidden=None):
+        self.metrics.append((name, step_metric))
+        if hidden:
+            self.hidden.append(name)
+
+    def log(self, row, step=None):
+        self.logged.append((step, dict(row)))
+
+    def finish(self, exit_code=0):
+        self.finished.append(exit_code)
+        self.run = None
+
+
+ONLINE = ["wandb.mode=online", "wandb.project=test-project"]
+REWARD_DEBUG_KEYS = {f"reward_model/train/debug/{k}" for k in ("loss_total", "loss_end", "grad_norm", "prediction_mae")}
+
+
+def downstream_ac_keys(ac_schema, action_dim, debug):
+    """The downstream actor_critic/train/ keys: the accepted exploration schema without the advantage-weight
+    statistics (sign-only PMPO) and intrinsic rewards, with the predicted task rewards instead."""
+    keys = {k for k in ac_schema(action_dim, debug) if not k.startswith(("weights/", "intrinsic/", "debug/weight_",
+                                                                        "debug/intrinsic_"))}
+    keys |= {"task_reward/reward_mean", "task_reward/reward_max"}
+    if debug:
+        keys |= {f"debug/task_reward_{s}" for s in ("std", "min", "p10", "median", "p90", "p99")}
+    return {f"actor_critic/train/{k}" for k in keys}
+
+
+def logged_run(milestone, monkeypatch, *extra, fake=None):
+    fake = fake or FakeWandb()
+    monkeypatch.setattr(downstream_module, "wandb", fake)
+    trainer = make_trainer(milestone, monkeypatch, extra=[*ONLINE, *extra])
+    output = trainer.run()
+    return trainer, output, fake
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, debug):
+    milestone = build_milestone(tmp_path)
+    flags = [f"rew_end_model.debug_metrics={debug}", f"agent.actor_critic.debug_metrics={debug}"]
+    trainer, output, fake = logged_run(milestone, monkeypatch, *flags, "evaluation.after_training=true",
+                                       "evaluation.seeds=[3001,3002,3005]", "evaluation.max_steps=3")
+    steps = [step for step, _ in fake.logged]
+    assert steps == list(range(4 + 3 + 1))  # one row per update (reward model, then PMPO), then the evaluation
+    reward, policy, (evaluation,) = [r for _, r in fake.logged[:4]], [r for _, r in fake.logged[4:7]], [r for _, r in fake.logged[7:]]
+
+    reward_keys = {f"reward_model/train/core/{k}" for k in ("loss_reward", "predicted_reward_mean", "target_reward_mean",
+                                                             "num_updates")} | (REWARD_DEBUG_KEYS if debug else set())
+    assert all(set(r) == reward_keys for r in reward) and [r[downstream_module.REWARD_AXIS] for r in reward] == [1, 2, 3, 4]
+    ac_keys = downstream_ac_keys(ac_schema, 6, debug)
+    assert len(ac_keys) == (132 if debug else 39)
+    assert all(set(r) == ac_keys for r in policy) and [r[downstream_module.POLICY_AXIS] for r in policy] == [1, 2, 3]
+    published = set().union(*map(set, (r for _, r in fake.logged)))
+    assert {k.split("/", 1)[0] for k in published} == {"reward_model", "actor_critic", "eval", "exploration"}
+    assert not any("intrinsic" in k or "weights/" in k or "weight_" in k for k in published)
+
+    # loss_reward is loss_rew (the reward MSE), not loss_total; values equal metrics.jsonl's.
+    rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+    assert [r["reward_model/train/core/loss_reward"] for r in reward] == [r["loss_rew"] for r in rows[:4]]
+    assert all(r["loss_rew"] != r["loss_total"] for r in rows[:4])
+    if debug:
+        assert [r["reward_model/train/debug/grad_norm"] for r in reward] == [r["grad_norm_before_clip"] for r in rows[:4]]
+
+    # Evaluation: one point at the milestone's recorded data budget; seed keys from the configured seeds.
+    (file,) = (output / "evaluations").iterdir()
+    saved = OmegaConf.to_container(OmegaConf.load(file))
+    assert evaluation == {**{f"eval/seed_{e['seed']}/return": e["episode_return"] for e in saved["episodes"]},
+                          **{f"eval/return_{k}": saved[f"return_{k}"] for k in ("max", "median", "mean", "min", "std")},
+                          "exploration/train_env_steps": 26}
+    assert sorted(k for k in evaluation if k.startswith("eval/seed_")) == [f"eval/seed_{s}/return" for s in (3001, 3002, 3005)]
+
+    # Axes: reward and evaluation axes hidden; groups on their axes.
+    assert fake.metrics == [(downstream_module.REWARD_AXIS, None), ("reward_model/train/*", downstream_module.REWARD_AXIS),
+                            (downstream_module.POLICY_AXIS, None), ("actor_critic/train/*", downstream_module.POLICY_AXIS),
+                            ("exploration/train_env_steps", None), ("eval/*", "exploration/train_env_steps")]
+    assert fake.hidden == [downstream_module.REWARD_AXIS, "exploration/train_env_steps"]
+
+    # Run identity, names and provenance; status; the identity file travels with the output.
+    (init,) = fake.inits
+    assert (init["name"], init["group"], init["job_type"], init["mode"]) == (
+        "run-steps_000026-walk-seed0", "run-walk-seed0", "adaptation", "online")
+    provenance = init["config"]["provenance"]
+    assert provenance["exploration"]["method"] == "not recorded" and provenance["exploration"]["collection_mode"] == "uniform"
+    assert provenance["exploration"]["seed"].startswith("not recorded")
+    assert provenance["milestone"]["collected_steps"] == 26 and provenance["denoiser_member"]["index"] == 0
+    assert provenance["milestone"]["replay_sha256"] == trainer.milestone.manifest["files"]["dataset"]["sha256"]
+    assert provenance["denoiser_member"]["sha256"] == OmegaConf.load(output / "summary.yaml").milestone.member_sha256
+    assert provenance["controller"]["actor_objective"] == {"mode": "sign"} and provenance["evaluation"]["seeds"] == [3001, 3002, 3005]
+    assert json.loads((output / "wandb_run.json").read_text())["id"] == "dsrun1"
+    assert fake.summary["status"] == "completed" and fake.finished == [0]
+    assert fake.summary[f"evaluations/{file.stem}"]["kind"] == "after_training"
+
+
+def test_reward_statistics_use_the_masked_transitions_and_task_rewards_pmpo_used(tmp_path, monkeypatch):
+    trainer = make_trainer(build_milestone(tmp_path), monkeypatch)
+    model = trainer.agent.rew_end_model
+    model.debug_metrics = True
+    batch = next(trainer._reward_batches)
+    mask = batch.mask_padding[:, :-1]
+    assert not mask.all()  # the windows reach beyond episode ends: padding to exclude
+    with torch.no_grad():
+        _, metrics = model(batch)
+        pred, _, _ = model.predict_rew_end(batch.obs[:, :-1], batch.act[:, :-1], batch.obs[:, 1:])
+    pred, target = pred[mask], batch.rew[:, :-1][mask]
+    torch.testing.assert_close(metrics["loss_rew"], ((pred - target) ** 2).mean())
+    torch.testing.assert_close(metrics["predicted_reward_mean"], pred.mean())
+    torch.testing.assert_close(metrics["target_reward_mean"], target.mean())
+    torch.testing.assert_close(metrics["prediction_mae"], (pred - target).abs().mean())
+    model.debug_metrics = False
+    assert "prediction_mae" not in model(batch)[1]  # skipped when off
+
+    # Task rewards: exactly the tensor PMPO gave the lambda returns.
+    import models.pmpo_beta as pmpo_module
+    given, original = [], pmpo_module.compute_lambda_returns
+    monkeypatch.setattr(pmpo_module, "compute_lambda_returns", lambda rew, *a: given.append(rew.clone()) or original(rew, *a))
+    trainer.agent.actor_critic.debug_metrics = True
+    trainer.phase = "actor_critic"
+    trainer.policy_update()
+    row = json.loads((trainer._work_dir / "metrics.jsonl").read_text().splitlines()[-1])
+    (rew,) = given
+    assert rew.shape == (2, 2)  # batch x horizon, every imagined step
+    assert row["task_reward_mean"] == pytest.approx(rew.mean().item()) and row["task_reward_max"] == pytest.approx(rew.max().item())
+    assert row["task_reward_p99"] == pytest.approx(torch.quantile(rew.flatten(), 0.99).item())
+    assert row["task_reward_median"] == pytest.approx(torch.quantile(rew.flatten(), 0.5).item())
+
+
+def test_each_milestone_gets_its_own_run_and_the_folder_launcher_none(tmp_path, monkeypatch):
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    runs = []
+    for name in ("steps_000020", "steps_000026"):
+        fake = FakeWandb(run_id=f"id-{name}")
+        logged_run(milestones / name, monkeypatch, fake=fake)
+        runs.append((fake.inits[0]["name"], fake.inits[0]["group"], json.loads(
+            (tmp_path / f"run/downstream/{name}/walk/seed_0/wandb_run.json").read_text())["id"]))
+    assert runs == [("run-steps_000020-walk-seed0", "run-walk-seed0", "id-steps_000020"),
+                    ("run-steps_000026-walk-seed0", "run-walk-seed0", "id-steps_000026")]
+    # The launcher never touches W&B; its children keep the W&B settings (each starts its own run).
+    def no_parent_run(**kwargs):
+        raise AssertionError("the folder launcher started a W&B run")
+    monkeypatch.setattr(downstream_module.wandb, "init", no_parent_run)
+    cfg, folder, base, _ = folder_cfg(milestones, "downstream.seed=1", *ONLINE)
+    run = FakeRun()
+    assert downstream_main.run_milestones(cfg, folder, base, run=run) == 0
+    assert len(run.commands) == 2 and all({"wandb.mode=online", "wandb.project=test-project"} <= set(c) for c in run.commands)
+
+
+def test_evaluate_only_adds_to_the_adaptation_run_without_the_milestone(tmp_path, monkeypatch):
+    milestone = build_milestone(tmp_path)
+    trainer, output, first = logged_run(milestone, monkeypatch, "evaluation.after_training=true",
+                                        "evaluation.seeds=[3001,3002]", "evaluation.max_steps=3")
+    shutil.move(str(tmp_path / "run/milestones"), str(tmp_path / "moved_milestones"))
+    shutil.move(str(tmp_path / "run/dataset"), str(tmp_path / "moved_dataset"))
+    cfg = compose("downstream", [f"initialization.milestone_path={milestone.as_posix()}", "downstream.task_name=walk",
+                                 "downstream.mode=evaluate", *TINY_DOWNSTREAM, *ONLINE, "evaluation.seeds=[5,9]",
+                                 "evaluation.max_steps=3"])
+    fake = FakeWandb(starting_step=8)
+    monkeypatch.setattr(downstream_module, "wandb", fake)
+    path = downstream_module.evaluate_saved_output(cfg)
+    (init,) = fake.inits
+    assert init["id"] == "dsrun1" and init["resume"] == "allow"  # the adaptation run
+    ((step, row),) = fake.logged
+    saved = OmegaConf.to_container(OmegaConf.load(path))
+    assert step == 8 and row["exploration/train_env_steps"] == 26 and row["eval/seed_9/return"] == saved["episodes"][1]["episode_return"]
+    assert fake.summary[f"evaluations/{path.stem}"]["kind"] == "evaluate_only" and fake.finished == [0]
+    with pytest.raises(FileExistsError, match="not overwriting"):  # local overwrite protection unchanged
+        downstream_module.evaluate_saved_output(cfg)
+
+    # An output without a W&B identity (e.g. trained with W&B off): a new, labelled evaluate-only run.
+    (output / "wandb_run.json").unlink()
+    cfg.evaluation.seeds = [7]
+    fake = FakeWandb(run_id="evalonly")
+    monkeypatch.setattr(downstream_module, "wandb", fake)
+    downstream_module.evaluate_saved_output(cfg)
+    (init,) = fake.inits
+    assert "id" not in init and init["job_type"] == "evaluate-only" and init["name"] == "run-steps_000026-walk-seed0-evaluate-only"
+    assert init["config"]["provenance"]["exploration"]["method"] == "not recorded in the saved output"
+    assert init["config"]["provenance"]["milestone"]["collected_steps"] == 26
+    assert fake.logged[0][0] == 7 + 2  # after the training updates and the two earlier evaluation files
+
+
+
+class EvaluationFailure(Exception):
+    pass
+
+
+def failing_evaluation(monkeypatch):
+    def fail(*args, **kwargs):
+        raise EvaluationFailure("evaluation crashed")
+    monkeypatch.setattr(downstream_module, "evaluate_policy", fail)
+
+
+def evaluate_only_cfg(milestone, *extra):
+    return compose("downstream", [f"initialization.milestone_path={milestone.as_posix()}", "downstream.task_name=walk",
+                                  "downstream.mode=evaluate", *TINY_DOWNSTREAM, *ONLINE, "evaluation.max_steps=3", *extra])
+
+
+def history(summary):
+    return [v for k, v in sorted(summary.items()) if k.startswith("status_history/")]
+
+
+def test_evaluate_only_status_after_a_failed_final_evaluation_of_an_adaptation_run(tmp_path, monkeypatch):
+    """The adaptation run's final evaluation fails (outputs published, run failed); evaluate-only fails
+    once more, then succeeds: the run ends completed with the evaluation, both failures kept as history."""
+    milestone = build_milestone(tmp_path)
+    original = downstream_module.evaluate_policy
+    failing_evaluation(monkeypatch)
+    first = FakeWandb()
+    monkeypatch.setattr(downstream_module, "wandb", first)
+    trainer = make_trainer(milestone, monkeypatch, extra=[*ONLINE, "evaluation.after_training=true",
+                                                          "evaluation.seeds=[3001,3002]", "evaluation.max_steps=3"])
+    with pytest.raises(EvaluationFailure):
+        trainer.run()
+    output = tmp_path / "run/downstream/steps_000026/walk/seed_0"
+    assert (output / "summary.yaml").is_file() and not (output / "evaluations").exists()
+    assert (first.summary["status"], first.summary["activity"], first.finished) == ("failed", "adaptation", [1])
+    assert "evaluation crashed" in first.summary["error"]
+
+    # Evaluate-only fails too (the server's summary is the first run's): failed again, the earlier one is history.
+    second = FakeWandb(starting_step=7, summary=first.summary)
+    monkeypatch.setattr(downstream_module, "wandb", second)
+    with pytest.raises(EvaluationFailure):
+        downstream_module.evaluate_saved_output(evaluate_only_cfg(milestone, "evaluation.seeds=[3001,3002]"))
+    assert second.inits[0]["id"] == "dsrun1" and second.finished == [1] and not second.logged
+    assert (second.summary["status"], second.summary["activity"]) == ("failed", "evaluate_only")
+    assert history(second.summary) == [dict(status="failed", activity="adaptation", error=first.summary["error"])]
+
+    # The retry succeeds: completed, the evaluation recorded, no current error, both failures in the history.
+    monkeypatch.setattr(downstream_module, "evaluate_policy", original)
+    third = FakeWandb(starting_step=7, summary=second.summary)
+    monkeypatch.setattr(downstream_module, "wandb", third)
+    path = downstream_module.evaluate_saved_output(evaluate_only_cfg(milestone, "evaluation.seeds=[3001,3002]"))
+    assert (third.summary["status"], third.summary["activity"], third.finished) == ("completed", "evaluate_only", [0])
+    assert "error" not in third.summary
+    assert [h["activity"] for h in history(third.summary)] == ["adaptation", "evaluate_only"]
+    ((step, row),) = third.logged
+    assert step == 7 and row["exploration/train_env_steps"] == 26 and set(row) >= {"eval/seed_3001/return", "eval/return_mean"}
+    assert third.summary[f"evaluations/{path.stem}"]["kind"] == "evaluate_only"
+
+    # The same policy and protocol again: refused before anything runs; W&B is not touched.
+    fourth = FakeWandb(summary=third.summary)
+    monkeypatch.setattr(downstream_module, "wandb", fourth)
+    with pytest.raises(FileExistsError, match="not overwriting"):
+        downstream_module.evaluate_saved_output(evaluate_only_cfg(milestone, "evaluation.seeds=[3001,3002]"))
+    assert not fourth.inits
+
+
+def test_standalone_evaluate_only_run_status(tmp_path, monkeypatch):
+    """An output without a W&B identity: each evaluate-only is its own run, running then failed or completed."""
+    milestone = build_milestone(tmp_path)
+    make_trainer(milestone, monkeypatch).run()  # W&B off: no wandb_run.json
+    original = downstream_module.evaluate_policy
+    failing_evaluation(monkeypatch)
+    failed = FakeWandb(run_id="standalone1")
+    monkeypatch.setattr(downstream_module, "wandb", failed)
+    with pytest.raises(EvaluationFailure):
+        downstream_module.evaluate_saved_output(evaluate_only_cfg(milestone, "evaluation.seeds=[5]"))
+    assert failed.inits[0]["job_type"] == "evaluate-only" and "id" not in failed.inits[0]
+    assert (failed.summary["status"], failed.summary["activity"], failed.finished) == ("failed", "evaluate_only", [1])
+    assert "evaluation crashed" in failed.summary["error"] and not failed.logged
+
+    monkeypatch.setattr(downstream_module, "evaluate_policy", original)
+    retry = FakeWandb(run_id="standalone2")
+    monkeypatch.setattr(downstream_module, "wandb", retry)
+    downstream_module.evaluate_saved_output(evaluate_only_cfg(milestone, "evaluation.seeds=[5]"))
+    assert (retry.summary["status"], retry.summary["activity"], retry.finished) == ("completed", "evaluate_only", [0])
+    assert "error" not in retry.summary and not history(retry.summary) and len(retry.logged) == 1
 
 # ---------------------------------------------------------------- Gaussian H10 EMA-critic controller
 

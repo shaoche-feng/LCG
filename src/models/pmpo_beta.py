@@ -96,6 +96,8 @@ DISTRIBUTION_GROUPS = dict(tanh_gaussian="gaussian", beta="beta")
 # Renamed in their groups: flat model name -> path within actor_critic/train/.
 RENAMED_METRICS = {"weight_clipped_fraction_positive": "weights/clipped_fraction_positive",
                    "weight_clipped_fraction_negative": "weights/clipped_fraction_negative",
+                   # Downstream: the predicted task rewards of the last update (exploration logs intrinsic/).
+                   "task_reward_mean": "task_reward/reward_mean", "task_reward_max": "task_reward/reward_max",
                    **{f"intrinsic_{kind}_reward_{stat}": f"intrinsic/{kind}_reward_{stat}"
                       for kind in ("raw", "scaled") for stat in ("mean", "max")}}
 
@@ -196,6 +198,18 @@ def summary_statistics(values, prefix):
     return {f"{prefix}_{name}": value for name, value in
             zip(("mean", "std", "min", "max", "p10", "median", "p90"),
                 (values.mean(), values.std(unbiased=False), values.min(), values.max(), *quantiles))}
+
+
+def reward_statistics(values, prefix, debug=False):
+    """Per imagined step of one PMPO update: <prefix>_mean and _max; with debug also _std, _min, _p10,
+    _median, _p90 and _p99 (exploration: intrinsic rewards; downstream: predicted task rewards)."""
+    values = values.detach().float()
+    metrics = {f"{prefix}_mean": values.mean(), f"{prefix}_max": values.max()}
+    if debug:
+        stats = summary_statistics(values, prefix)
+        metrics.update({k: v for k, v in stats.items() if not k.endswith(("_mean", "_max"))})
+        metrics[f"{prefix}_p99"] = torch.quantile(values.flatten(), 0.99)
+    return metrics
 
 
 ACTOR_OBJECTIVES = ("sign", "advantage_weighted")
@@ -314,6 +328,7 @@ class PMPOBeta(nn.Module):
         # Logging only (not a controller setting): the PMPO diagnostic mode turns it on.
         self.debug_metrics = bool(cfg.debug_metrics)
         self.intrinsic_reward_fn = None
+        self.last_reward = None  # the last update's rewards as given to the lambda returns (a reference; logging only)
         self.scoring_timer: Optional[RegionTimer] = None  # monitoring only: time in intrinsic_reward_fn
         self.rl_env = None
         self._fixed_obs = None
@@ -495,6 +510,7 @@ class PMPOBeta(nn.Module):
         if self.intrinsic_reward_fn is not None:
             with timed(self.scoring_timer):
                 rew = self.intrinsic_reward_fn(infos, rew).detach()
+        self.last_reward = rew.detach()
         targets = compute_lambda_returns(rew, end, trunc, bootstrap, c.gamma, c.lambda_)
         advantage = targets - old_values
         flat_obs = obs.flatten(0, 1).detach()
