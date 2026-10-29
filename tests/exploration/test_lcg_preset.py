@@ -88,7 +88,9 @@ def test_trainer_policy_reward_is_raw_lcg_over_the_fixed_divisor(tmp_path, monke
         assert row["actor_critic/train/intrinsic/scaled_reward_mean"] == reward.float().mean()
         assert row["actor_critic/train/intrinsic/scaled_reward_max"] == reward.float().max()
         assert not any("/debug/" in k for k in row)  # distribution detail only with debug metrics
-    assert any("timing/lcg_scoring_seconds" in row and "timing/pmpo_update_seconds" in row for row in logs)
+    # Canonical timing only: the per-update PMPO time; LCG's own timers run but are not logged.
+    assert any("timing/pmpo_seconds_per_update" in row for row in logs) and trainer._lcg_lifecycle.scoring_seconds > 0
+    assert not any(k.startswith(("timing/lcg_", "lcg/")) or k == "timing/pmpo_update_seconds" for row in logs for k in row)
 
 
 def test_resume_refuses_switched_reward_scaling(tmp_path, monkeypatch):

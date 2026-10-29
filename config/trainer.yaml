@@ -22,7 +22,7 @@ wandb:
 # Exploration terminal output (configs without this section use these values).
 logging:
   progress: bar  # bar: standard tqdm bars (phase, %, counts, elapsed, remaining, rate); none: no progress output
-  epoch_summary: true  # one epoch_summary/* W&B row per epoch (not shown on the terminal)
+  epoch_summary: true  # one W&B row per epoch with the progress/* counters and timing/* (not shown on the terminal)
   # Mirror every W&B row to wandb_history.jsonl in the run folder; a resume re-logs committed rows
   # the W&B server never received (e.g. a hard crash that also killed the upload process).
   local_history: true

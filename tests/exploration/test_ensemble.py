@@ -116,10 +116,15 @@ def test_members_are_independent_and_train_their_own_schedule(tmp_path, monkeypa
         assert {id(p) for g in o.param_groups for p in g["params"]} == {id(p) for p in m.parameters()}
     # Per-member schedule: 2 (first epoch) + 1 + 1 updates each; member 0 also counts as denoiser.
     assert trainer.ensemble.updates == [3, 3, 3] and trainer.num_batch_train.denoiser == 3
-    rows = [r for r in logs if "ensemble/total_denoiser_updates" in r]
-    assert rows[-1]["ensemble/total_denoiser_updates"] == 9
-    assert all(f"timing/denoiser_member_{k}_seconds" in rows[-1] for k in range(3))
-    assert any("denoiser/member_2/train/loss_denoising" in r for r in logs)
+    # W&B: actual updates over all members; per-member losses on their own update axes only.
+    rows = [r for r in logs if "progress/denoiser_updates_total" in r]
+    assert [r["progress/denoiser_updates_total"] for r in rows] == [6, 9]
+    for k in range(3):
+        member = [r for r in logs if f"denoiser/member_{k}/train/loss_denoising" in r]
+        assert [r[f"denoiser/member_{k}/train/num_batch_train_member"] for r in member] == [0, 1, 2]
+        assert all(set(r) == {f"denoiser/member_{k}/train/loss_denoising", f"denoiser/member_{k}/train/num_batch_train_member",
+                              "progress/train_env_steps"} for r in member)  # no lr, gradient norm or member-0 duplicate
+    assert not [k for r in logs for k in r if k.startswith(("ensemble/", "timing/denoiser_member_", "denoiser/train/"))]
 
 
 def test_bootstrap_multiplicities_are_reproducible_fixed_and_grow():

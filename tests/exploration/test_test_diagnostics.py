@@ -1,5 +1,6 @@
 """Exploration test collection and diagnostics: evaluation.should / every / collect_test,
 no task-return logging, test-interaction accounting, isolation and resume."""
+import json
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +61,10 @@ def rows_with(logs, prefix):
     return [(epoch, row) for epoch, row in logs if any(k.startswith(prefix) for k in row)]
 
 
+def load_evaluation(name):
+    return json.loads(Path(f"evaluation/{name}.json").read_text())
+
+
 def spy_calls(monkeypatch):
     """Record collect_test and test_agent calls in order."""
     calls = []
@@ -79,11 +84,11 @@ def spy_calls(monkeypatch):
 
 
 def training_rows(logs):
-    """Learning metrics only: losses, PMPO metrics (incl. sampled actions), train collection."""
+    """Learning metrics only: training losses and PMPO metrics (incl. sampled actions)."""
     out = []
     for epoch, row in logs:
         values = {k: float(v) for k, v in row.items() if np.ndim(v) == 0
-                  and k.split("/")[0] in ("denoiser", "actor_critic", "train_dataset") and "/test/" not in k}
+                  and k.split("/")[0] in ("denoiser", "actor_critic") and k.split("/")[1] not in ("test", "final_test")}
         if values:
             out.append((epoch, values))
     return out
@@ -138,14 +143,17 @@ def test_fresh_mode_collects_then_diagnoses_and_counts_test_interactions(tmp_pat
     # Each scheduled point and the final: collection, then diagnostics.
     assert calls == [("collect", 1, False), ("test_agent", 1), ("collect", 2, False), ("test_agent", 2),
                      ("collect", 2, True), ("test_agent", 2)]
-    summaries = [(epoch, row) for epoch, row in logs if "test/fresh" in row or "final_test/fresh" in row]
-    got = [(e, r.get("test/new_env_steps", r.get("final_test/new_env_steps")),
-            r.get("test/total_new_env_steps", r.get("final_test/total_new_env_steps"))) for e, r in summaries]
-    assert got == [(1, 12, 12), (2, 12, 24), (2, 18, 42)]
-    assert all(r.get("test/fresh", r.get("final_test/fresh")) == 1 for _, r in summaries)
-    assert summaries[-1][1]["final_test/num_episodes"] == 3 and summaries[-1][1]["final_test/num_steps"] == 18
+    # W&B: cumulative test steps on the epoch rows and the final row (the final collection included).
+    totals = [(e, r["progress/test_env_steps"]) for e, r in logs
+              if "timing/epoch_seconds" in r or "timing/final_test_diagnostic_seconds" in r]
+    assert totals == [(1, 12), (2, 24), (2, 42)]
+    # Per diagnostic: interactions and fresh status in evaluation/*.json.
+    saved = [load_evaluation(name) for name in ("epoch_00001", "epoch_00002", "final_epoch_00002")]
+    assert [(s["new_test_env_steps"], s["total_test_env_steps"], s["fresh"]) for s in saved] == \
+        [(12, 12, True), (12, 24, True), (18, 42, True)]
+    assert (saved[-1]["num_episodes"], saved[-1]["num_steps"]) == (3, 18)
     assert trainer.num_test_steps == 42 and trainer.num_episodes_test == 7 and trainer.final_test_done
-    assert len(rows_with(logs, "denoiser/test")) > 0
+    assert len(rows_with(logs, "denoiser/test")) == 2 and len(rows_with(logs, "denoiser/final_test")) == 1
     # The training budget is unaffected; the final state is committed.
     assert trainer.train_dataset.num_steps == 24
     saved = torch.load("checkpoints/state.pt", weights_only=False)
@@ -212,14 +220,14 @@ def test_reuse_only_after_resume_diagnoses_without_collecting(tmp_path, monkeypa
     committed = [p.resolve() for p in resumed.test_dataset.episode_files()]
     run(resumed)
     assert [c[0] for c in calls] == ["test_agent", "test_agent"]  # epoch 2 and final, no collection
-    summaries = [row for _, row in logs if "test/fresh" in row or "final_test/fresh" in row]
-    assert len(summaries) == 2
-    for row in summaries:
-        prefix = "test" if "test/fresh" in row else "final_test"
-        assert row[f"{prefix}/fresh"] == 0 and row[f"{prefix}/new_env_steps"] == 0
-        assert row[f"{prefix}/total_new_env_steps"] == 12  # epoch 1's collection only
-        assert row[f"{prefix}/num_episodes"] == 2
-        assert not any(is_task_return(k) for k in row)
+    for name in ("epoch_00002", "final_epoch_00002"):
+        saved = load_evaluation(name)
+        assert not saved["fresh"] and saved["new_test_env_steps"] == 0 and saved["kind"].startswith("dataset_diagnostic")
+        assert saved["total_test_env_steps"] == 12  # epoch 1's collection only
+        assert saved["num_episodes"] == 2
+    final = [r for _, r in logs if "timing/final_test_diagnostic_seconds" in r]
+    assert len(final) == 1 and final[0]["progress/test_env_steps"] == 12
+    assert not any(is_task_return(k) for _, row in logs for k in row)
     assert [p.resolve() for p in resumed.test_dataset.episode_files()] == committed
     assert all(p.is_file() for p in committed)
     # Diagnostics are isolated: training continues exactly as in the fresh uninterrupted run.

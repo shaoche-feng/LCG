@@ -62,7 +62,7 @@ class FakeWandb:
 
     def __init__(self, run_id="fakerun1", starting_step=0, offline=False):
         self.run, self.run_id, self.starting_step, self.offline = None, run_id, starting_step, offline
-        self.inits, self.metrics, self.config_updates, self.logged = [], [], [], []
+        self.inits, self.metrics, self.hidden, self.config_updates, self.logged = [], [], [], [], []
         self.summary = {}
         self.config = SimpleNamespace(update=lambda d, **kw: self.config_updates.append(d))
 
@@ -75,8 +75,10 @@ class FakeWandb:
     def save(self, *args, **kwargs):
         pass
 
-    def define_metric(self, name, step_metric=None):
+    def define_metric(self, name, step_metric=None, hidden=None):
         self.metrics.append((name, step_metric))
+        if hidden:
+            self.hidden.append(name)
 
     def log(self, row):
         self.logged.append(row)
@@ -124,6 +126,18 @@ def merged(logs, prefix, epoch=None):
 def scalars(row):
     """Scalar values without wall-clock monitoring (timing/*, duration)."""
     return {k: float(v) for k, v in row.items() if np.ndim(v) == 0 and not k.startswith("timing/") and k != "duration"}
+
+
+# W&B categories that are no longer logged (old runs keep them).
+RETIRED_CATEGORIES = ("duration", "length", "train_dataset", "test_dataset", "epoch_summary", "test", "final_test",
+                      "ensemble", "plan2explore", "laplace", "lcg", "classification_metrics")
+
+
+def eval_keys(block, seeds):
+    """The W&B keys of a seeded evaluation block: per-seed raw and scaled returns, their mean and std."""
+    kinds = ("intrinsic_raw_return", "intrinsic_scaled_return")
+    return ({f"{block}/seed_{s}/{k}" for s in seeds for k in kinds}
+            | {f"{block}/{k}_{stat}" for k in kinds for stat in ("mean", "std")})
 
 
 def pmpo_rows(logs):
@@ -203,23 +217,29 @@ def test_seeded_test_episodes_are_labeled_counted_scored_and_saved(tmp_path, mon
     # Each scheduled point resets the test env once per configured seed, in order; final likewise.
     assert SeedEnv.resets[1:] == SEEDS + SEEDS + [11, 12]  # [0]: the training env's own reset
     assert trainer.test_episode_seeds == [11, 12]
-    # Test interactions: 4 x 6 steps per point, 2 x 6 at the end; training budget unchanged.
-    totals = [r[k] for _, r in logs for k in r if k.endswith("test/total_new_env_steps")]
+    # Test interactions: 4 x 6 steps per point, 2 x 6 at the end (on the final row); training budget unchanged.
+    totals = [r["progress/test_env_steps"] for _, r in logs if "timing/epoch_seconds" in r
+              or "timing/final_test_diagnostic_seconds" in r]
     assert totals == [24, 48, 60] and trainer.num_test_steps == 60 and trainer.train_dataset.num_steps == 24
     for epoch in (1, 2):
+        # W&B: exactly the 12 return keys (4 seeds x raw/scaled, raw/scaled mean and std).
         block = merged(logs, "test_eval/", epoch)
-        assert block["test_eval/intrinsic_applicable"] == 1 and block["test_eval/intrinsic_scored"] == 1
-        for seed in SEEDS:
-            assert block[f"test_eval/seed_{seed}/length"] == 6
-            assert block[f"test_eval/seed_{seed}/intrinsic_scored_steps"] == 6  # final observation completes step 5
+        assert set(block) == eval_keys("test_eval", SEEDS)
+        # Lengths, scored steps and per-step values: in evaluation/*.json only.
+        saved = json.loads(Path(f"evaluation/epoch_{epoch:05d}.json").read_text())
+        assert saved["intrinsic"]["applicable"] and saved["intrinsic"]["scored"] and saved["new_test_env_steps"] == 24
+        for seed, record in zip(SEEDS, saved["episodes"]):
+            assert record["seed"] == seed and record["length"] == 6
+            assert record["intrinsic_scored_steps"] == 6  # final observation completes step 5
             raw, scaled = block[f"test_eval/seed_{seed}/intrinsic_raw_return"], block[f"test_eval/seed_{seed}/intrinsic_scaled_return"]
+            assert (record["intrinsic_raw_return"], record["intrinsic_scaled_return"]) == (raw, scaled)
             assert np.isfinite(raw) and np.isfinite(scaled) and raw != scaled
-            assert block[f"test_eval/seed_{seed}/intrinsic_raw_per_step"] == pytest.approx(raw / 6)
-        returns = [block[f"test_eval/seed_{s}/intrinsic_raw_return"] for s in SEEDS]
-        assert block["test_eval/intrinsic_raw_return_mean"] == pytest.approx(np.mean(returns))
-        assert block["test_eval/intrinsic_raw_return_std"] == pytest.approx(np.std(returns))
-    final = merged(logs, "final_test_eval/")
-    assert {k.split("/")[1] for k in final if "/seed_" in k} == {"seed_11", "seed_12"}
+            assert record["intrinsic_raw_per_step"] == pytest.approx(raw / 6)
+        for kind in ("raw", "scaled"):
+            returns = [block[f"test_eval/seed_{s}/intrinsic_{kind}_return"] for s in SEEDS]
+            assert block[f"test_eval/intrinsic_{kind}_return_mean"] == pytest.approx(np.mean(returns))
+            assert block[f"test_eval/intrinsic_{kind}_return_std"] == pytest.approx(np.std(returns))
+    assert set(merged(logs, "final_test_eval/")) == eval_keys("final_test_eval", (11, 12))
     # Saved locally with the protocol.
     saved = json.loads(Path("evaluation/epoch_00002.json").read_text())
     assert saved["kind"] == "current_policy_evaluation" and saved["protocol"]["reset_seeds"] == SEEDS
@@ -288,7 +308,8 @@ def test_evaluation_matches_imagination_scoring_and_leaves_scorer_state_unchange
     trainer, logs = launch(tmp_path / "run", monkeypatch, tiny, BASE + SEEDED + extra)
     run(trainer)
     block = merged(logs, "final_test_eval/")
-    assert block["final_test_eval/intrinsic_scored"] == 1
+    assert json.loads(Path("evaluation/final_epoch_00002.json").read_text())["intrinsic"]["scored"]
+    assert set(block) == eval_keys("final_test_eval", (11, 12))
     assert np.isfinite(block["final_test_eval/intrinsic_raw_return_mean"])
     assert np.isfinite(block["final_test_eval/intrinsic_scaled_return_mean"])
 
@@ -351,15 +372,17 @@ def test_uniform_omits_scorer_and_pmpo_and_marks_intrinsic_not_applicable(tmp_pa
     assert_epoch_spacing(lines)
     assert_clean_terminal(lines)
     assert not any("intrinsic_raw" in k or "intrinsic_scaled" in k or "_raw_reward" in k for _, r in logs for k in r)
-    block = merged(logs, "test_eval/", 1)
-    assert block["test_eval/intrinsic_applicable"] == 0 and block["test_eval/intrinsic_scored"] == 0
-    assert block["test_eval/seed_3001/length"] == 6 and not any("return" in k for k in block)
+    # No evaluation keys at all; the not-applicable status and lengths are in evaluation/*.json.
+    assert not merged(logs, "test_eval/") and not merged(logs, "final_test_eval/")
     saved = json.loads(Path("evaluation/epoch_00001.json").read_text())
     assert saved["intrinsic"] == dict(applicable=False, scored=False, scorer=None,
                                       reason="not applicable: uniform random has no intrinsic scorer")
-    summaries = [r for _, r in logs if "epoch_summary/denoiser_loss_mean" in r]
-    assert len(summaries) == 2 and all(r["progress/pmpo_updates"] == 0 for r in summaries)
-    assert not any(k.startswith("epoch_summary/pmpo_") or k.startswith("epoch_summary/intrinsic") for r in summaries for k in r)
+    assert [e["length"] for e in saved["episodes"]] == [6] * 4 and saved["fresh"]
+    # Epoch rows: no PMPO counter and no PMPO or scorer timing (nothing fabricated).
+    epochs = [r for _, r in logs if "timing/epoch_seconds" in r]
+    assert len(epochs) == 2
+    assert not any(k in r for r in epochs for k in ("progress/pmpo_updates", "timing/epoch_pmpo_seconds",
+                                                      "timing/epoch_scorer_refresh_seconds", "timing/pmpo_seconds_per_update"))
 
 
 # ---------------------------------------------------------------- rows, axes, counters
@@ -368,33 +391,32 @@ def test_epoch_rows_counters_axes_and_training_only_epochs(tmp_path, monkeypatch
     trainer, logs = launch(tmp_path / "run", monkeypatch, TINY, BASE + SEEDED + ["training.num_final_epochs=1"])
     run(trainer)
     lines = terminal_lines(capsys.readouterr().out)
-    summaries = {e: r for e, r in logs if "epoch_summary/denoiser_loss_mean" in r}
-    assert sorted(summaries) == [1, 2, 3]
+    epochs = {e: r for e, r in logs if "timing/epoch_seconds" in r}
+    assert sorted(epochs) == [1, 2, 3]
     # Epoch 3 trains without collecting: steps stay, updates advance, still one row per epoch.
-    expected = {1: (18, 6, 2, 2, 24), 2: (24, 6, 3, 3, 48), 3: (24, 0, 4, 4, 72)}
-    for epoch, (steps, new, denoiser, pmpo, test) in expected.items():
-        r = summaries[epoch]
-        assert (r["progress/train_env_steps"], r["progress/new_train_env_steps"], r["progress/denoiser_updates"],
-                r["progress/pmpo_updates"], r["progress/test_env_steps"]) == (steps, new, denoiser, pmpo, test)
-        assert r["timing/epoch_seconds"] > 0 and "timing/epoch_denoiser_seconds" in r and "timing/epoch_pmpo_seconds" in r
-        assert "timing/epoch_scorer_refresh_seconds" in r and "timing/epoch_test_seconds" in r
-        assert ("timing/epoch_collection_seconds" in r) == (epoch < 3)
-        # Raw and scaled intrinsic rewards stay separate (RunningRMS: different values).
-        assert r["epoch_summary/intrinsic_raw_reward_mean"] != r["epoch_summary/intrinsic_scaled_reward_mean"]
-        for name in ("loss_actor", "loss_value", "policy_entropy", "kl_prior", "positive_fraction", "actor_grad_norm"):
-            assert np.isfinite(r[f"epoch_summary/pmpo_{name}_mean"])
+    expected = {1: (18, 2, 2, 24), 2: (24, 3, 3, 48), 3: (24, 4, 4, 72)}
+    for epoch, (steps, denoiser, pmpo, test) in expected.items():
+        r = epochs[epoch]
+        progress = {k: v for k, v in r.items() if k.startswith("progress/")}
+        assert progress == {"progress/train_env_steps": steps, "progress/denoiser_updates_total": denoiser,
+                            "progress/pmpo_updates": pmpo, "progress/test_env_steps": test}
+        timing = {"timing/epoch_seconds", "timing/epoch_denoiser_seconds", "timing/epoch_scorer_refresh_seconds",
+                  "timing/epoch_pmpo_seconds", "timing/pmpo_seconds_per_update", "timing/epoch_test_seconds"}
+        if epoch < 3:
+            timing.add("timing/epoch_collection_seconds")
+        assert set(r) == set(progress) | timing and r["timing/epoch_seconds"] > 0  # CPU: no GPU peak
         # Every row carries the env-step axis at the time it was logged.
         assert all(row["progress/train_env_steps"] == steps for e, row in logs if e == epoch)
+        # One mean denoiser test loss per diagnostic.
+        assert len([row for e, row in logs if e == epoch and "denoiser/test/loss_denoising" in row]) == 1
     assert trainer.agent.actor_critic.updates.item() == 4 and trainer.num_batch_train.denoiser == 4
     # PMPO rows keep their own update counter (W&B step metric), raw and policy reward separate.
     pmpo = [r for _, r in logs if "actor_critic/train/core/num_batch_train_actor_critic" in r]
     assert [r["actor_critic/train/core/num_batch_train_actor_critic"] for r in pmpo] == [1, 2, 3, 4]
-    assert all("actor_critic/train/intrinsic/raw_reward_mean" in r and "actor_critic/train/intrinsic/scaled_reward_mean" in r
-               for r in pmpo)
-    # The denoiser test loss and the LCG refresh identity stay in W&B only.
-    assert any("denoiser/test/loss_denoising" in r for _, r in logs)
-    refresh = [r for _, r in logs if "lcg/h_D_fingerprint" in r]
-    assert [r["lcg/round"] for r in refresh] == [1, 2, 3] and all(np.isfinite(r["lcg/banks_fingerprint"]) for r in refresh)
+    assert all(r["actor_critic/train/intrinsic/raw_reward_mean"] != r["actor_critic/train/intrinsic/scaled_reward_mean"]
+               for r in pmpo)  # RunningRMS: different values
+    # Retired categories are gone (the LCG refresh identity is in the W&B summary).
+    assert not [k for _, r in logs for k in r if k.split("/")[0] in RETIRED_CATEGORIES]
     assert not [k for _, r in logs for k in r if k == "return" or "/return_" in k and not k.startswith("actor_critic/")]
 
     # Terminal: the compact banner, one closed bar per phase, labelled intrinsic statistics.
@@ -487,9 +509,8 @@ def test_method_progress_bars_and_intrinsic_labels(tmp_path, monkeypatch, capsys
         re.fullmatch(r"  seed \d+ \| 6 steps \| raw return \S+ \| scaled return \S+", line) for line in seed_lines)
     assert_epoch_spacing(lines)
     assert_clean_terminal(lines)
-    # The method's refresh diagnostics stay in W&B.
-    prefix = dict(ensemble="ensemble/", plan2explore="plan2explore/", laplace="laplace/")[method]
-    assert any(k.startswith(prefix) for _, r in logs for k in r)
+    # The method's refresh bookkeeping is not charted (checkpoint, evaluation JSON and W&B summary keep it).
+    assert not [k for _, r in logs for k in r if k.split("/")[0] in RETIRED_CATEGORIES]
 
 
 def test_wandb_axes_provenance_milestones_and_unchanged_training(tmp_path, monkeypatch, capsys):
@@ -498,7 +519,7 @@ def test_wandb_axes_provenance_milestones_and_unchanged_training(tmp_path, monke
     off, logs_off = launch(tmp_path / "off", monkeypatch, TINY, BASE + FRESH + quiet)
     run(off)
     assert "%|" not in capsys.readouterr().out
-    assert not [r for _, r in logs_off if "epoch_summary/denoiser_loss_mean" in r]
+    assert not [r for _, r in logs_off if "timing/epoch_seconds" in r]
     monkeypatch.undo()
     fake = FakeWandb()
     on, logs_on = launch(tmp_path / "on", monkeypatch, TINY, BASE + FRESH + [
@@ -511,7 +532,9 @@ def test_wandb_axes_provenance_milestones_and_unchanged_training(tmp_path, monke
     axes = dict(fake.metrics)
     assert axes["actor_critic/train/*"] == "actor_critic/train/core/num_batch_train_actor_critic"
     assert axes["denoiser/train/*"] == "denoiser/train/num_batch_train_denoiser"
-    assert axes["epoch_summary/*"] == axes["test_eval/*"] == axes["progress/*"] == "epoch"
+    assert axes["test_eval/*"] == axes["progress/*"] == axes["denoiser/final_test/*"] == "epoch"
+    assert fake.hidden == ["epoch"]  # an x-axis only
+    assert not [n for n in axes if n.split("/")[0] in RETIRED_CATEGORIES]
     globs = [n for n in axes if n.endswith("*")]
     for _, row in logs_on:
         for key in row:
@@ -520,7 +543,19 @@ def test_wandb_axes_provenance_milestones_and_unchanged_training(tmp_path, monke
     provenance = fake.config_updates[0]["provenance"]
     assert provenance["seed"] == 7 and provenance["method"] == "lcg" and provenance["source"] == on.source
     assert provenance["method_settings"]["reward_scaling"] == on._lcg_reward_scaling
+    assert provenance["method_settings"]["lcg"]["theta_s_dim"] == on._lcg_lifecycle._theta_s_dim > 0  # a run constant
     assert provenance["evaluation"]["every"] == 1
+    # Unseeded episodes: only the aggregate returns; the episodes are in evaluation/*.json.
+    assert set(merged(logs_on, "test_eval/")) == {f"test_eval/intrinsic_{k}_return_{s}" for k in ("raw", "scaled")
+                                                  for s in ("mean", "std")}
+    # Status and scorer identity: W&B summary metadata (latest), not history.
+    status = fake.summary["evaluation/final_test_eval"]
+    assert (status["fresh"], status["num_episodes"], status["new_test_env_steps"], status["total_test_env_steps"]) == \
+        (True, 3, 18, 42)
+    assert status["intrinsic"]["scored"] and status["file"].endswith("final_epoch_00002.json")
+    assert fake.summary["evaluation/test_eval"]["epoch"] == 2
+    scorer = fake.summary["scorer"]
+    assert scorer["method"] == "lcg" and scorer["round"] == 2 and np.isfinite(scorer["h_D_fingerprint"])
     # The run id is kept in the run folder; the milestone identity goes to the summary.
     assert json.loads(Path("wandb_run.json").read_text())["id"] == "fakerun1"
     milestone = fake.summary["milestones/steps_000024"]
@@ -536,6 +571,117 @@ def test_wandb_axes_provenance_milestones_and_unchanged_training(tmp_path, monke
     assert len(milestone) == 1 and lines[milestone[0] - 1] != ""
     assert_epoch_spacing(lines)
     assert_clean_terminal(lines)
+
+
+FINAL_SEEDS = [11, 12, 13, 14]
+SEEDED_4 = [o for o in SEEDED if "final" not in o] + ["collection.test.num_final_episodes=4",
+                                                      f"evaluation.final_reset_seeds=[{','.join(map(str, FINAL_SEEDS))}]"]
+
+
+def expected_keys(trainer, ac_schema):
+    """Every W&B key the trainer may publish for this method (CPU: no GPU peak), written out."""
+    learned = trainer._method is not None
+    keys = {"progress/train_env_steps", "progress/test_env_steps", "progress/denoiser_updates_total",
+            "timing/epoch_collection_seconds", "timing/epoch_denoiser_seconds", "timing/epoch_test_seconds",
+            "timing/epoch_seconds", "timing/final_test_diagnostic_seconds",
+            "denoiser/test/loss_denoising", "denoiser/final_test/loss_denoising"}
+    if trainer.ensemble is not None:
+        keys |= {f"denoiser/member_{k}/train/{name}" for k in range(trainer.ensemble.members)
+                 for name in ("loss_denoising", "num_batch_train_member")}
+    else:
+        keys |= {"denoiser/train/loss_denoising", "denoiser/train/num_batch_train_denoiser"}
+    if learned:
+        keys |= {"progress/pmpo_updates", "timing/epoch_scorer_refresh_seconds", "timing/epoch_pmpo_seconds",
+                 "timing/pmpo_seconds_per_update"}
+        keys |= {f"actor_critic/train/{k}" for k in ac_schema(2, debug=False)}
+        keys |= eval_keys("test_eval", SEEDS) | eval_keys("final_test_eval", FINAL_SEEDS)
+    return keys
+
+
+@pytest.mark.parametrize("method", ["lcg", "ensemble", "laplace", "plan2explore", "uniform"])
+def test_published_keys_axes_mirror_and_summary_by_method(tmp_path, monkeypatch, method, ac_schema):
+    """The complete W&B key set of each method (4 fixed seeds per evaluation), one axis per key,
+    the mirror equal to what is sent, and the status/identity kept as summary metadata."""
+    tiny, extra = METHOD_SETUPS[method]
+    fake = FakeWandb()
+    trainer, logs = launch(tmp_path / "run", monkeypatch, tiny, BASE + SEEDED_4 + extra + [
+        "wandb.mode=offline", "wandb.project=p"], fake_wandb=fake)
+    run(trainer)
+    keys = {k for _, r in logs for k in r}
+    assert keys == expected_keys(trainer, ac_schema)
+    assert not [k for k in keys if k.split("/")[0] in RETIRED_CATEGORIES or k.endswith(("/lr", "grad_norm_before_clip"))]
+    for block, seeds in (("test_eval", SEEDS), ("final_test_eval", FINAL_SEEDS)):
+        assert len({k for k in keys if k.startswith(f"{block}/")}) == (12 if trainer._method else 0)
+    # Final test steps are counted on the final row, separately from training steps.
+    final = [r for _, r in logs if "timing/final_test_diagnostic_seconds" in r]
+    assert len(final) == 1 and final[0]["progress/test_env_steps"] == 72 and final[0]["progress/train_env_steps"] == 24
+    assert "denoiser/final_test/loss_denoising" in final[0]
+    if trainer.ensemble is not None:  # actual updates over every member
+        assert final[0]["progress/denoiser_updates_total"] == sum(trainer.ensemble.updates) == 3 * trainer.num_batch_train.denoiser
+    else:
+        assert final[0]["progress/denoiser_updates_total"] == trainer.num_batch_train.denoiser == 3
+    # Axes: each key matches exactly one definition; member losses on their own counters.
+    axes = dict(fake.metrics)
+    globs = [n for n in axes if n.endswith("*")]
+    for key in keys:
+        assert len([g for g in globs if key.startswith(g[:-1])]) == 1, key
+    for k in range(trainer.ensemble.members if trainer.ensemble is not None else 0):
+        assert axes[f"denoiser/member_{k}/train/*"] == f"denoiser/member_{k}/train/num_batch_train_member"
+    assert fake.hidden == ["epoch"]
+    # The local mirror holds exactly the rows sent to W&B.
+    mirror = [json.loads(line) for line in Path("wandb_history.jsonl").read_text().splitlines()]
+    assert [m["values"] for m in mirror] == [{k: float(v) for k, v in r.items() if np.ndim(v) == 0} for _, r in logs]
+    # Summary metadata: evaluation status (uniform: not applicable, no scorer) and scorer identity.
+    status = fake.summary["evaluation/final_test_eval"]
+    assert status["fresh"] and status["num_episodes"] == 4 and status["new_test_env_steps"] == 24
+    if trainer._method is None:
+        assert status["intrinsic"]["reason"] == "not applicable: uniform random has no intrinsic scorer"
+        assert "scorer" not in fake.summary
+    else:
+        assert status["intrinsic"]["scored"] and fake.summary["scorer"]["method"] == trainer._method
+    settings = fake.config_updates[0]["provenance"]["method_settings"]
+    if trainer.plan2explore is not None:  # run constants: configuration/provenance
+        assert settings["plan2explore"]["head_parameters"] == trainer.plan2explore.num_head_parameters
+        assert settings["plan2explore"]["extractor"]["feature_dim"] == trainer.plan2explore.feature_dim
+        assert fake.summary["scorer"]["fit_updates"] == trainer.plan2explore.fit_updates
+    if trainer.laplace is not None:
+        assert settings["laplace"]["dim"] == trainer.laplace.dim and fake.summary["scorer"]["refreshes"] == 2
+    if trainer.ensemble is not None:
+        assert fake.summary["scorer"]["member_updates"] == trainer.ensemble.updates
+
+
+def test_denoiser_test_loss_is_one_mean_per_diagnostic_and_unpublished_values_stay_internal(tmp_path, monkeypatch):
+    batches, internal = [], []
+    test_component, train_agent = ExplorationTrainer.test_component, ExplorationTrainer.train_agent
+
+    def spy_test(self, name):
+        rows = test_component(self, name)
+        batches.append([float(r["denoiser/test/loss_denoising"]) for r in rows])
+        return rows
+
+    def spy_train(self):
+        rows = train_agent(self)
+        internal.extend(rows)
+        return rows
+
+    monkeypatch.setattr(ExplorationTrainer, "test_component", spy_test)
+    monkeypatch.setattr(ExplorationTrainer, "train_agent", spy_train)
+    trainer, logs = launch(tmp_path / "run", monkeypatch, TINY, BASE + SEEDED + ["collection.test.num_episodes=4",
+                                                                                 "denoiser.training.batch_size=2"])
+    run(trainer)
+    # Several test batches per diagnostic; W&B gets their unweighted mean (periodic, then final).
+    assert len(batches) == 3 and all(len(b) > 1 and np.isfinite(b).all() for b in batches)
+    logged = [r.get("denoiser/test/loss_denoising", r.get("denoiser/final_test/loss_denoising")) for _, r in logs
+              if "denoiser/test/loss_denoising" in r or "denoiser/final_test/loss_denoising" in r]
+    assert logged == [pytest.approx(float(np.mean(b)), nan_ok=True) for b in batches]
+    assert trainer.num_batch_test.denoiser == sum(map(len, batches))  # the checkpointed counter still counts
+    # The trainer's rows keep the learning rate and gradient norm (the PMPO diagnostic reads them);
+    # W&B and the mirror do not.
+    assert any("denoiser/train/lr" in r and "denoiser/train/grad_norm_before_clip" in r for r in internal)
+    assert not any(k.endswith(("/lr", "/grad_norm_before_clip")) for _, r in logs for k in r)
+    assert trainer_module.published_row({"denoiser/train/lr": 1.0, "denoiser/train/loss_denoising": 2.0,
+                                         "actor_critic/train/core/loss_actor": 3.0}) == \
+        {"denoiser/train/loss_denoising": 2.0, "actor_critic/train/core/loss_actor": 3.0}
 
 
 def test_message_during_an_active_bar_gets_its_own_line(capsys):
@@ -575,10 +721,11 @@ def test_resume_keeps_wandb_run_counters_and_seed_labels(tmp_path, monkeypatch):
     # The same W&B run continues (id from the run folder), and the resume is labeled.
     assert fake_resumed.inits[0]["id"] == "fakerun1" and fake_resumed.inits[0]["resume"] == "allow"
     assert fake_resumed.summary["resume_count"] == 1
-    resume_rows = [r for _, r in logs if "resume/from_epoch" in r]
-    assert len(resume_rows) == 1 and resume_rows[0]["resume/from_epoch"] == 1 and resume_rows[0]["resume/count"] == 1
+    # The resume event is summary metadata, not a history row.
+    resume = fake_resumed.summary["resume"]
+    assert resume["from_epoch"] == 1 and resume["count"] == 1 and not rows_of(logs, "resume/")
     # This fake server holds no rows, so every committed row was backfilled (see the backfill test).
-    assert resume_rows[0]["resume/backfilled_rows"] == resume_rows[0]["resume/wandb_committed_rows"] > 0
+    assert resume["backfilled_rows"] == resume["wandb_committed_rows"] > 0
     # Replayed epoch 2 logs exactly what the uninterrupted run logged (wall-clock timing aside).
     def epoch2(rows):
         return [scalars(r) for e, r in rows if e == 2 and not any(k.startswith("resume/") for k in r)]
@@ -617,8 +764,9 @@ def test_resume_keeps_wandb_run_counters_and_seed_labels(tmp_path, monkeypatch):
     resumed, logs = launch(tmp_path / "old", monkeypatch, None, REUSE, resume=True)
     run(resumed)
     block = merged(logs, "test_dataset_diagnostic/", 2)
-    assert not [k for k in block if "/seed_" in k]
-    assert {k.split("/")[1] for k in block if "/episode_" in k} == {f"episode_{i}" for i in range(4)}
+    assert set(block) == {f"test_dataset_diagnostic/intrinsic_{k}_return_{s}" for k in ("raw", "scaled")
+                          for s in ("mean", "std")}  # unlabeled episodes: aggregates only
+    assert [e["seed"] for e in json.loads(Path("evaluation/epoch_00002.json").read_text())["episodes"]] == [None] * 4
     assert resumed.resume_count == 1
 
 
@@ -640,7 +788,7 @@ def test_resume_backfills_rows_the_wandb_server_lost_and_counts_replayed_ones(tm
     fake = FakeWandb(starting_step=starting, offline=server == "offline")
     capsys.readouterr()
     resumed, logs = launch(tmp_path / "run", monkeypatch, None, [], resume=True, fake_wandb=fake)
-    resume_row = resumed._start_logs[-1]
+    resume_row = resumed._resume_event  # W&B summary "resume"
     lines = terminal_lines(capsys.readouterr().out)  # essential resume messages stay visible
     assert "  Resumed at epoch 1 (resume #1)" in lines
     message = dict(lost=f"W&B: backfilled {committed - 3} committed rows the server did not receive before the crash",
@@ -648,19 +796,19 @@ def test_resume_backfills_rows_the_wandb_server_lost_and_counts_replayed_ones(tm
                    offline="W&B offline: the server's row count is unknown, so no rows are backfilled "
                            "(wandb_history.jsonl keeps every committed row)")[server]
     assert message in lines
-    assert resume_row["resume/wandb_committed_rows"] == committed
-    assert resume_row.get("resume/wandb_server_rows") == (None if server == "offline" else starting)
+    assert resume_row["wandb_committed_rows"] == committed and fake.summary["resume"] is resume_row
+    assert resume_row.get("wandb_server_rows") == (None if server == "offline" else starting)
     backfilled = [r for r in fake.logged if r.get("resume/backfilled") == 1]
     if server == "offline":
         assert not backfilled and resumed.wandb_steps == committed
     elif server == "lost":
         # Exactly the committed rows the server lacks, in order, with their epoch and values.
-        assert resume_row["resume/backfilled_rows"] == committed - 3 and resumed.wandb_steps == committed
+        assert resume_row["backfilled_rows"] == committed - 3 and resumed.wandb_steps == committed
         expected = [{"epoch": 1, **{k: float(v) for k, v in row.items() if np.ndim(v) == 0}, "resume/backfilled": 1}
                     for row in epoch1[3:]]
         assert backfilled == expected
     else:
-        assert not backfilled and resume_row["resume/server_rows_beyond_checkpoint"] == 7
+        assert not backfilled and resume_row["server_rows_beyond_checkpoint"] == 7
         assert resumed.wandb_steps == committed + 7
     run(resumed)
     # The mirror's latest entry per step continues from the reconciled step.
@@ -759,13 +907,13 @@ def test_resume_repairs_the_mirror_and_backfills_only_committed_rows(tmp_path, m
     expected = [{"epoch": 1, **{k: float(v) for k, v in row.items() if np.ndim(v) == 0}, "resume/backfilled": 1}
                 for row in epoch1[3:]]
     assert backfilled == expected  # the committed values, not the interrupted segment's -1.0 / -2.0
-    assert resumed._start_logs[-1]["resume/backfilled_rows"] == committed - 3
+    assert resumed._resume_event["backfilled_rows"] == committed - 3
     with pytest.raises(Crash):  # a second crash in the same epoch
         resumed._run()
     monkeypatch.undo()
     fake = FakeWandb(starting_step=committed)  # nothing lost this time: no backfill, no replay
     resumed, _ = launch(tmp_path / "run", monkeypatch, None, [], resume=True, fake_wandb=fake)
-    assert "resume/backfilled_rows" not in resumed._start_logs[-1]
+    assert "backfilled_rows" not in resumed._resume_event
     run(resumed)
     records = list(history_records(path))  # every line a whole record after appends and repairs
     assert records[-1]["step"] == resumed.wandb_steps - 1
@@ -873,7 +1021,7 @@ def test_older_checkpoint_without_scorer_state(tmp_path, monkeypatch, capsys, me
     block = merged(logs, "final_test_eval/")
     saved = json.loads(Path("evaluation/final_epoch_00002.json").read_text())
     if method == "lcg":
-        assert block["final_test_eval/intrinsic_scored"] == 0 and not any("intrinsic_raw" in k for k in block)
+        assert not block and not saved["intrinsic"]["scored"]  # nothing logged, nothing invented
         assert "Final intrinsic evaluation: N/A (the checkpoint predates saved LCG scorer state" in out
         assert "predates saved LCG scorer state" in saved["intrinsic"]["reason"]
     else:  # raw disagreement from the restored members; the lost RunningRMS scale is not invented

@@ -661,11 +661,11 @@ def test_trainer_runs_one_denoiser_and_logs(tmp_path, monkeypatch):
     assert trainer.plan2explore.refreshes == 2 and trainer.plan2explore.last_refresh_epoch == 2
     assert trainer.agent.actor_critic.updates.item() == 3
     keys = set().union(*logs)
-    for key in ("plan2explore/eligible_transitions", "plan2explore/member_2_loss_last", "plan2explore/feature_dim",
-                "plan2explore/near_constant_coordinates", "timing/p2e_feature_preparation_seconds",
-                "timing/p2e_fit_seconds", "timing/p2e_scoring_seconds", "timing/p2e_imagination_feature_seconds",
-                "actor_critic/train/intrinsic/raw_reward_mean", "actor_critic/train/intrinsic/scaled_reward_max"):
+    for key in ("actor_critic/train/intrinsic/raw_reward_mean", "actor_critic/train/intrinsic/scaled_reward_max"):
         assert key in keys, key
+    # Refresh and feature diagnostics and method timers are not logged; the timers still run.
+    assert not [k for k in keys if k.startswith(("plan2explore/", "timing/p2e_"))]
+    assert trainer.plan2explore.scoring_seconds > 0 and trainer.plan2explore.extractor.seconds > 0
     rewards = [row["actor_critic/train/intrinsic/raw_reward_mean"] for row in logs if "actor_critic/train/intrinsic/raw_reward_mean" in row]
     assert all(torch.isfinite(torch.as_tensor(r)) and r > 0 for r in rewards)
 

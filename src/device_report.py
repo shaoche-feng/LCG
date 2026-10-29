@@ -64,6 +64,14 @@ def physical_index(uuid: Optional[str], gpus: Optional[List[Dict[str, str]]]) ->
     return matches[0] if len(matches) == 1 else None
 
 
+def physical_gpu_index(device: torch.device) -> Optional[int]:
+    """nvidia-smi index of this process's CUDA device (matched by UUID); None on CPU or if unverified."""
+    if device.type != "cuda":
+        return None
+    index = physical_index(cuda_uuid(device), nvidia_smi_gpus())
+    return None if index is None else int(index)
+
+
 def compute_device_line(device: torch.device, name: Optional[str], uuid: Optional[str],
                         gpus: Optional[List[Dict[str, str]]]) -> str:
     if device.type != "cuda":

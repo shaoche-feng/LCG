@@ -212,11 +212,9 @@ def test_debug_schema_and_unchanged_training_through_the_trainer(tmp_path, monke
     for k in ("python", "numpy", "torch"):
         assert repr(off._final_rng[k]) == repr(on._final_rng[k]), k
     assert off.agent.actor_critic._fixed_obs is None and on.agent.actor_critic._fixed_obs is not None
-    # Terminal and epoch summaries read the renamed keys and are identical in both modes.
-    summary = lambda logs: [{k: v for k, v in r.items() if k.startswith("epoch_summary/")}
-                            for _, r in logs if "epoch_summary/pmpo_loss_actor_mean" in r]
-    assert summary(logs_off) == summary(logs_on) and len(summary(logs_off)) == 2
-    for row in summary(logs_off):
-        assert row["epoch_summary/pmpo_negative_fraction_mean"] == pytest.approx(1 - row["epoch_summary/pmpo_positive_fraction_mean"])
-        assert {"epoch_summary/intrinsic_raw_reward_mean", "epoch_summary/intrinsic_raw_reward_max",
-                "epoch_summary/intrinsic_scaled_reward_mean"} <= set(row)
+    # Epoch rows (progress counters) are identical in both modes and carry no PMPO aggregates.
+    epochs = lambda logs: [{k: v for k, v in r.items() if not k.startswith("timing/")}
+                           for _, r in logs if "timing/epoch_seconds" in r]
+    assert epochs(logs_off) == epochs(logs_on) and len(epochs(logs_off)) == 2
+    assert all(set(row) == {"progress/train_env_steps", "progress/test_env_steps", "progress/denoiser_updates_total",
+                            "progress/pmpo_updates"} for row in epochs(logs_off))

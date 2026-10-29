@@ -19,7 +19,7 @@ from utils import normalize_saved_config
 from coroutines.collector import COLLECTION_MODES, CollectorState, make_collector, NumToCollect
 from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
 from data.milestone import milestone_name, publish_milestone, read_manifest, referenced_files
-from device_report import device_lines
+from device_report import device_lines, physical_gpu_index
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
 from lcg import LCGLifecycle, selected_named_parameters
@@ -101,7 +101,7 @@ class ExplorationTrainer(StateDictMixin):
 
         # Terminal output (configs without a logging section use the defaults)
         configure_progress(OmegaConf.select(cfg, "logging.progress", default="bar"))
-        self._epoch_summary = OmegaConf.select(cfg, "logging.epoch_summary", default=True)
+        self._epoch_summary = OmegaConf.select(cfg, "logging.epoch_summary", default=True)  # progress/timing row
         # Local mirror of every W&B row (run folder), used to backfill rows a crash kept from W&B.
         self._local_history = OmegaConf.select(cfg, "logging.local_history", default=True)
         self._path_history = Path("wandb_history.jsonl")
@@ -114,6 +114,9 @@ class ExplorationTrainer(StateDictMixin):
             path_run_id = Path("wandb_run.json")
             if wandb_kwargs.get("id") is None and path_run_id.is_file():
                 wandb_kwargs["id"] = json.loads(path_run_id.read_text())["id"]
+            gpu = physical_gpu_index(self._device)
+            if gpu is not None:  # system charts of this run's GPU only (W&B numbers GPUs like nvidia-smi)
+                wandb_kwargs.setdefault("settings", wandb.Settings(x_stats_gpu_device_ids=[gpu]))
             try_until_no_except(
                 partial(wandb.init, config=OmegaConf.to_container(cfg, resolve=True), reinit=True,
                         resume="allow" if wandb_kwargs.get("id") else True, **wandb_kwargs)
@@ -362,6 +365,7 @@ class ExplorationTrainer(StateDictMixin):
         self._lcg_lifecycle = None
         self._ensemble_scorer = None
         self._lcg_reward_scaling = None  # intrinsic reward settings a resume must not change (any method)
+        self._lcg_theta_s_dim = None
         if self._method == "ensemble_disagreement":
             self._lcg_reward_scaling = self._ensemble_cfg.reward_scaling_settings()
             self._ensemble_scorer = EnsembleScorer(self._ensemble_cfg)
@@ -372,7 +376,8 @@ class ExplorationTrainer(StateDictMixin):
             self._ensemble_scorer = LaplaceScorer(self._laplace_cfg)
         elif self._learned_exploration:
             lcg_cfg = instantiate(cfg.intrinsic_reward)
-            selected_named_parameters(self.agent.denoiser, lcg_cfg.theta_s)  # fail now on a wrong theta_S, not at epoch 1
+            theta_s = selected_named_parameters(self.agent.denoiser, lcg_cfg.theta_s)  # fail now on a wrong theta_S
+            self._lcg_theta_s_dim = sum(p.numel() for p in theta_s.values())  # provenance constant
             self._lcg_reward_scaling = lcg_cfg.reward_scaling_settings()
             self._lcg_lifecycle = LCGLifecycle(
                 lcg_cfg, sigma_distribution_cfg,
@@ -411,14 +416,14 @@ class ExplorationTrainer(StateDictMixin):
         self._committed_history_bytes = None  # on resume: the loaded checkpoint's value (backfill reads only these)
 
         self._path_milestones = Path("milestones")
-        self._start_logs = []
+        self._resume_event = None  # this process's resume (W&B summary "resume"; not a history row)
         self._rng_to_restore = None
         if cfg.common.resume:
             self.load_state_checkpoint()
             self.resume_count += 1
             if self._rank == 0 and self._local_history:
                 self.repair_wandb_history()
-            self._start_logs.append({"resume/from_epoch": self.epoch, "resume/count": self.resume_count})
+            self._resume_event = {"from_epoch": self.epoch, "count": self.resume_count}
         if self._should_test and not self._collect_test:
             self.check_reusable_test_dataset()
         if not cfg.common.resume:
@@ -446,15 +451,14 @@ class ExplorationTrainer(StateDictMixin):
             raise
 
     def _run(self) -> None:
-        to_log = list(self._start_logs)  # resumed runs log where they resumed from
+        to_log = []
 
         if self.epoch == 0:
             if self._is_static_dataset:
                 self.num_epochs_collect = 0
             else:
                 if self._rank == 0:
-                    self.num_epochs_collect, to_log_ = self.collect_initial_dataset()
-                    to_log += to_log_
+                    self.num_epochs_collect = self.collect_initial_dataset()
                 self.num_epochs_collect, sd_train_dataset = broadcast_if_needed(self.num_epochs_collect, self.train_dataset.state_dict())
                 self.train_dataset.load_state_dict(sd_train_dataset)
                 self.check_no_true_termination(self.train_dataset)
@@ -466,8 +470,7 @@ class ExplorationTrainer(StateDictMixin):
         while self.epoch < num_epochs:
             self.epoch += 1
             start_time = time.time()
-            self._phase_seconds, self._gpu_peak = {}, 0.0
-            steps_before = self.train_dataset.num_steps
+            self._phase_seconds, self._gpu_peak, self._pmpo_seconds_per_update = {}, 0.0, None
             if self._use_cuda:
                 torch.cuda.reset_peak_memory_stats(self._device)  # epoch peak (monitoring only)
 
@@ -484,8 +487,10 @@ class ExplorationTrainer(StateDictMixin):
             if should_collect_train:
                 c = self._cfg.collection.train
                 t0 = time.time()
-                to_log += without_task_returns(self._train_collector.send(
-                    NumToCollect(steps=c.steps_per_epoch, mode=c.mode, desc=f"Collection ({c.mode} actions)")))
+                # Collection rows (episode ids, lengths, dataset counts) are not logged: the replay
+                # and progress/train_env_steps hold them.
+                self._train_collector.send(
+                    NumToCollect(steps=c.steps_per_epoch, mode=c.mode, desc=f"Collection ({c.mode} actions)"))
                 self._phase_seconds["collection"] = time.time() - t0
                 self.check_no_true_termination(self.train_dataset)
             sd_train_dataset, = broadcast_if_needed(self.train_dataset.state_dict())  # update dataset for ranks > 0
@@ -502,11 +507,11 @@ class ExplorationTrainer(StateDictMixin):
                 to_log += self.test_diagnostics()
 
             # Logging
-            to_log.append({"duration": (time.time() - start_time) / 3600})
             if self._rank == 0:
                 if self._epoch_summary:
-                    to_log.append(self.epoch_summary(to_log, steps_before, time.time() - start_time))
+                    to_log.append(self.epoch_row(time.time() - start_time))
                 self.log_rows(to_log)
+                self.scorer_summary()
             to_log = []
 
             # Checkpointing
@@ -521,8 +526,7 @@ class ExplorationTrainer(StateDictMixin):
             self.final_test_done = True
             self.save_checkpoint()
 
-    def collect_initial_dataset(self) -> Tuple[int, Logs]:
-        to_log = []
+    def collect_initial_dataset(self) -> int:
         c = self._cfg.collection.train
         min_steps = c.first_epoch.min
         phase()
@@ -531,8 +535,8 @@ class ExplorationTrainer(StateDictMixin):
 
         steps = min_steps
         while True:
-            to_log += without_task_returns(self._train_collector.send(
-                NumToCollect(steps=steps, mode=c.first_epoch.mode, desc=f"Initial collection ({c.first_epoch.mode} actions)")))
+            self._train_collector.send(
+                NumToCollect(steps=steps, mode=c.first_epoch.mode, desc=f"Initial collection ({c.first_epoch.mode} actions)"))
             num_steps = self.train_dataset.num_steps
             if num_steps >= min_steps:
                 break
@@ -540,15 +544,15 @@ class ExplorationTrainer(StateDictMixin):
 
         remaining_steps = c.num_steps_total - num_steps
         assert remaining_steps % c.steps_per_epoch == 0
-        num_epochs_collect = remaining_steps // c.steps_per_epoch
-
-        return num_epochs_collect, to_log
+        return remaining_steps // c.steps_per_epoch
 
     def check_no_true_termination(self, dataset: Dataset) -> None:
         if dataset.counts_end[1] > 0:
             raise RuntimeError(f"{dataset.name} has a true termination; exploration supports time-limit-only tasks")
 
-    def collect_test(self, final: bool = False) -> Logs:
+    def collect_test(self, final: bool = False) -> int:
+        """Fresh test episodes into the test dataset; returns the environment steps taken (the
+        collector's count, incl. discarded unfinished steps). Collection rows are not logged."""
         c = self._cfg.collection.test
         episodes = c.num_final_episodes if final else c.num_episodes
         td = self.test_dataset
@@ -571,12 +575,10 @@ class ExplorationTrainer(StateDictMixin):
             if td.num_episodes != len(seeds):
                 raise RuntimeError(f"Seeded test collection gave {td.num_episodes} episodes for {len(seeds)} seeds")
             self.test_episode_seeds = list(seeds)
-        key_ep_id = f"{td.name}/episode_id"
-        to_log = [{k: v + self.num_episodes_test if k == key_ep_id else v for k, v in x.items()} for x in to_log]
-
         self.check_no_true_termination(td)
         self.num_episodes_test += episodes
-        return without_task_returns(to_log)
+        key = f"{td.name}/new_env_steps"
+        return sum(row[key] for row in to_log if key in row)
 
     def train_agent(self) -> Logs:
         self.agent.train()
@@ -591,7 +593,8 @@ class ExplorationTrainer(StateDictMixin):
                         self.note_gpu_peak()  # before the refresh + PMPO peak window restarts
                         torch.cuda.reset_peak_memory_stats(self._device)
                     say(f"Scorer refresh ({METHOD_NAMES[self._method]}): {REFRESH_WORK[self._method]}")
-                    refresh_logs = []
+                    # The refresh diagnostics the methods return are not logged to W&B; the scorer's
+                    # identity goes to the W&B summary (scorer_summary) and to evaluation/*.json.
                     t_refresh = time.time()
                     if self._lcg_lifecycle is not None:
                         # Refresh the intrinsic scorer on this epoch's denoiser, then rewire the
@@ -599,24 +602,17 @@ class ExplorationTrainer(StateDictMixin):
                         # continues the seed sequence (the lifecycle itself is not checkpointed).
                         self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
                         self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
-                        refresh_logs.append(lcg_refresh_metrics(self._lcg_lifecycle, self.train_dataset))
                     elif self.plan2explore is not None:
                         # Encode the replay with this epoch's (frozen) denoiser, fit fresh heads, then
                         # freeze them; the denoiser stays in eval mode for PMPO (only read).
-                        to_log += self.plan2explore.refresh(self.agent.denoiser, self.train_dataset,
-                                                            self.successor_observations(), epoch=self.epoch)
-                        if self._use_cuda:  # the refresh alone (gpu_peak_* below covers refresh + PMPO)
-                            to_log.append({"timing/p2e_refresh_gpu_peak_allocated_gb":
-                                           torch.cuda.max_memory_allocated(self._device) / 2 ** 30})
+                        self.plan2explore.refresh(self.agent.denoiser, self.train_dataset,
+                                                  self.successor_observations(), epoch=self.epoch)
                         self.agent.denoiser.eval()
                         self.agent.actor_critic.set_intrinsic_reward_fn(self.plan2explore)
                     elif self.laplace is not None:
                         # LCG's precision on this epoch's denoiser, then a fresh sample bank, frozen
                         # for the PMPO phase; the base denoiser is only read (eval mode).
-                        to_log.append(self.laplace.refresh(self.train_dataset, epoch=self.epoch))
-                        if self._use_cuda:  # the refresh alone (gpu_peak_* below covers refresh + PMPO)
-                            to_log.append({"timing/laplace_refresh_gpu_peak_allocated_gb":
-                                           torch.cuda.max_memory_allocated(self._device) / 2 ** 30})
+                        self.laplace.refresh(self.train_dataset, epoch=self.epoch)
                         self.agent.denoiser.eval()
                         self._ensemble_scorer.reset()
                         self.agent.actor_critic.set_intrinsic_reward_fn(self._ensemble_scorer)
@@ -628,9 +624,7 @@ class ExplorationTrainer(StateDictMixin):
                         self.agent.actor_critic.set_intrinsic_reward_fn(self._ensemble_scorer)
                     if self._use_cuda:
                         torch.cuda.synchronize(self._device)
-                    t_refresh = time.time() - t_refresh
-                    self._phase_seconds["scorer_refresh"] = t_refresh
-                    to_log += refresh_logs
+                    self._phase_seconds["scorer_refresh"] = time.time() - t_refresh
                 steps = cfg.steps_first_epoch if self.epoch == 1 else cfg.steps_per_epoch
                 t0 = time.time()
                 if name == "denoiser" and self.ensemble is not None:
@@ -645,58 +639,23 @@ class ExplorationTrainer(StateDictMixin):
                 elapsed = time.time() - t0
                 self._phase_seconds["denoiser" if name == "denoiser" else "pmpo"] = elapsed
                 if name == "actor_critic":
-                    # Wall-clock monitoring (timing/*), not compared between runs. pmpo_update_seconds
-                    # is the whole PMPO phase (all updates, imagination and scoring included).
-                    timing = {"timing/pmpo_update_seconds": elapsed, "timing/pmpo_updates": steps,
-                              "timing/pmpo_seconds_per_update": elapsed / max(steps, 1),
-                              "timing/scorer_refresh_seconds": t_refresh}
-                    lcg = self._lcg_lifecycle
-                    if lcg is not None:
-                        timing.update({"timing/lcg_refresh_seconds": t_refresh,
-                                       "timing/lcg_precision_seconds": lcg.precision_seconds,
-                                       "timing/lcg_scoring_seconds": lcg.scoring_seconds})
-                    if self.plan2explore is not None:
-                        # Imagination feature extraction (one extractor pass per imagined step) and
-                        # head scoring, both inside pmpo_update_seconds; the refresh is not.
-                        timing.update({"timing/p2e_refresh_seconds": t_refresh,
-                                       "timing/p2e_imagination_feature_seconds": self.plan2explore.extractor.seconds,
-                                       "timing/p2e_scoring_seconds": self.plan2explore.scoring_seconds})
-                    if self.laplace is not None:
-                        # Member predictions (all K complete chains per imagined step) are inside
-                        # pmpo_update_seconds; the refresh (precision + sampling) is not.
-                        timing.update({"timing/laplace_refresh_seconds": t_refresh,
-                                       "timing/laplace_prediction_seconds": self.laplace.prediction_seconds,
-                                       "timing/laplace_prediction_calls": self.laplace.prediction_calls,
-                                       "timing/laplace_shared_prefix_evaluations": self.laplace.prefix_evaluations})
-                    if self._use_cuda:
-                        timing["timing/gpu_peak_allocated_gb"] = torch.cuda.max_memory_allocated(self._device) / 2 ** 30
-                        timing["timing/gpu_peak_reserved_gb"] = torch.cuda.max_memory_reserved(self._device) / 2 ** 30
-                    to_log.append(timing)
+                    # The whole PMPO phase (imagination and scoring included) per update; the
+                    # methods' internal timers keep counting but are not logged.
+                    self._pmpo_seconds_per_update = elapsed / max(steps, 1)
         return to_log
 
     def train_ensemble(self, steps: int) -> Logs:
         """Each member trains `steps` updates (the per-member schedule; K members cost K times the
-        updates) on its own RNG stream and sampler."""
-        to_log, timing = [], {}
+        updates) on its own RNG stream and sampler. Member counters stay in the checkpoint, the
+        W&B summary (scorer_summary) and progress/denoiser_updates_total."""
+        to_log = []
         ens = self.ensemble
         for k in range(ens.members):
-            t0 = time.time()
             with ens.member_rng(k):
                 to_log += self.train_component("denoiser", steps, member=k)
-            if self._use_cuda:
-                torch.cuda.synchronize(self._device)
-            timing[f"timing/denoiser_member_{k}_seconds"] = time.time() - t0
             sampler = self._member_samplers[k]
             ens.empty_bootstrap_batches[k] += sampler.empty_bootstrap_batches
             sampler.empty_bootstrap_batches = 0
-        summary = {"ensemble/total_denoiser_updates": sum(ens.updates)}
-        for k in range(ens.members):
-            summary[f"ensemble/member_{k}_updates"] = ens.updates[k]
-            summary[f"ensemble/member_{k}_empty_bootstrap_batches"] = ens.empty_bootstrap_batches[k]
-            if ens.bootstrap:
-                m = ens.multiplicity(k, self.train_dataset.num_episodes)
-                summary[f"ensemble/member_{k}_bootstrap_zero_episode_fraction"] = float((m == 0).mean())
-        to_log.append({**timing, **summary})
         return to_log
 
     def intrinsic_reward_metrics(self) -> Dict[str, Any]:
@@ -723,12 +682,15 @@ class ExplorationTrainer(StateDictMixin):
             self._gpu_peak = max(getattr(self, "_gpu_peak", 0.0), torch.cuda.max_memory_allocated(self._device) / 2 ** 30)
 
     def progress_counters(self) -> Dict[str, Any]:
+        """Cumulative counters: training env steps, test env steps (all fresh test collection, the
+        final one included), denoiser updates actually taken (summed over ensemble members) and,
+        for learned methods, PMPO updates."""
+        denoiser = sum(self.ensemble.updates) if self.ensemble is not None else self.num_batch_train.denoiser
         counters = {"progress/train_env_steps": int(self.train_dataset.num_steps),
                     "progress/test_env_steps": int(self.num_test_steps),
-                    "progress/denoiser_updates": int(self.num_batch_train.denoiser),
-                    "progress/pmpo_updates": int(self.agent.actor_critic.updates.item())}
-        if self.ensemble is not None:
-            counters["progress/member_denoiser_updates_total"] = int(sum(self.ensemble.updates))
+                    "progress/denoiser_updates_total": int(denoiser)}
+        if self._method is not None:  # uniform random has no PMPO
+            counters["progress/pmpo_updates"] = int(self.agent.actor_critic.updates.item())
         return counters
 
     def with_env_steps(self, rows: Logs) -> Logs:
@@ -739,8 +701,9 @@ class ExplorationTrainer(StateDictMixin):
 
     def log_rows(self, rows: Logs) -> None:
         """Log rows to W&B (each with the env-step axis) and mirror each one, keyed by its W&B
-        step, to wandb_history.jsonl before the checkpoint that commits it."""
-        rows = self.with_env_steps(rows)
+        step, to wandb_history.jsonl before the checkpoint that commits it. Only the published
+        keys (published_row) are sent and mirrored."""
+        rows = self.with_env_steps([row for row in map(published_row, rows) if row])
         if self._local_history:
             with open(self._path_history, "a", encoding="utf-8") as f:
                 for i, row in enumerate(rows):
@@ -768,7 +731,8 @@ class ExplorationTrainer(StateDictMixin):
         """On resume: W&B's starting step is the number of rows its server holds. Committed rows
         it lacks (lost when a hard crash also killed the upload) are re-logged from the mirror,
         each with resume/backfilled=1; rows beyond the checkpoint (an uncommitted epoch that is
-        now replayed) are counted, never silently duplicated. Returns the counts."""
+        now replayed) are counted, never silently duplicated. Returns the counts (W&B summary
+        "resume")."""
         server = int(getattr(wandb.run, "starting_step", 0) or 0)
         committed = self.wandb_steps
         if getattr(wandb.run, "offline", False) and committed is not None:
@@ -776,12 +740,12 @@ class ExplorationTrainer(StateDictMixin):
             # segment: backfilling would re-log every committed row, duplicated when both are synced.
             say("W&B offline: the server's row count is unknown, so no rows are backfilled "
                 f"({self._path_history} keeps every committed row)")
-            return {"resume/wandb_committed_rows": committed}
-        stats = {"resume/wandb_server_rows": server}
+            return {"wandb_committed_rows": committed}
+        stats = {"wandb_server_rows": server}
         if committed is None:  # checkpoint from before the mirror
             self.wandb_steps = server
             return stats
-        stats["resume/wandb_committed_rows"] = committed
+        stats["wandb_committed_rows"] = committed
         if server < committed and self._local_history and self._path_history.is_file():
             # Only records the checkpoint committed (before its byte offset; checkpoints from before
             # the offset: all complete records). Within them the last write of a step is the
@@ -796,54 +760,51 @@ class ExplorationTrainer(StateDictMixin):
             for step in range(server, committed):
                 record = latest[step]
                 wandb.log({"epoch": record["epoch"], **record["values"], "resume/backfilled": 1})
-            stats["resume/backfilled_rows"] = committed - server
+            stats["backfilled_rows"] = committed - server
             say(f"W&B: backfilled {committed - server} committed rows the server did not receive before the crash")
         elif server > committed:
-            stats["resume/server_rows_beyond_checkpoint"] = server - committed
+            stats["server_rows_beyond_checkpoint"] = server - committed
             say(f"W&B: {server - committed} rows logged after the checkpoint are on the server; their epochs are replayed")
             self.wandb_steps = server
         else:
             self.wandb_steps = max(committed, server)
         return stats
 
-    def epoch_summary(self, rows: Logs, steps_before: int, seconds: float) -> Dict[str, Any]:
-        """One compact W&B row (epoch_summary/*, progress/*, timing/epoch_*) of this epoch's
-        existing metrics (not shown on the terminal). Monitoring only."""
-        def values(match):
-            return [float(v) for row in rows for k, v in row.items() if match(k) and np.ndim(v) == 0]
-
-        def mean(match):
-            v = values(match)
-            return float(np.mean(v)) if v else None
-
-        summary = {}
-        summary["epoch_summary/denoiser_loss_mean"] = mean(
-            lambda k: k == "denoiser/train/loss_denoising" or (k.startswith("denoiser/member_") and k.endswith("/train/loss_denoising")))
-        if self.ensemble is not None:
-            for k in range(self.ensemble.members):
-                summary[f"epoch_summary/denoiser_member_{k}_loss_mean"] = mean(lambda key: key == f"denoiser/member_{k}/train/loss_denoising")
-        summary["epoch_summary/denoiser_test_loss_mean"] = mean(lambda k: k == "denoiser/test/loss_denoising")
-        for name in PMPO_SUMMARY:
-            summary[f"epoch_summary/pmpo_{name}_mean"] = mean(lambda k: k == f"actor_critic/train/core/{name}")
-        # negative_fraction is a debug metric; its epoch mean is 1 - the positive fraction's
-        # (complementary fractions of the same advantages; equal up to float rounding).
-        positive = summary["epoch_summary/pmpo_positive_fraction_mean"]
-        summary["epoch_summary/pmpo_negative_fraction_mean"] = None if positive is None else 1.0 - positive
-        summary["epoch_summary/intrinsic_raw_reward_mean"] = mean(lambda k: k == "actor_critic/train/intrinsic/raw_reward_mean")
-        raw_max = values(lambda k: k == "actor_critic/train/intrinsic/raw_reward_max")
-        summary["epoch_summary/intrinsic_raw_reward_max"] = max(raw_max) if raw_max else None
-        summary["epoch_summary/intrinsic_scaled_reward_mean"] = mean(lambda k: k == "actor_critic/train/intrinsic/scaled_reward_mean")
-        summary = {k: v for k, v in summary.items() if v is not None}
-        summary.update(self.progress_counters())
-        summary["progress/new_train_env_steps"] = int(self.train_dataset.num_steps - steps_before)
-        self.note_gpu_peak()
-        p = self._phase_seconds
-        timing = {f"timing/epoch_{k}_seconds": v for k, v in p.items()}
-        timing["timing/epoch_seconds"] = seconds
+    def epoch_row(self, seconds: float) -> Dict[str, Any]:
+        """The epoch's W&B row: the progress counters and the canonical wall-clock timings of the
+        phases that ran (no PMPO or scorer timing without PMPO). Monitoring only."""
+        row = self.progress_counters()
+        row.update({f"timing/epoch_{k}_seconds": v for k, v in self._phase_seconds.items()})
+        row["timing/epoch_seconds"] = seconds
+        if self._pmpo_seconds_per_update is not None:
+            row["timing/pmpo_seconds_per_update"] = self._pmpo_seconds_per_update
         if self._use_cuda:
-            timing["timing/epoch_gpu_peak_allocated_gb"] = self._gpu_peak
+            self.note_gpu_peak()
+            row["timing/epoch_gpu_peak_allocated_gb"] = self._gpu_peak
+        return row
 
-        return {**summary, **timing}
+    def scorer_summary(self) -> None:
+        """The frozen scorer's identity and the methods' bookkeeping counters (refreshes, member
+        updates, bootstrap fallbacks): latest values in the W&B summary ("scorer"), no charts."""
+        if wandb.run is None or self._method is None:
+            return
+        reason = self._intrinsic.unavailable_reason()
+        info = dict(self._intrinsic.settings()) if reason is None else dict(method=self._method, unavailable=reason)
+        lcg = self._lcg_lifecycle
+        if lcg is not None and lcg.ready:
+            info.update(h_D_fingerprint=float(lcg.h_D.sum().item()),
+                        banks_fingerprint=float(sum(s.item() for s in lcg.bank.sigmas)))
+        if self.ensemble is not None:
+            info.update(member_updates=[int(u) for u in self.ensemble.updates],
+                        empty_bootstrap_batches=[int(n) for n in self.ensemble.empty_bootstrap_batches])
+        if self.plan2explore is not None:
+            p2e = self.plan2explore
+            info.update(refreshes=int(p2e.refreshes), fit_updates=[int(n) for n in p2e.fit_updates],
+                        empty_bootstrap_fallbacks=[int(n) for n in p2e.empty_bootstrap_fallbacks],
+                        cache_identity=p2e.cache_identity)
+        if self.laplace is not None:
+            info.update(refreshes=int(self.laplace.refreshes))
+        wandb.summary["scorer"] = info
 
     def announce_start(self) -> None:
         """Startup summary (stdout) once the run's state is final."""
@@ -870,7 +831,7 @@ class ExplorationTrainer(StateDictMixin):
         """W&B axes and provenance (no-op without an active run)."""
         if self._rank != 0 or wandb.run is None:
             return
-        wandb.define_metric("epoch")
+        wandb.define_metric("epoch", hidden=True)  # an x-axis only, no chart of its own
         wandb.define_metric(PMPO_UPDATE_AXIS)
         wandb.define_metric("actor_critic/train/*", step_metric=PMPO_UPDATE_AXIS)
         wandb.define_metric("denoiser/train/num_batch_train_denoiser")
@@ -885,7 +846,8 @@ class ExplorationTrainer(StateDictMixin):
         wandb.config.update({"provenance": self.provenance()}, allow_val_change=True)
         wandb.summary["resume_count"] = self.resume_count
         if self._cfg.common.resume:
-            self._start_logs[-1].update(self.reconcile_wandb_history())
+            self._resume_event.update(self.reconcile_wandb_history())
+            wandb.summary["resume"] = self._resume_event
             for milestone in self.milestones:
                 if not milestone["retired"]:
                     self.milestone_summary(milestone["name"])
@@ -894,10 +856,13 @@ class ExplorationTrainer(StateDictMixin):
         settings = None
         if self._method is not None:
             settings = dict(reward_scaling=self._lcg_reward_scaling)
+            if self._lcg_theta_s_dim is not None:
+                settings["lcg"] = dict(theta_s_dim=int(self._lcg_theta_s_dim))
             if self.laplace is not None:
-                settings["laplace"] = self.laplace.settings()
-            if self.plan2explore is not None:
-                settings["plan2explore"] = self.plan2explore.settings()
+                settings["laplace"] = self.laplace.settings()  # includes the selected dimension
+            if self.plan2explore is not None:  # extractor settings include the feature dimension
+                settings["plan2explore"] = dict(self.plan2explore.settings(),
+                                                head_parameters=int(self.plan2explore.num_head_parameters))
             if self.ensemble is not None:
                 settings["ensemble"] = self.ensemble.settings()
         controller = None
@@ -920,10 +885,11 @@ class ExplorationTrainer(StateDictMixin):
                     env=OmegaConf.to_container(cfg.env.test), intrinsic=self._intrinsic_eval and self._method is not None,
                     intrinsic_note=INTRINSIC_UNITS_NOTE)
 
-    def intrinsic_evaluation(self, final: bool) -> Logs:
-        """Per test episode: length, task returns and (learned methods) raw and scaled intrinsic
-        returns from the frozen scorer; logged under <block>/ and saved to evaluation/*.json.
-        Fresh episodes are a current-policy evaluation; reused ones a dataset diagnostic."""
+    def intrinsic_evaluation(self, final: bool, new_steps: int) -> Dict[str, Any]:
+        """Per test episode: length and (learned methods) raw and scaled intrinsic returns from the
+        frozen scorer, saved to evaluation/*.json with the protocol and status. W&B gets only the
+        returns (evaluation_metrics) and the status in the summary (evaluation/<block>). Fresh
+        episodes are a current-policy evaluation; reused ones a dataset diagnostic."""
         td, fresh = self.test_dataset, self._collect_test
         block = ("final_" if final else "") + ("test_eval" if fresh else "test_dataset_diagnostic")
         labels = self.test_episode_seeds
@@ -945,12 +911,7 @@ class ExplorationTrainer(StateDictMixin):
             if reason is None:
                 record.update(episode_record(*self._intrinsic.score_episode(episode)))
             records.append(record)
-        row = {f"{block}/intrinsic_applicable": int(self._method is not None), f"{block}/intrinsic_scored": int(reason is None),
-               f"{block}/num_episodes": td.num_episodes}
-        for record in records:
-            label = f"seed_{record['seed']}" if record["seed"] is not None else f"episode_{record['episode']}"
-            row.update({f"{block}/{label}/{k}": v for k, v in record.items() if k not in ("episode", "seed")})
-        row.update({f"{block}/{k}": v for k, v in aggregate(records).items()})
+        row = evaluation_metrics(block, records)
 
         if not fresh:
             kind = "dataset_diagnostic (reused test episodes, not the current policy)"
@@ -962,24 +923,29 @@ class ExplorationTrainer(StateDictMixin):
         if reason is None and any("intrinsic_scaled_return" not in r for r in records):
             say(f"Warning: no frozen reward scale{'; ' + self._scorer_restore_note if self._scorer_restore_note else ''}"
                 "; scaled returns are N/A")
-        result = dict(kind=kind, block=block, epoch=self.epoch, final=final, fresh=fresh,
+        intrinsic = dict(applicable=self._method is not None, scored=reason is None, reason=reason,
+                         scorer=self._intrinsic.settings() if reason is None else None)
+        status = dict(kind=kind, block=block, epoch=self.epoch, final=final, fresh=fresh,
+                      num_episodes=td.num_episodes, num_steps=int(td.num_steps), new_test_env_steps=int(new_steps),
                       train_env_steps=int(self.train_dataset.num_steps), total_test_env_steps=int(self.num_test_steps),
-                      pmpo_updates=int(self.agent.actor_critic.updates.item()), protocol=self.evaluation_protocol(),
-                      intrinsic=dict(applicable=self._method is not None, scored=reason is None, reason=reason,
-                                     scorer=self._intrinsic.settings() if reason is None else None),
-                      episodes=records, aggregate=aggregate(records))
+                      pmpo_updates=int(self.agent.actor_critic.updates.item()))
+        result = dict(status, protocol=self.evaluation_protocol(), intrinsic=intrinsic, episodes=records,
+                      aggregate=aggregate(records))
         path = Path("evaluation") / (f"final_epoch_{self.epoch:05d}.json" if final else f"epoch_{self.epoch:05d}.json")
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps(result, indent=2, default=str))
-        return [row]
+        if wandb.run is not None:  # the latest diagnostic of each block; per-episode details stay in the file
+            wandb.summary[f"evaluation/{block}"] = dict(status, intrinsic=intrinsic, file=str(path))
+        return row
 
     def test_diagnostics(self, final: bool = False) -> Logs:
         """A scheduled (or the final) test diagnostic: collect fresh test episodes if
         evaluation.collect_test, else reuse the test dataset; then the denoiser test loss on
         reward-free batches and the intrinsic evaluation. Task returns are neither shown nor
         logged (the test episodes keep their task-reward columns). Uses the test RNG stream and restores module modes; no weights,
-        optimizers, schedules or training data change."""
-        td = self.test_dataset
+        optimizers, schedules or training data change. Returns one W&B row: the mean test loss
+        (denoiser/test or, final, denoiser/final_test), the evaluation returns and, for the final
+        diagnostic, its timing and the progress counters (test steps incl. the final collection)."""
         t0 = time.time()
         training_rng = rng_state()
         modes = {name: module.training for name, module in self.agent.named_modules()}
@@ -987,28 +953,22 @@ class ExplorationTrainer(StateDictMixin):
         if final:
             phase()  # the final evaluation is not part of an epoch
         try:
-            to_log, new_steps = [], 0
-            if self._collect_test:
-                to_log = self.collect_test(final)
-                new_steps = sum(x[f"{td.name}/new_env_steps"] for x in to_log if f"{td.name}/new_env_steps" in x)
+            new_steps = self.collect_test(final) if self._collect_test else 0
             self.num_test_steps += new_steps
-            to_log += self.test_agent()
+            row = mean_test_metrics(self.test_agent(), final)
             # The frozen scorer on the real test episodes (test RNG stream; nothing refreshed).
-            to_log += self.intrinsic_evaluation(final)
-            summary = dict(fresh=int(self._collect_test), num_episodes=td.num_episodes, num_steps=td.num_steps,
-                           new_env_steps=new_steps, total_new_env_steps=self.num_test_steps)
-            prefix = "final_test" if final else "test"
-            to_log.append({f"{prefix}/{k}": v for k, v in summary.items()})
+            row.update(self.intrinsic_evaluation(final, new_steps))
         finally:
             self.test_rng = rng_state()
             set_rng_state(training_rng)
             for name, module in self.agent.named_modules():
                 module.training = modes[name]
         seconds = time.time() - t0
-        if not final:
-            self._phase_seconds["test"] = seconds
-        to_log.append({f"timing/{'final_' if final else ''}test_diagnostic_seconds": seconds})
-        return to_log
+        if final:
+            row.update({"timing/final_test_diagnostic_seconds": seconds, **self.progress_counters()})
+        else:
+            self._phase_seconds["test"] = seconds  # timing/epoch_test_seconds
+        return [row] if row else []
 
     def check_reusable_test_dataset(self) -> None:
         """Reuse-only diagnostics need test episodes on disk; training replay is never used."""
@@ -1076,9 +1036,10 @@ class ExplorationTrainer(StateDictMixin):
                 raise FloatingPointError(f"Non-finite {name} loss")
             loss.backward()
 
-            if member is None or member == 0:
+            if member is None or member == 0:  # member 0 also advances the denoiser counter (not logged)
                 num_batch = self.num_batch_train.get(name)
-                metrics[f"num_batch_train_{name}"] = num_batch
+                if member is None:
+                    metrics[f"num_batch_train_{name}"] = num_batch
                 self.num_batch_train.set(name, num_batch + 1)
             if member is not None:
                 metrics[f"num_batch_train_member"] = self.ensemble.updates[member]
@@ -1110,12 +1071,10 @@ class ExplorationTrainer(StateDictMixin):
         data_loader = self._data_loader_test.get(name)
         model.eval()
         to_log = []
-        for batch in data_loader:  # no terminal output: the test loss is logged to W&B only
+        for batch in data_loader:  # no terminal output; per-batch rows, averaged by mean_test_metrics
             batch = batch.to(self._device)
             _, metrics = model(batch)
-            num_batch = self.num_batch_test.get(name)
-            metrics[f"num_batch_test_{name}"] = num_batch
-            self.num_batch_test.set(name, num_batch + 1)
+            self.num_batch_test.set(name, self.num_batch_test.get(name) + 1)
             to_log.append(metrics)
 
         process_confusion_matrices_if_any_and_compute_classification_metrics(to_log)
@@ -1391,16 +1350,14 @@ REFRESH_WORK = {"lcg": "historical precision and candidate bank on this epoch's 
                 "ensemble_disagreement": "freezing the trained members (no refresh computation)",
                 "plan2explore_disagreement": "replay feature encoding and fresh predictor heads",
                 "laplace_disagreement": "historical precision and a new posterior sample bank"}
-# Existing PMPO metrics averaged over the epoch's updates in epoch_summary/*.
 PMPO_UPDATE_AXIS = "actor_critic/train/core/num_batch_train_actor_critic"
-PMPO_SUMMARY = ("loss_actor", "loss_value", "policy_entropy", "kl_prior", "positive_fraction",
-                "actor_grad_norm", "value_grad_norm", "return_mean")
 # W&B metrics plotted against epoch (setup_wandb): every logged key outside the per-update
-# denoiser/actor_critic train rows.
-EPOCH_AXIS_METRICS = ("epoch_summary/*", "progress/*", "timing/*", "duration", "resume/*", "milestone/*",
-                      "train_dataset/*", "test_dataset/*", "denoiser/test/*", "test/*", "final_test/*",
-                      "test_eval/*", "final_test_eval/*", "test_dataset_diagnostic/*", "final_test_dataset_diagnostic/*",
-                      "ensemble/*", "plan2explore/*", "laplace/*", "lcg/*", "classification_metrics/*", "length")
+# denoiser/actor_critic train rows. epoch itself is a hidden x-axis.
+EPOCH_AXIS_METRICS = ("progress/*", "timing/*", "resume/*", "denoiser/test/*", "denoiser/final_test/*",
+                      "test_eval/*", "final_test_eval/*", "test_dataset_diagnostic/*", "final_test_dataset_diagnostic/*")
+# Per-update denoiser values that stay in the trainer's rows (the PMPO diagnostic reads them) but
+# are not published to W&B.
+UNPUBLISHED_DENOISER_METRICS = ("lr", "grad_norm_before_clip")
 INTRINSIC_UNITS_NOTE = ("Intrinsic returns are in each method's own units (LCG score, pixel variance, feature "
                         "variance, ...); they compare checkpoints within one method, never methods with each other.")
 
@@ -1408,24 +1365,41 @@ INTRINSIC_UNITS_NOTE = ("Intrinsic returns are in each method's own units (LCG s
 MISSING = object()  # a checkpoint field that older code did not save
 
 
-def without_task_returns(rows: Logs) -> Logs:
-    """Collection rows without the per-episode return (the env reward is a downstream task's
-    reward, so it is a task return); episode ids, lengths and counts stay. Replay is unchanged."""
-    return [{k: v for k, v in row.items() if k != "return"} for row in rows]
+def published_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The keys of a trainer row that are sent to W&B (and mirrored to wandb_history.jsonl)."""
+    return {k: v for k, v in row.items()
+            if not (k.startswith("denoiser/") and k.rsplit("/", 1)[-1] in UNPUBLISHED_DENOISER_METRICS)}
 
 
-def lcg_refresh_metrics(lcg, dataset: Dataset) -> Dict[str, Any]:
-    """LCG refresh identity for W&B (the lifecycle's stdout lines are off in exploration)."""
-    if not lcg.ready:
-        return {}  # no round was set up; the missing hook is reported by PMPO
-    return {"lcg/round": lcg.round_id, "lcg/replay_steps": int(dataset.num_steps),
-            "lcg/theta_s_dim": int(lcg._theta_s_dim), "lcg/h_D_fingerprint": float(lcg.h_D.sum().item()),
-            "lcg/banks_fingerprint": float(sum(s.item() for s in lcg.bank.sigmas))}
+def mean_test_metrics(rows: Logs, final: bool) -> Dict[str, float]:
+    """One value per test diagnostic for each denoiser test metric: the unweighted mean over the
+    test batches of the per-batch values (each a batch-mean loss), the definition of the former
+    epoch_summary/denoiser_test_loss_mean. The final diagnostic's go under denoiser/final_test/."""
+    out = {}
+    for key in dict.fromkeys(k for row in rows for k in row):
+        name = key.replace("/test/", "/final_test/", 1) if final else key
+        out[name] = float(np.mean([float(row[key]) for row in rows if key in row]))
+    return out
+
+
+def evaluation_metrics(block: str, records: List[Dict[str, Any]]) -> Dict[str, float]:
+    """An evaluation's W&B keys: raw and scaled intrinsic return of each seeded episode and their
+    mean and (population) std over the episodes; unseeded episodes give the mean and std only.
+    Unscored evaluations (uniform random, no frozen scorer) give none, a missing scale no scaled
+    keys. Lengths, scored steps, per-step values and status stay in evaluation/*.json."""
+    stats, row = aggregate(records), {}
+    for kind in ("raw", "scaled"):
+        key = f"intrinsic_{kind}_return"
+        if f"{key}_mean" not in stats:
+            continue
+        row.update({f"{block}/seed_{r['seed']}/{key}": r[key] for r in records if r["seed"] is not None})
+        row.update({f"{block}/{key}_{s}": stats[f"{key}_{s}"] for s in ("mean", "std")})
+    return row
 
 
 def training_intrinsic_line(rows: Logs) -> str:
     """Raw and scaled intrinsic reward per imagined step over this epoch's PMPO updates: mean of
-    the per-update means, max of the per-update maxima (the epoch_summary/* definitions)."""
+    the per-update means, max of the per-update maxima."""
     def stat(key, reduce):
         values = [float(row[key]) for row in rows if key in row]
         return reduce(values) if values else None
