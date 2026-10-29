@@ -46,7 +46,7 @@ def test_configured_member_is_loaded_recorded_and_kept_apart(tmp_path, monkeypat
     assert not any(p.requires_grad for p in trainer.agent.denoiser.parameters())
     assert trainer.output_dir.name == "seed_0_member_2" and default.output_dir.name == "seed_0"
     out = trainer.run()
-    summary = OmegaConf.load(out / "summary.yaml")
+    summary = OmegaConf.load(out / "summary.json")
     assert summary.milestone.member_index == 2
     assert summary.milestone.member_sha256 == state_sha256(states[1]) == manifest["identity"]["member_sha256"][2]
 

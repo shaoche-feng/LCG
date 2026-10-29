@@ -605,3 +605,30 @@ def test_resume_of_a_run_without_wandb_starts_one_and_backfills_its_committed_up
     event = fake.summary["resume"]
     assert event["previous_status"] == "no earlier W&B run" and event["backfilled_rows"] == 8
     assert [s for s, _ in fake.logged] == list(range(10))  # 8 committed rows backfilled, then PMPO updates 3 and 4
+
+
+def test_resume_needs_the_milestone_manifest_json(tmp_path, monkeypatch):
+    """A resume reads the milestone's manifest.json like a fresh run; without it the resume stops with a
+    clear error and the work folder is kept."""
+    milestone = build_milestone(tmp_path)
+    original = DownstreamTrainer.policy_update
+
+    def crash(self):
+        original(self)
+        if self.num_updates["actor_critic"] == 3:
+            raise Crash()
+
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", crash)
+    with pytest.raises(Crash):
+        make(milestone, monkeypatch).run()
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", original)
+    manifest = milestone / "manifest.json"
+    saved = manifest.read_bytes()
+    manifest.unlink()
+    work = tmp_path / "run/downstream/steps_000026/walk/.seed_0.tmp"
+    with pytest.raises(FileNotFoundError, match="No milestone manifest at .*manifest.json"):
+        make(milestone, monkeypatch, resume=True)
+    assert (work / "checkpoints/state.pt").is_file()
+    manifest.write_bytes(saved)
+    output = make(milestone, monkeypatch, resume=True).run()
+    assert json.loads((output / "summary.json").read_text())["num_updates"] == {"rew_end_model": 6, "actor_critic": 4}

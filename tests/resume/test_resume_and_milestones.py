@@ -237,8 +237,9 @@ def test_milestones_are_immutable_movable_and_validated(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="no reward labels for task 'jump'"):
         load_milestone(milestone.path, "jump")
     bad = Path(shutil.copytree(moved, tmp_path / "bad"))
-    with open(bad / "milestones/steps_000018/manifest.yaml", "a", encoding="utf-8") as f:
-        f.write("collected_steps: 19\n")
+    manifest = bad / "milestones/steps_000018/manifest.json"
+    manifest.write_text(manifest.read_text(encoding="utf-8").replace('"collected_steps": 18', '"collected_steps": 19', 1),
+                        encoding="utf-8")
     with pytest.raises(ValueError, match="manifest says 19"):
         load_milestone(bad / "milestones/steps_000018", "walk")
     (bad / "milestones/steps_000024/denoiser.pt").write_bytes(b"corrupt")

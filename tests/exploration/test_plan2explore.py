@@ -842,4 +842,4 @@ def test_downstream_trainer_loads_a_plan2explore_milestone(tmp_path, monkeypatch
     trainer = down.make_trainer(path, monkeypatch)
     assert down.states_equal(m.denoiser_state, trainer.agent.denoiser.state_dict())
     out = trainer.run()
-    assert (out / "summary.yaml").is_file()
+    assert (out / "summary.json").is_file()

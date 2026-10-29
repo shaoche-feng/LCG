@@ -5,14 +5,18 @@ Layout inside a run folder:
     milestones/steps_NNNNNN/denoiser.pt    denoiser weights (ensemble: member 0)
     milestones/steps_NNNNNN/denoiser_member_K.pt  ensemble member K >= 1 (ensemble runs only)
     milestones/steps_NNNNNN/dataset.pt     replay index (episode versions, checksums, lengths, labels)
-    milestones/steps_NNNNNN/manifest.yaml  what the milestone is, with file checksums
+    milestones/steps_NNNNNN/manifest.json  what the milestone is, with file checksums
 
 All paths are relative to the milestone folder, so the whole run folder can be moved.
 Episode files are the dataset's immutable versions (`<id>_<length>.pt`), shared with
 checkpoints and other milestones rather than copied.
+
+File formats: configuration is YAML, generated metadata (milestone manifests, downstream
+summaries and evaluation reports) is JSON only, append-only training metrics are JSONL.
 """
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -20,7 +24,6 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import yaml
 
 from .dataset import Dataset
 from utils import file_sha256
@@ -28,7 +31,46 @@ from utils import file_sha256
 SCHEMA_VERSION = 1
 DENOISER_FILE = "denoiser.pt"
 DATASET_FILE = "dataset.pt"
-MANIFEST_FILE = "manifest.yaml"
+MANIFEST_FILE = "manifest.json"
+SUMMARY_FILE = "summary.json"  # a completed downstream output
+
+
+def write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Generated metadata as standard JSON: a non-finite number raises instead of being written as
+    NaN/Infinity. Written aside and renamed, so a reader never sees a partial file."""
+    path = Path(path)
+    text = json.dumps(data, indent=2, allow_nan=False) + "\n"
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def reject_constant(name: str) -> None:
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def read_json(path: Path, what: str) -> Dict[str, Any]:
+    """Generated metadata: standard JSON holding a mapping (NaN/Infinity are rejected). A missing file
+    is reported as such, naming a generated YAML file left by older code if there is one (not read)."""
+    path = Path(path)
+    if not path.is_file():
+        old = path.with_suffix(".yaml")
+        raise FileNotFoundError(f"No {what} at {path}" + (
+            f" (only {old.name}, generated YAML metadata from before 2026-10-29, which is no longer read)"
+            if old.is_file() else ""))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_constant)
+    except ValueError as error:
+        raise ValueError(f"{path} is not valid JSON ({error})") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} does not hold a JSON object")
+    return data
+
+
+def downstream_summary(output_dir: Path) -> Optional[Dict[str, Any]]:
+    """The completion summary (summary.json) of a downstream output; None if it was not completed."""
+    path = Path(output_dir) / SUMMARY_FILE
+    return read_json(path, "downstream summary") if path.is_file() else None
 
 
 def milestone_name(num_steps: int) -> str:
@@ -113,8 +155,7 @@ def publish_milestone(
         ),
         identity=identity,
     )
-    with open(tmp / MANIFEST_FILE, "w", encoding="utf-8") as f:
-        yaml.safe_dump(manifest, f, sort_keys=False)
+    write_json(tmp / MANIFEST_FILE, manifest)
     replace_directory(tmp, final)
     return final
 
@@ -141,10 +182,7 @@ def index_sha256(dataset: Dataset) -> str:
 
 def read_manifest(milestone_path: Path) -> Dict[str, Any]:
     path = Path(milestone_path) / MANIFEST_FILE
-    if not path.is_file():
-        raise FileNotFoundError(f"No milestone manifest at {path}")
-    with open(path, encoding="utf-8") as f:
-        manifest = yaml.safe_load(f)
+    manifest = read_json(path, "milestone manifest")
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"{path}: schema_version {manifest.get('schema_version')}, expected {SCHEMA_VERSION}")
     return manifest
@@ -167,7 +205,7 @@ def discover_milestones(milestones_dir: Path) -> List[Tuple[Path, Dict[str, Any]
         else:
             try:
                 manifest = read_manifest(path)
-            except (OSError, ValueError, yaml.YAMLError) as error:
+            except (OSError, ValueError) as error:
                 problems.append(f"{path.name}: {error}")
                 continue
             steps = manifest.get("collected_steps")

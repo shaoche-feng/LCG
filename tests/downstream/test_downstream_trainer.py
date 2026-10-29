@@ -20,7 +20,7 @@ import downstream_main
 import downstream_trainer as downstream_module
 from coroutines.env_loop import make_env_loop
 from data import Dataset, Episode
-from data.milestone import discover_milestones, publish_milestone
+from data.milestone import discover_milestones, load_milestone, publish_milestone, read_manifest, write_json
 from data.segment import SegmentId
 from data.utils import make_task_reward_collate
 from downstream_trainer import DownstreamTrainer
@@ -141,8 +141,8 @@ def test_outputs_are_separate_complete_and_never_overwritten(tmp_path, monkeypat
     out = tmp_path / "run/downstream/steps_000026/walk/seed_3"
     assert trainer.output_dir == out and not (out.parent / ".seed_3.tmp").exists()
     assert sorted(p.name for p in out.iterdir()) == ["actor_critic.pt", "config.yaml", "metrics.jsonl",
-                                                     "rew_end_model.pt", "summary.yaml"]
-    summary = OmegaConf.load(out / "summary.yaml")
+                                                     "rew_end_model.pt", "summary.json"]
+    summary = OmegaConf.load(out / "summary.json")
     assert summary.task_name == "walk" and summary.task_index == 1 and summary.seed == 3
     assert summary.num_updates == {"rew_end_model": 4, "actor_critic": 3}
     assert summary.milestone.path == "../../../../milestones/steps_000026"
@@ -314,7 +314,7 @@ def test_entry_point_runs_through_hydra(tmp_path):
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[-2000:]
     out = tmp_path / "run/downstream/steps_000026/run/seed_1"
-    assert (out / "summary.yaml").is_file() and OmegaConf.load(out / "summary.yaml").task_index == 2
+    assert (out / "summary.json").is_file() and OmegaConf.load(out / "summary.json").task_index == 2
     assert not list(ROOT.glob("*.log"))  # no Hydra log file written into the repository
     config = OmegaConf.load(out / "config.yaml")  # a normal single-milestone configuration
     assert "milestones_dir" not in config.initialization and config.initialization.milestone_path == milestone.as_posix()
@@ -391,9 +391,9 @@ def test_discovery_orders_by_recorded_steps_and_rejects_bad_folders(tmp_path):
         with pytest.raises(ValueError, match=f"Malformed milestones folder(.|\\n)*{message}"):
             discover_milestones(milestones)
         shutil.rmtree(milestones / name) if (milestones / name).is_dir() else (milestones / name).unlink()
-    manifest = milestones / "a_third/manifest.yaml"
+    manifest = milestones / "a_third/manifest.json"
     text = manifest.read_text(encoding="utf-8")
-    manifest.write_text(text.replace("collected_steps: 26", "collected_steps: many"), encoding="utf-8")
+    manifest.write_text(text.replace('"collected_steps": 26', '"collected_steps": "many"'), encoding="utf-8")
     with pytest.raises(ValueError, match="a_third: manifest has no integer collected_steps"):
         discover_milestones(milestones)
 
@@ -460,7 +460,7 @@ def test_children_get_their_own_milestone_with_identical_settings_and_failure_st
     def crash_after_checkpoint(command):
         if len(run.commands) == 1:
             completed.mkdir(parents=True)
-            (completed / "summary.yaml").write_text("done\n")
+            (completed / "summary.json").write_text("done\n")
         else:
             (work / "checkpoints").mkdir(parents=True)
             (work / "checkpoints/state.pt").write_bytes(b"checkpoint")
@@ -476,7 +476,7 @@ def test_children_get_their_own_milestone_with_identical_settings_and_failure_st
     assert "steps_000020: FAILED (exit code 3)" in out and f"resumable work folder {work} kept; resume it with:" in out
     resume = downstream_main.milestone_command(base, milestones / "steps_000020", "resume")
     assert downstream_main.shell(resume) in out and resume[-1] == "downstream.mode=resume" and "downstream.seed=7" in resume
-    assert (completed / "summary.yaml").is_file() and (work / "checkpoints/state.pt").is_file()  # both preserved
+    assert (completed / "summary.json").is_file() and (work / "checkpoints/state.pt").is_file()  # both preserved
     assert "Stopped at the failure; later milestones were not started." in out
 
 
@@ -493,7 +493,7 @@ def test_folder_mode_runs_independent_single_milestone_trainings(tmp_path):
     configs = {}
     for name, steps in (("steps_000020", 20), ("steps_000026", 26)):
         out = tmp_path / f"a/run/downstream/{name}/run/seed_1"
-        summary = OmegaConf.load(out / "summary.yaml")
+        summary = OmegaConf.load(out / "summary.json")
         assert (summary.milestone.collected_steps, summary.seed, summary.task_name) == (steps, 1, "run")
         assert (out / summary.milestone.path).resolve() == (milestones / name).resolve()
         assert summary.num_updates == {"rew_end_model": 4, "actor_critic": 3}
@@ -570,7 +570,7 @@ def test_folder_mode_from_a_config_file_with_a_custom_config_source(tmp_path, so
         assert Path(config.initialization.milestone_path).resolve() == (milestones / name).resolve()
         assert (config.downstream.task_name, config.downstream.seed, config.rew_end_model.optimizer.lr,
                 config.rew_end_model.training.steps, config.actor_critic.training.steps) == ("run", 3, 0.0003, 4, 3)
-        assert OmegaConf.load(out / "summary.yaml").num_updates == {"rew_end_model": 4, "actor_critic": 3}
+        assert OmegaConf.load(out / "summary.json").num_updates == {"rew_end_model": 4, "actor_critic": 3}
 
 
 def test_failure_after_publication_reports_the_outputs_and_their_evaluate_command(tmp_path, capsys):
@@ -595,7 +595,7 @@ def test_failure_after_publication_reports_the_outputs_and_their_evaluate_comman
     evaluate = downstream_main.milestone_command(base, milestones / "steps_000020", "evaluate")
     assert f"steps_000020: FAILED (exit code 1) after" in out and f"training outputs were published at {output}" in out
     assert downstream_main.shell(evaluate) in out and "steps_000026: not started" in out
-    assert (output / "summary.yaml").is_file() and not (output / "evaluations").exists()  # nothing deleted
+    assert (output / "summary.json").is_file() and not (output / "evaluations").exists()  # nothing deleted
     assert evaluate[len(base) - 1:] == ["++initialization.milestones_dir=null",
                                         f"initialization.milestone_path={(milestones / 'steps_000020').resolve().as_posix()}",
                                         "downstream.mode=evaluate"]
@@ -721,14 +721,14 @@ def test_terminal_format_single_milestone_folder_and_evaluate_only(tmp_path):
 
 def test_evaluate_only_needs_only_the_saved_output_not_the_milestone(tmp_path):
     """A completed output is evaluated after its source milestone and replay were moved away: the
-    banner comes from the output's config.yaml and summary.yaml; nothing reads the milestone."""
+    banner comes from the output's config.yaml and summary.json; nothing reads the milestone."""
     milestones = build_milestone(tmp_path).parent
     single, root = milestones / "steps_000026", tmp_path / "run/downstream"
     output = root / "steps_000026/walk/seed_0"
     downstream_screen(f"initialization.milestone_path={single.as_posix()}", "downstream.task_name=walk", *TINY_DOWNSTREAM)
     shutil.move(str(tmp_path / "run/milestones"), str(tmp_path / "moved_milestones"))
     shutil.move(str(tmp_path / "run/dataset"), str(tmp_path / "moved_dataset"))
-    assert not single.exists() and (output / "summary.yaml").is_file()
+    assert not single.exists() and (output / "summary.json").is_file()
     trained = tree_hashes(output)
 
     evaluate = [f"initialization.milestone_path={single.as_posix()}", "downstream.task_name=walk", "downstream.mode=evaluate",
@@ -740,7 +740,7 @@ def test_evaluate_only_needs_only_the_saved_output_not_the_milestone(tmp_path):
     rest = lines[len(expected):]
     assert rest[:7] == ["Downstream batch: 1 milestone", "  Domain: walker; task: walk", "  Adaptation seed: 0",
                         "  Mode: evaluate only (completed output)", "  Milestones:",
-                        "  1. steps_000026 | 26 training env steps", ""]  # recorded in summary.yaml
+                        "  1. steps_000026 | 26 training env steps", ""]  # recorded in summary.json
     assert rest[7] == "=== Milestone 1/1: steps_000026 ==="
     assert check_block(rest[8:], output, [5, 9], training=False) == [""]
     assert {k: v for k, v in tree_hashes(output).items() if "evaluations" not in k} == trained  # outputs untouched
@@ -755,9 +755,9 @@ def test_evaluate_only_needs_only_the_saved_output_not_the_milestone(tmp_path):
     assert evaluation.read_bytes() == before
 
     # Historical metadata not in the summary is labelled, not guessed.
-    summary = yaml.safe_load((output / "summary.yaml").read_text(encoding="utf-8"))
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     del summary["milestone"]["collected_steps"]
-    (output / "summary.yaml").write_text(yaml.safe_dump(summary, sort_keys=False), encoding="utf-8")
+    (output / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
     lines = downstream_screen(*evaluate[:-1], "evaluation.seeds=[7]")
     assert "  1. steps_000026 | training env steps not recorded in the saved output" in lines
     assert check_block(lines[lines.index("=== Milestone 1/1: steps_000026 ===") + 1:], output, [7], training=False) == [""]
@@ -889,7 +889,7 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
     assert provenance["exploration"]["seed"].startswith("not recorded")
     assert provenance["milestone"]["collected_steps"] == 26 and provenance["denoiser_member"]["index"] == 0
     assert provenance["milestone"]["replay_sha256"] == trainer.milestone.manifest["files"]["dataset"]["sha256"]
-    assert provenance["denoiser_member"]["sha256"] == OmegaConf.load(output / "summary.yaml").milestone.member_sha256
+    assert provenance["denoiser_member"]["sha256"] == OmegaConf.load(output / "summary.json").milestone.member_sha256
     assert provenance["controller"]["actor_objective"] == {"mode": "sign"} and provenance["evaluation"]["seeds"] == [3001, 3002, 3005]
     assert json.loads((output / "wandb_run.json").read_text())["id"] == "dsrun1"
     assert fake.summary["status"] == "completed" and fake.finished == [0]
@@ -1016,7 +1016,7 @@ def test_evaluate_only_status_after_a_failed_final_evaluation_of_an_adaptation_r
     with pytest.raises(EvaluationFailure):
         trainer.run()
     output = tmp_path / "run/downstream/steps_000026/walk/seed_0"
-    assert (output / "summary.yaml").is_file() and not (output / "evaluations").exists()
+    assert (output / "summary.json").is_file() and not (output / "evaluations").exists()
     assert (first.summary["status"], first.summary["activity"], first.finished) == ("failed", "adaptation", [1])
     assert "evaluation crashed" in first.summary["error"]
 
@@ -1069,6 +1069,99 @@ def test_standalone_evaluate_only_run_status(tmp_path, monkeypatch):
     downstream_module.evaluate_saved_output(evaluate_only_cfg(milestone, "evaluation.seeds=[5]"))
     assert (retry.summary["status"], retry.summary["activity"], retry.finished) == ("completed", "evaluate_only", [0])
     assert "error" not in retry.summary and not history(retry.summary) and len(retry.logged) == 1
+
+# ---------------------------------------------------------------- metadata format (JSON only)
+
+def test_milestone_metadata_is_json_only(tmp_path):
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    new = milestones / "steps_000026"
+    assert sorted(p.name for p in new.iterdir()) == ["dataset.pt", "denoiser.pt", "manifest.json"]
+    manifest = json.loads((new / "manifest.json").read_text(encoding="utf-8"))  # standard JSON
+    assert manifest == read_manifest(new) and manifest["collected_steps"] == 26
+    assert load_milestone(new, "walk").manifest == manifest
+    assert [(p.name, m["collected_steps"]) for p, m in discover_milestones(milestones)] == [("steps_000020", 20),
+                                                                                            ("steps_000026", 26)]
+    cfg, folder, base, _ = folder_cfg(milestones)
+    run = FakeRun()
+    assert downstream_main.run_milestones(cfg, folder, base, run=run) == 0 and len(run.commands) == 2
+
+    # A milestone with only generated YAML metadata (written before 2026-10-29) is not read: a clear
+    # error, and the old file is left as it is.
+    old = milestones / "steps_000020"
+    data = json.loads((old / "manifest.json").read_text(encoding="utf-8"))
+    (old / "manifest.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    (old / "manifest.json").unlink()
+    before = tree_hashes(old)
+    with pytest.raises(FileNotFoundError, match="No milestone manifest at .*manifest.json \\(only manifest.yaml, "
+                                                "generated YAML metadata from before 2026-10-29, which is no longer read\\)"):
+        read_manifest(old)
+    with pytest.raises(ValueError, match="Malformed milestones folder(.|\\n)*steps_000020: No milestone manifest"):
+        discover_milestones(milestones)
+    with pytest.raises(FileNotFoundError, match="No milestone manifest"):
+        load_milestone(old, "walk")
+    assert tree_hashes(old) == before
+    shutil.rmtree(old)
+
+    # Malformed or non-standard JSON is rejected; checksums are still checked.
+    text = (new / "manifest.json").read_text(encoding="utf-8")
+    for bad, message in (('{"schema_version": 1,', "is not valid JSON"),
+                         (text.replace('"epoch": 2', '"epoch": NaN', 1), "non-standard JSON constant NaN"),
+                         ("[1, 2]", "does not hold a JSON object")):
+        (new / "manifest.json").write_text(bad, encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            read_manifest(new)
+    (new / "manifest.json").write_text(text, encoding="utf-8")
+    (new / "denoiser.pt").write_bytes((new / "denoiser.pt").read_bytes() + b"x")
+    with pytest.raises(ValueError, match="does not match its checksum"):
+        load_milestone(new, "walk")
+    with pytest.raises(ValueError, match="Out of range float values are not JSON compliant"):
+        write_json(tmp_path / "x.json", dict(value=float("inf")))  # never written as non-standard JSON
+    assert not (tmp_path / "x.json").exists()
+
+
+def test_downstream_outputs_are_json_only(tmp_path, monkeypatch):
+    milestone = build_milestone(tmp_path)
+    trainer, output, first = logged_run(milestone, monkeypatch, "evaluation.after_training=true",
+                                        "evaluation.seeds=[5,6]", "evaluation.max_steps=3")
+    (report,) = (output / "evaluations").iterdir()
+    assert report.suffix == ".json" and sorted(p.name for p in output.iterdir()) == [
+        "actor_critic.pt", "config.yaml", "evaluations", "metrics.jsonl", "rew_end_model.pt", "summary.json", "wandb_run.json"]
+    stored = json.loads(report.read_text(encoding="utf-8"), parse_constant=lambda name: 1 / 0)
+    assert stored["seeds"] == [5, 6] and len(stored["episodes"]) == 2 and stored["policy_sha256_prefix"] in report.stem
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"), parse_constant=lambda name: 1 / 0)
+    assert summary["num_updates"] == {"rew_end_model": 4, "actor_critic": 3}
+
+    # Evaluate-only from the JSON output, with the source milestone and replay moved away.
+    shutil.move(str(tmp_path / "run/milestones"), str(tmp_path / "moved_milestones"))
+    shutil.move(str(tmp_path / "run/dataset"), str(tmp_path / "moved_dataset"))
+    cfg = compose("downstream", [f"initialization.milestone_path={milestone.as_posix()}", "downstream.task_name=walk",
+                                 "downstream.mode=evaluate", *TINY_DOWNSTREAM, *ONLINE, "evaluation.max_steps=3",
+                                 "evaluation.seeds=[5,6]"])
+    assert downstream_main.saved_output_milestone(cfg, milestone) == dict(domain="walker", collected_steps=26)
+    assert "training outputs were published" in downstream_main.failure_state(milestone, output, ["python"])
+    fake = FakeWandb(starting_step=8)
+    monkeypatch.setattr(downstream_module, "wandb", fake)
+    before = report.read_bytes()
+    with pytest.raises(FileExistsError, match=f"{report.name} already exists; not overwriting"):
+        downstream_module.evaluate_saved_output(cfg)  # the same evaluation: refused before W&B starts
+    assert not fake.inits and report.read_bytes() == before
+    cfg.evaluation.seeds = [7]
+    path = downstream_module.evaluate_saved_output(cfg)
+    assert path.suffix == ".json" and fake.logged[0][0] == 7 + 1  # after the one earlier report
+    assert fake.summary["status"] == "completed"
+
+    # Malformed summary.json: an error; an output with only a generated summary.yaml is not a completed output.
+    text = (output / "summary.json").read_text(encoding="utf-8")
+    (output / "summary.json").write_text("{", encoding="utf-8")
+    cfg.evaluation.seeds = [8]
+    with pytest.raises(ValueError, match="summary.json is not valid JSON"):
+        downstream_module.evaluate_saved_output(cfg)
+    (output / "summary.yaml").write_text(yaml.safe_dump(json.loads(text)), encoding="utf-8")
+    (output / "summary.json").unlink()
+    with pytest.raises(FileNotFoundError, match="No completed downstream output at .* \\(no summary.json\\)"):
+        downstream_module.evaluate_saved_output(cfg)
+    assert downstream_main.saved_output_milestone(cfg, milestone) is None
+    assert sorted(p.name for p in (output / "evaluations").iterdir()) == sorted([report.name, path.name])
 
 # ---------------------------------------------------------------- Gaussian H10 EMA-critic controller
 

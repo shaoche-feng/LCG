@@ -506,4 +506,4 @@ def test_milestones_hold_the_unperturbed_denoiser_and_load_downstream(tmp_path, 
     lap_path = publish_milestone(single.parent, "steps_laplace", m.denoiser_state, m.dataset, m.successor_observations, keep)
     downstream = down.make_trainer(lap_path, monkeypatch)
     assert down.states_equal(m.denoiser_state, downstream.agent.denoiser.state_dict())
-    assert (downstream.run() / "summary.yaml").is_file()
+    assert (downstream.run() / "summary.json").is_file()

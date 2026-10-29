@@ -11,9 +11,9 @@ import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
-import yaml
 
-from data.milestone import discover_milestones, downstream_output_dir, load_milestone, milestone_members, read_manifest
+from data.milestone import (SUMMARY_FILE, discover_milestones, downstream_output_dir, downstream_summary, load_milestone,
+                            milestone_members, read_manifest)
 from device_report import device_lines
 from downstream_trainer import DownstreamTrainer, evaluate_saved_output, seed_span
 from utils import say, setup_visible_cuda_devices
@@ -147,13 +147,13 @@ def banner_device(cfg: DictConfig) -> torch.device:
 
 def saved_output_milestone(cfg: DictConfig, path: Path) -> Optional[Dict[str, Any]]:
     """Evaluate-only: the banner's milestone information from the completed output's saved config.yaml
-    (domain) and summary.yaml (recorded collected steps; None if not recorded), without reading the
+    (domain) and summary (recorded collected steps; None if not recorded), without reading the
     milestone itself, which may have moved or been deleted. None if there is no completed output."""
     output = downstream_output_dir(path, cfg.downstream.task_name, cfg.downstream.seed,
                                    OmegaConf.select(cfg, "initialization.member_index", default=0))
-    if not (output / "summary.yaml").is_file() or not (output / "config.yaml").is_file():
+    summary = downstream_summary(output) if (output / "config.yaml").is_file() else None
+    if summary is None:
         return None
-    summary = yaml.safe_load((output / "summary.yaml").read_text(encoding="utf-8")) or {}
     saved = OmegaConf.load(output / "config.yaml")
     return dict(domain=saved.env.train.domain_name,
                 collected_steps=(summary.get("milestone") or {}).get("collected_steps"))
@@ -200,7 +200,7 @@ def plural(n: int, noun: str) -> str:
 def failure_state(path: Path, output: Path, base: List[str]) -> str:
     """What a failed child left behind (read only) and the single-milestone command that continues it."""
     work = output.with_name(f".{output.name}.tmp")
-    if (output / "summary.yaml").is_file():  # published: training completed, the failure came after it
+    if (output / SUMMARY_FILE).is_file():  # published: training completed, the failure came after it
         return (f"training outputs were published at {output} (training completed; the failure came after it, "
                 f"e.g. in the evaluation); evaluate them with:\n      {shell(milestone_command(base, path, 'evaluate'))}")
     if (work / "checkpoints" / "state.pt").is_file():

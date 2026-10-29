@@ -23,12 +23,12 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 from torch.utils.data import DataLoader
 import wandb
-import yaml
 
 from agent import Agent
 from coroutines.frame_history import FrameHistory
 from data import BatchSampler, collate_segments_without_rewards
-from data.milestone import downstream_output_dir, load_milestone, milestone_members, state_sha256
+from data.milestone import (SUMMARY_FILE, downstream_output_dir, downstream_summary, load_milestone, milestone_members,
+                            state_sha256, write_json)
 from data.utils import make_task_reward_collate
 from device_report import physical_gpu_index
 from envs import DMControlEnv, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
@@ -396,8 +396,7 @@ class DownstreamTrainer:
                        actor_critic="actor_critic.pt"),
             note="Completed training: final weights. Evaluations are in evaluations/.",
         )
-        with open(self._work_dir / "summary.yaml", "w", encoding="utf-8") as f:
-            yaml.safe_dump(summary, f, sort_keys=False)
+        write_json(self._work_dir / SUMMARY_FILE, summary)
         os.replace(self._work_dir, self.output_dir)
         shutil.rmtree(self.output_dir / "checkpoints", ignore_errors=True)  # training is complete
         return self.output_dir
@@ -564,7 +563,7 @@ def log_evaluation(result: Dict[str, Any], path: Path, collected_steps: Optional
     evaluation was (after_training or evaluate_only) and its file."""
     if wandb.run is None:
         return
-    earlier = sum(1 for p in Path(path).parent.glob("eval_*.yaml") if p != Path(path))
+    earlier = sum(1 for p in Path(path).parent.glob("eval_*.json") if p != Path(path))
     step = max(next_step, int(getattr(wandb.run, "starting_step", 0) or 0), total_updates + earlier)
     wandb.log(evaluation_row(result, collected_steps), step=step)
     wandb.summary[f"evaluations/{Path(path).stem}"] = dict(
@@ -720,10 +719,10 @@ def frame_tensor(image: np.ndarray, device: torch.device) -> torch.Tensor:
 
 def evaluation_path(output_dir: Path, task_name: str, seeds: List[int], max_steps: int,
                     policy_state: Dict[str, Any]) -> Path:
-    """evaluations/eval_<task>_policy-<weights hash>_protocol-<seeds and step limit hash>.yaml"""
+    """evaluations/eval_<task>_policy-<weights hash>_protocol-<seeds and step limit hash>.json"""
     policy = state_sha256({k: v for k, v in policy_state.items() if torch.is_tensor(v)})[:12]
     protocol = hashlib.sha256(repr(([int(s) for s in seeds], int(max_steps))).encode()).hexdigest()[:12]
-    return Path(output_dir) / "evaluations" / f"eval_{task_name}_policy-{policy}_protocol-{protocol}.yaml"
+    return Path(output_dir) / "evaluations" / f"eval_{task_name}_policy-{policy}_protocol-{protocol}.json"
 
 
 def save_evaluation(output_dir: Path, result: Dict[str, Any], policy_state: Dict[str, Any]) -> Path:
@@ -733,10 +732,7 @@ def save_evaluation(output_dir: Path, result: Dict[str, Any], policy_state: Dict
     if path.exists():
         raise FileExistsError(f"Evaluation {path} already exists; not overwriting it")
     path.parent.mkdir(exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.safe_dump(dict(result, policy_sha256_prefix=policy), f, sort_keys=False)
-    tmp.replace(path)
+    write_json(path, dict(result, policy_sha256_prefix=policy))
     return path
 
 
@@ -762,8 +758,8 @@ def evaluate_saved_output(cfg: DictConfig) -> Path:
     task_name, seed = cfg.downstream.task_name, cfg.downstream.seed
     output_dir = downstream_output_dir(Path(cfg.initialization.milestone_path), task_name, seed,
                                        OmegaConf.select(cfg, "initialization.member_index", default=0))
-    if not (output_dir / "summary.yaml").is_file():
-        raise FileNotFoundError(f"No completed downstream output at {output_dir}")
+    if downstream_summary(output_dir) is None:
+        raise FileNotFoundError(f"No completed downstream output at {output_dir} (no {SUMMARY_FILE})")
     saved = OmegaConf.load(output_dir / "config.yaml")
     use_cuda = cfg.common.devices != "cpu" and torch.cuda.is_available()
     device = torch.device("cuda", 0) if use_cuda else torch.device("cpu")
@@ -797,7 +793,7 @@ def start_saved_evaluation(cfg: DictConfig, output_dir: Path, saved: DictConfig,
     """Evaluate-only to W&B: the output's adaptation run when its identity (wandb_run.json) exists,
     else a new run of job type evaluate-only; its status becomes running (begin_status). Everything
     comes from the completed output. Returns the evaluation row's axis value and update count."""
-    summary = yaml.safe_load((output_dir / "summary.yaml").read_text(encoding="utf-8")) or {}
+    summary = downstream_summary(output_dir) or {}
     recorded = summary.get("milestone") or {}
     steps = recorded.get("collected_steps")
     path_identity = output_dir / "wandb_run.json"
