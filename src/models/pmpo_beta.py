@@ -15,6 +15,7 @@ from torch.nn import functional as F
 from .actor_critic import ActorCriticEncoder, ActorCriticOutput, compute_lambda_returns
 from coroutines.env_loop import make_env_loop
 from envs import WorldModelEnv
+from utils import RegionTimer, timed
 
 
 @dataclass
@@ -313,6 +314,7 @@ class PMPOBeta(nn.Module):
         # Logging only (not a controller setting): the PMPO diagnostic mode turns it on.
         self.debug_metrics = bool(cfg.debug_metrics)
         self.intrinsic_reward_fn = None
+        self.scoring_timer: Optional[RegionTimer] = None  # monitoring only: time in intrinsic_reward_fn
         self.rl_env = None
         self._fixed_obs = None
         self._rng = dict(cpu=torch.Generator().manual_seed(seed).get_state(), cuda=None,
@@ -491,7 +493,8 @@ class PMPOBeta(nn.Module):
         self.prior_actor.eval()
         obs, act, rew, end, trunc, _, old_values, bootstrap, infos = self.collect_imagination()
         if self.intrinsic_reward_fn is not None:
-            rew = self.intrinsic_reward_fn(infos, rew).detach()
+            with timed(self.scoring_timer):
+                rew = self.intrinsic_reward_fn(infos, rew).detach()
         targets = compute_lambda_returns(rew, end, trunc, bootstrap, c.gamma, c.lambda_)
         advantage = targets - old_values
         flat_obs = obs.flatten(0, 1).detach()

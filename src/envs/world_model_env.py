@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from coroutines import coroutine
 from models.diffusion import Denoiser, DiffusionSampler, DiffusionSamplerConfig
 from models.rew_end_model import RewEndModel
+from utils import RegionTimer, timed
 
 ResetOutput = Tuple[torch.FloatTensor, Dict[str, Any]]
 StepOutput = Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Any]]
@@ -97,6 +98,9 @@ class WorldModelEnv:
         # prompt, or zero padding at an episode start, as in the denoiser's training batches).
         self.feature_encoder = feature_encoder
         self.last_disagreement, self.last_member = None, None
+        # Monitoring only: the intrinsic-scoring work done here (Plan2Explore feature extraction;
+        # ensemble/Laplace member predictions and disagreement, which also give the next frame).
+        self.scoring_timer: Optional[RegionTimer] = None
         self.rew_end_model = rew_end_model
         # False: use only the reward head; imagined episodes end by horizon truncation.
         self.sample_ends = sample_ends
@@ -164,7 +168,8 @@ class WorldModelEnv:
             # is not part of it (it goes to the predictors separately). No random numbers.
             context = torch.cat((self.prev_obs.unsqueeze(1), self.obs_buffer[:, :-1]), dim=1)
             context_act = torch.cat((self.prev_act.unsqueeze(1), self.act_buffer[:, :-1]), dim=1)
-            feature = self.feature_encoder(self.obs_buffer[:, -1], context, context_act)
+            with timed(self.scoring_timer):
+                feature = self.feature_encoder(self.obs_buffer[:, -1], context, context_act)
 
         next_obs, denoising_trajectory = self.predict_next_obs()
         if self.rew_end_model is None:
@@ -212,7 +217,8 @@ class WorldModelEnv:
     def predict_next_obs(self) -> Tuple[Tensor, List[Tensor]]:
         if self.ensemble_samplers is None and self.member_predictor is None:
             return self.sampler.sample(self.obs_buffer, self.act_buffer)
-        return self.predict_next_obs_ensemble(), []
+        with timed(self.scoring_timer):
+            return self.predict_next_obs_ensemble(), []
 
     @torch.no_grad()
     def predict_next_obs_ensemble(self) -> Tensor:

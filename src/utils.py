@@ -1,6 +1,7 @@
 
 from argparse import Namespace
 from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import random
 import subprocess
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -580,3 +582,51 @@ def setup_visible_cuda_devices(devices: Union[str, int, List[int]]) -> None:
     elif isinstance(devices, int):
         devices = [devices]
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))
+
+
+class RegionTimer:
+    """Accumulated time of marked regions (monitoring only). Only the outermost region counts,
+    so work inside nested regions is counted once. On CUDA each region records two events on
+    the current stream (no host synchronization); seconds() waits for the last one. On CPU,
+    wall-clock time. reset() starts a new accumulation."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.cuda = device.type == "cuda"
+        self.reset()
+
+    def reset(self) -> None:
+        self._events, self._seconds, self._depth = [], 0.0, 0
+
+    def _mark(self) -> Any:
+        if not self.cuda:
+            return time.perf_counter()
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    @contextmanager
+    def region(self):
+        self._depth += 1
+        start = self._mark() if self._depth == 1 else None
+        try:
+            yield
+        finally:
+            self._depth -= 1
+            if start is not None:
+                end = self._mark()
+                if self.cuda:
+                    self._events.append((start, end))
+                else:
+                    self._seconds += end - start
+
+    def seconds(self) -> float:
+        if self._events:
+            self._events[-1][1].synchronize()
+            self._seconds += sum(start.elapsed_time(end) for start, end in self._events) / 1000
+            self._events = []
+        return self._seconds
+
+
+def timed(timer: Optional[RegionTimer]):
+    """timer.region(), or nothing without a timer."""
+    return nullcontext() if timer is None else timer.region()

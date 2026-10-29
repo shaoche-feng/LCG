@@ -23,7 +23,7 @@ def test_walker_lcg_100k_preset_resolves_the_agreed_settings():
     lcg = instantiate(cfg.intrinsic_reward)
     assert lcg.enabled and list(lcg.theta_s.include) == ["unet.u_blocks.3.resblocks.0.*"]
     assert (lcg.theta_s.expected_num_tensors, lcg.theta_s.expected_dim) == (10, 217_664)
-    assert (lcg.candidate_num_mc, lcg.candidate_chunk_size) == (5, 16)
+    assert (lcg.candidate_num_mc, lcg.candidate_chunk_size) == (5, 32)
     assert (lcg.precision_reference_size, lcg.precision_num_mc, lcg.damping, lcg.beta) == (320, 3, 1e-4, 1.0)
     assert lcg.reward_scaling_settings() == dict(mode="fixed", fixed_divisor=100.0)
     # Everything but the method matches the uniform preset: budget, schedules, milestones,

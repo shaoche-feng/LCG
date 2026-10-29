@@ -40,6 +40,7 @@ from utils import (
     keep_agent_copies_every,
     Logs,
     process_confusion_matrices_if_any_and_compute_classification_metrics,
+    RegionTimer,
     history_records,
     repair_history,
     phase,
@@ -348,6 +349,12 @@ class ExplorationTrainer(StateDictMixin):
         # Setup training
         sigma_distribution_cfg = instantiate(cfg.denoiser.sigma_distribution)
         self.agent.setup_training(sigma_distribution_cfg, rl_env)
+        # Intrinsic scoring inside PMPO updates (timing/intrinsic_scoring_seconds_per_update): the
+        # reward hook and the imagination's scoring work, never the real-test intrinsic evaluation.
+        self._scoring_timer = None
+        if rl_env is not None:
+            self._scoring_timer = RegionTimer(self._device)
+            rl_env.scoring_timer = self.agent.actor_critic.scoring_timer = self._scoring_timer
         diagnostic_cfg = cfg.get("pmpo_diagnostic")
         self._pmpo_diagnostic = None
         if diagnostic_cfg is not None and diagnostic_cfg.enabled:
@@ -471,6 +478,7 @@ class ExplorationTrainer(StateDictMixin):
             self.epoch += 1
             start_time = time.time()
             self._phase_seconds, self._gpu_peak, self._pmpo_seconds_per_update = {}, 0.0, None
+            self._scoring_seconds_per_update = None
             if self._use_cuda:
                 torch.cuda.reset_peak_memory_stats(self._device)  # epoch peak (monitoring only)
 
@@ -624,8 +632,13 @@ class ExplorationTrainer(StateDictMixin):
                         self.agent.actor_critic.set_intrinsic_reward_fn(self._ensemble_scorer)
                     if self._use_cuda:
                         torch.cuda.synchronize(self._device)
-                    self._phase_seconds["scorer_refresh"] = time.time() - t_refresh
+                    # Method-specific refresh/preparation; the full ensemble's additional-member
+                    # training (train_ensemble) is already in it.
+                    self._phase_seconds["method_refresh"] = (self._phase_seconds.get("method_refresh", 0.0)
+                                                            + time.time() - t_refresh)
                 steps = cfg.steps_first_epoch if self.epoch == 1 else cfg.steps_per_epoch
+                if name == "actor_critic" and self._scoring_timer is not None:
+                    self._scoring_timer.reset()
                 t0 = time.time()
                 if name == "denoiser" and self.ensemble is not None:
                     to_log += self.train_ensemble(steps)
@@ -642,6 +655,8 @@ class ExplorationTrainer(StateDictMixin):
                     # The whole PMPO phase (imagination and scoring included) per update; the
                     # methods' internal timers keep counting but are not logged.
                     self._pmpo_seconds_per_update = elapsed / max(steps, 1)
+                    # The part of it spent producing intrinsic rewards (included above, not additional).
+                    self._scoring_seconds_per_update = self._scoring_timer.seconds() / max(steps, 1)
         return to_log
 
     def train_ensemble(self, steps: int) -> Logs:
@@ -651,12 +666,21 @@ class ExplorationTrainer(StateDictMixin):
         to_log = []
         ens = self.ensemble
         for k in range(ens.members):
+            if k == 1:  # members 1..K-1: the ensemble's method-specific cost (timing/epoch_method_refresh_seconds)
+                t_members = self.synchronized_time()
             with ens.member_rng(k):
                 to_log += self.train_component("denoiser", steps, member=k)
             sampler = self._member_samplers[k]
             ens.empty_bootstrap_batches[k] += sampler.empty_bootstrap_batches
             sampler.empty_bootstrap_batches = 0
+        if ens.members > 1:
+            self._phase_seconds["method_refresh"] = self.synchronized_time() - t_members
         return to_log
+
+    def synchronized_time(self) -> float:
+        if self._use_cuda:
+            torch.cuda.synchronize(self._device)
+        return time.time()
 
     def intrinsic_reward_metrics(self) -> Dict[str, Any]:
         """Per imagined step of the last PMPO update: the scorer's raw intrinsic reward and the
@@ -778,6 +802,7 @@ class ExplorationTrainer(StateDictMixin):
         row["timing/epoch_seconds"] = seconds
         if self._pmpo_seconds_per_update is not None:
             row["timing/pmpo_seconds_per_update"] = self._pmpo_seconds_per_update
+            row["timing/intrinsic_scoring_seconds_per_update"] = self._scoring_seconds_per_update
         if self._use_cuda:
             self.note_gpu_peak()
             row["timing/epoch_gpu_peak_allocated_gb"] = self._gpu_peak

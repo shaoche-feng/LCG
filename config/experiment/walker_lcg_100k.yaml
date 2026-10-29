@@ -50,7 +50,7 @@ intrinsic_reward:
     expected_num_tensors: 10
     expected_dim: 217664
   candidate_num_mc: 5  # candidate MC probes (forward JVP, Full CRN)
-  candidate_chunk_size: 16
+  candidate_chunk_size: 32  # fastest of 16/32/64 on the RTX 5090 (1.90 / 1.60 / 1.70 s per 480 candidates); scores do not depend on it
   precision_reference_size: 320  # historical reference transitions
   precision_num_mc: 3  # historical MC probes
   damping: 1e-4

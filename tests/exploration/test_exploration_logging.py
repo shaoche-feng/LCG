@@ -6,6 +6,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import re
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,9 +15,10 @@ import torch
 from omegaconf import OmegaConf
 
 import exploration_trainer as trainer_module
+import utils
 from data.segment import SegmentId
 from data.utils import make_segment
-from envs.world_model_env import ImaginedCandidate
+from envs.world_model_env import ImaginedCandidate, WorldModelEnv
 from exploration_trainer import ExplorationTrainer
 from intrinsic_eval import sampler_windows
 from test_ensemble import ENS
@@ -27,8 +29,9 @@ from test_test_diagnostics import assert_same_training, BASE, Crash, crash_at_te
     same, training_rows, yaml_value
 from laplace import LaplaceEnsemble
 from lcg.lifecycle import LCGLifecycle
-from plan2explore import Plan2Explore
-from utils import history_records, repair_history, rng_state
+from models.pmpo_beta import PMPOBeta, PMPOOptimizers
+from plan2explore import FeatureExtractor, Plan2Explore
+from utils import history_records, RegionTimer, repair_history, rng_state
 
 SEEDS = [3001, 3002, 3003, 3004]
 SEEDED = ["evaluation.should=true", "evaluation.every=1", "evaluation.collect_test=true",
@@ -382,7 +385,8 @@ def test_uniform_omits_scorer_and_pmpo_and_marks_intrinsic_not_applicable(tmp_pa
     epochs = [r for _, r in logs if "timing/epoch_seconds" in r]
     assert len(epochs) == 2
     assert not any(k in r for r in epochs for k in ("progress/pmpo_updates", "timing/epoch_pmpo_seconds",
-                                                      "timing/epoch_scorer_refresh_seconds", "timing/pmpo_seconds_per_update"))
+                                                      "timing/epoch_method_refresh_seconds", "timing/pmpo_seconds_per_update",
+                                                      "timing/intrinsic_scoring_seconds_per_update"))
 
 
 # ---------------------------------------------------------------- rows, axes, counters
@@ -400,8 +404,9 @@ def test_epoch_rows_counters_axes_and_training_only_epochs(tmp_path, monkeypatch
         progress = {k: v for k, v in r.items() if k.startswith("progress/")}
         assert progress == {"progress/train_env_steps": steps, "progress/denoiser_updates_total": denoiser,
                             "progress/pmpo_updates": pmpo, "progress/test_env_steps": test}
-        timing = {"timing/epoch_seconds", "timing/epoch_denoiser_seconds", "timing/epoch_scorer_refresh_seconds",
-                  "timing/epoch_pmpo_seconds", "timing/pmpo_seconds_per_update", "timing/epoch_test_seconds"}
+        timing = {"timing/epoch_seconds", "timing/epoch_denoiser_seconds", "timing/epoch_method_refresh_seconds",
+                  "timing/epoch_pmpo_seconds", "timing/pmpo_seconds_per_update", "timing/intrinsic_scoring_seconds_per_update",
+                  "timing/epoch_test_seconds"}
         if epoch < 3:
             timing.add("timing/epoch_collection_seconds")
         assert set(r) == set(progress) | timing and r["timing/epoch_seconds"] > 0  # CPU: no GPU peak
@@ -591,8 +596,8 @@ def expected_keys(trainer, ac_schema):
     else:
         keys |= {"denoiser/train/loss_denoising", "denoiser/train/num_batch_train_denoiser"}
     if learned:
-        keys |= {"progress/pmpo_updates", "timing/epoch_scorer_refresh_seconds", "timing/epoch_pmpo_seconds",
-                 "timing/pmpo_seconds_per_update"}
+        keys |= {"progress/pmpo_updates", "timing/epoch_method_refresh_seconds", "timing/epoch_pmpo_seconds",
+                 "timing/pmpo_seconds_per_update", "timing/intrinsic_scoring_seconds_per_update"}
         keys |= {f"actor_critic/train/{k}" for k in ac_schema(2, debug=False)}
         keys |= eval_keys("test_eval", SEEDS) | eval_keys("final_test_eval", FINAL_SEEDS)
     return keys
@@ -1044,3 +1049,149 @@ def test_older_checkpoint_without_scorer_state(tmp_path, monkeypatch, capsys, me
     run(resumed)
     assert merged(logs, "final_test_eval/") == merged(logs_full, "final_test_eval/")
     assert_same_training(full, resumed)
+
+
+# ---------------------------------------------------------------- timing definitions
+
+SLEEP, COMMON_SLEEP = 0.03, 0.6
+
+
+class Calls(list):
+    """Slowed-down calls as (tag, epoch, inside a PMPO update)."""
+    trainer, in_pmpo = None, False
+
+    def add(self, tag):
+        self.append((tag, self.trainer.epoch if self.trainer else 0, self.in_pmpo))
+
+
+def slow_down(monkeypatch, cls, name, calls, tag, seconds=SLEEP, when=None):
+    """cls.name takes `seconds` longer (only where `when` holds); every such call is recorded."""
+    original = getattr(cls, name)
+
+    def wrapper(*args, **kwargs):
+        if when is None or when(*args, **kwargs):
+            calls.add(tag)
+            time.sleep(seconds)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(cls, name, wrapper)
+
+
+def instrument(monkeypatch, method):
+    """Known extra time in each method's refresh work, its intrinsic-scoring work, the common
+    denoiser training and the non-scoring part of a PMPO update."""
+    calls = Calls()
+    forward = PMPOBeta.forward
+
+    def pmpo_forward(self):
+        calls.in_pmpo = True
+        try:
+            return forward(self)
+        finally:
+            calls.in_pmpo = False
+    monkeypatch.setattr(PMPOBeta, "forward", pmpo_forward)
+    slow_down(monkeypatch, PMPOOptimizers, "step", calls, "update")
+    if method == "ensemble":  # member 0 is the common denoiser; members 1..K-1 the method's refresh cost
+        slow_down(monkeypatch, ExplorationTrainer, "train_component", calls, "common", COMMON_SLEEP,
+                  when=lambda self, name, steps, member=None: name == "denoiser" and member == 0)
+        slow_down(monkeypatch, ExplorationTrainer, "train_component", calls, "refresh",
+                  when=lambda self, name, steps, member=None: name == "denoiser" and member is not None and member > 0)
+        slow_down(monkeypatch, WorldModelEnv, "predict_next_obs_ensemble", calls, "scoring")
+        return calls
+    slow_down(monkeypatch, ExplorationTrainer, "train_component", calls, "common", COMMON_SLEEP,
+              when=lambda self, name, steps, member=None: name == "denoiser")
+    if method == "lcg":
+        slow_down(monkeypatch, LCGLifecycle, "refresh", calls, "refresh")
+        make_hook = LCGLifecycle._make_hook
+
+        def slow_hook(self, denoiser):
+            hook = make_hook(self, denoiser)
+
+            def slowed(infos, rew):
+                calls.add("scoring")
+                time.sleep(SLEEP)
+                return hook(infos, rew)
+            return slowed
+        monkeypatch.setattr(LCGLifecycle, "_make_hook", slow_hook)
+    elif method == "plan2explore":
+        slow_down(monkeypatch, Plan2Explore, "refresh", calls, "refresh")
+        slow_down(monkeypatch, FeatureExtractor, "__call__", calls, "scoring")  # imagination features (also refresh, eval)
+        slow_down(monkeypatch, Plan2Explore, "__call__", calls, "scoring")  # head disagreement
+    else:
+        slow_down(monkeypatch, LaplaceEnsemble, "refresh", calls, "refresh")
+        slow_down(monkeypatch, LaplaceEnsemble, "predict_members", calls, "scoring")
+    return calls
+
+
+@pytest.mark.parametrize("method", ["lcg", "ensemble", "laplace", "plan2explore"])
+def test_refresh_and_scoring_timers_cover_their_method_paths(tmp_path, monkeypatch, method):
+    """timing/epoch_method_refresh_seconds: the method-specific refresh, for the full ensemble the
+    training of members 1..K-1, never the common denoiser. timing/intrinsic_scoring_seconds_per_update:
+    the scoring work inside PMPO updates, part of timing/pmpo_seconds_per_update, never the rest of
+    an update, the refresh or the real-test intrinsic evaluation."""
+    calls = instrument(monkeypatch, method)
+    tiny, extra = METHOD_SETUPS[method]
+    trainer, logs = launch(tmp_path / "run", monkeypatch, tiny, BASE + SEEDED + extra)
+    calls.trainer = trainer
+    run(trainer)
+
+    def count(tag, epoch, in_pmpo=None):
+        return sum(1 for t, e, p in calls if t == tag and e == epoch and (in_pmpo is None or p == in_pmpo))
+
+    epochs = dict(sorted((e, r) for e, r in logs if "timing/epoch_seconds" in r))
+    assert len(epochs) == 2
+    previous = 0
+    for epoch, r in epochs.items():
+        steps, previous = r["progress/pmpo_updates"] - previous, r["progress/pmpo_updates"]
+        refresh, denoiser = r["timing/epoch_method_refresh_seconds"], r["timing/epoch_denoiser_seconds"]
+        expected = trainer.ensemble.members - 1 if method == "ensemble" else 1
+        assert count("refresh", epoch) == expected and count("common", epoch) == 1
+        assert SLEEP * expected <= refresh < SLEEP * expected + COMMON_SLEEP  # never the common denoiser
+        if method == "ensemble":  # the denoiser total overlaps the additional members: never add both
+            assert denoiser >= refresh + COMMON_SLEEP
+        scoring = r["timing/intrinsic_scoring_seconds_per_update"] * steps
+        pmpo = r["timing/pmpo_seconds_per_update"] * steps
+        in_updates = count("scoring", epoch, in_pmpo=True)
+        assert in_updates >= steps and scoring >= SLEEP * in_updates
+        assert count("update", epoch) == steps and pmpo - scoring >= SLEEP * steps  # inside PMPO time, not the rest
+        assert pmpo == pytest.approx(r["timing/epoch_pmpo_seconds"])
+    # The final evaluation (scored after the last PMPO phase) did not add to the training-scoring time.
+    (_, first), (_, last) = epochs.items()
+    last_steps = last["progress/pmpo_updates"] - first["progress/pmpo_updates"]
+    assert trainer._scoring_timer.seconds() == pytest.approx(last["timing/intrinsic_scoring_seconds_per_update"] * last_steps)
+    if method in ("laplace", "plan2explore"):  # evaluation really went through the slowed scoring code
+        assert any(tag == "scoring" and not in_pmpo for tag, _, in_pmpo in calls)
+
+
+@pytest.mark.parametrize("method", ["lcg", "ensemble", "laplace", "plan2explore"])
+def test_timers_leave_training_rewards_and_rng_unchanged(tmp_path, monkeypatch, method):
+    """The scoring timer only records clock times (CUDA: events): weights, optimizers, schedules,
+    RNG, replay, rewards and every non-timing logged value are identical with it removed."""
+    tiny, extra = METHOD_SETUPS[method]
+    on, logs_on = launch(tmp_path / "on", monkeypatch, tiny, BASE + SEEDED + extra)
+    assert isinstance(on._scoring_timer, RegionTimer)
+    assert on._rl_env.scoring_timer is on.agent.actor_critic.scoring_timer is on._scoring_timer
+    run(on)
+    monkeypatch.undo()
+    off, logs_off = launch(tmp_path / "off", monkeypatch, tiny, BASE + SEEDED + extra)
+    off._rl_env.scoring_timer = off.agent.actor_critic.scoring_timer = None
+    off._scoring_timer = RegionTimer(torch.device("cpu"))  # read, never entered
+    run(off)
+    assert_same_training(on, off)
+    assert training_rows(logs_on) == training_rows(logs_off)
+    assert [scalars(r) for _, r in logs_on] == [scalars(r) for _, r in logs_off]
+    assert off._scoring_timer.seconds() == 0 < on._scoring_timer.seconds()
+    assert not [k for k in on.state_dict() if "timer" in k or "seconds" in k]  # nothing stale to restore on resume
+
+
+def test_region_timer_counts_nested_regions_once(monkeypatch):
+    clock = iter([1.0, 3.0, 10.0, 14.0])  # outer region 1-3 (inner region not timed), then 10-14
+    monkeypatch.setattr(utils.time, "perf_counter", lambda: next(clock))
+    timer = RegionTimer(torch.device("cpu"))
+    with timer.region():
+        with timer.region():
+            pass
+    with timer.region():
+        pass
+    assert timer.seconds() == 6.0
+    timer.reset()
+    assert timer.seconds() == 0
