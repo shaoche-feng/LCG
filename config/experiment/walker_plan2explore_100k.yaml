@@ -3,7 +3,7 @@
 # ExplorationTrainer with one denoiser and 5 bootstrapped next-feature predictor heads; PMPO
 # trains on their disagreement. Settings: config/intrinsic_reward/plan2explore_disagreement.yaml.
 #
-#   python src/main.py +experiment=walker_plan2explore_100k common.devices=0 common.seed=0 \
+#   python src/exploration_main.py +experiment=walker_plan2explore_100k common.devices=0 common.seed=0 \
 #       hydra.run.dir=outputs/<run name>
 # On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
 # scripts/resume.sh <run folder>. Any value can be overridden, e.g. intrinsic_reward.num_members=5

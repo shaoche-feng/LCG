@@ -1,4 +1,5 @@
 """Step 5 (first increment): downstream reward-model and PMPO training on a frozen milestone."""
+import csv
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import downstream_trainer as downstream_module
 from coroutines.env_loop import make_env_loop
 from data import Dataset, Episode
 from data.milestone import discover_milestones, load_milestone, publish_milestone, read_manifest, write_json
+from utils import file_sha256
 from data.segment import SegmentId
 from data.utils import make_task_reward_collate
 from downstream_trainer import DownstreamTrainer
@@ -63,7 +65,7 @@ def build_milestone(root, column_offsets=(0.0, 0.0, 0.0), early=()):
     milestones of the same run after that many finished episodes (1: steps_000010, 2: steps_000020)."""
     g = torch.Generator().manual_seed(0)
     run = root / "run"
-    cfg = compose("trainer", TINY_DENOISER)
+    cfg = compose("exploration", TINY_DENOISER)
     denoiser_cfg = instantiate(cfg.agent.denoiser)
     denoiser_cfg.inner_model.continuous_action_dim = 6
     torch.manual_seed(1)
@@ -76,7 +78,7 @@ def build_milestone(root, column_offsets=(0.0, 0.0, 0.0), early=()):
                         exploration=dict(collection_mode="uniform", intrinsic_reward_enabled=False),
                         model=dict(denoiser=OmegaConf.to_container(cfg.agent.denoiser, resolve=True),
                                    env=OmegaConf.to_container(cfg.env.train, resolve=True)),
-                        run_config="../../config/trainer.yaml", source=dict(git_commit=None))
+                        run_config="../../config/exploration.yaml", source=dict(git_commit=None))
         return publish_milestone(run / "milestones", f"steps_{steps:06d}", denoiser.state_dict(), dataset, successors, manifest)
 
     dataset = Dataset(run / "dataset/train", "train_dataset")
@@ -883,7 +885,8 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
     # Run identity, names and provenance; status; the identity file travels with the output.
     (init,) = fake.inits
     assert (init["name"], init["group"], init["job_type"], init["mode"]) == (
-        "run-steps_000026-walk-seed0", "run-walk-seed0", "adaptation", "online")
+        "uniform-walker-exploration-seed-unrecorded-steps_000026-walk-adaptation-seed0",
+        "uniform-walker-exploration-seed-unrecorded-walk-adaptation-seed0", "adaptation", "online")
     provenance = init["config"]["provenance"]
     assert provenance["exploration"]["method"] == "not recorded" and provenance["exploration"]["collection_mode"] == "uniform"
     assert provenance["exploration"]["seed"].startswith("not recorded")
@@ -937,8 +940,9 @@ def test_each_milestone_gets_its_own_run_and_the_folder_launcher_none(tmp_path, 
         logged_run(milestones / name, monkeypatch, fake=fake)
         runs.append((fake.inits[0]["name"], fake.inits[0]["group"], json.loads(
             (tmp_path / f"run/downstream/{name}/walk/seed_0/wandb_run.json").read_text())["id"]))
-    assert runs == [("run-steps_000020-walk-seed0", "run-walk-seed0", "id-steps_000020"),
-                    ("run-steps_000026-walk-seed0", "run-walk-seed0", "id-steps_000026")]
+    group = "uniform-walker-exploration-seed-unrecorded-walk-adaptation-seed0"  # the manifest records no seed
+    assert runs == [("uniform-walker-exploration-seed-unrecorded-steps_000020-walk-adaptation-seed0", group, "id-steps_000020"),
+                    ("uniform-walker-exploration-seed-unrecorded-steps_000026-walk-adaptation-seed0", group, "id-steps_000026")]
     # The launcher never touches W&B; its children keep the W&B settings (each starts its own run).
     def no_parent_run(**kwargs):
         raise AssertionError("the folder launcher started a W&B run")
@@ -977,7 +981,8 @@ def test_evaluate_only_adds_to_the_adaptation_run_without_the_milestone(tmp_path
     monkeypatch.setattr(downstream_module, "wandb", fake)
     downstream_module.evaluate_saved_output(cfg)
     (init,) = fake.inits
-    assert "id" not in init and init["job_type"] == "evaluate-only" and init["name"] == "run-steps_000026-walk-seed0-evaluate-only"
+    assert "id" not in init and init["job_type"] == "evaluate-only" and init["name"] == (  # milestone and run configuration gone: only the saved domain is known
+        "unrecorded-walker-exploration-seed-unrecorded-steps_000026-walk-adaptation-seed0-evaluate-only")
     assert init["config"]["provenance"]["exploration"]["method"] == "not recorded in the saved output"
     assert init["config"]["provenance"]["milestone"]["collected_steps"] == 26
     assert fake.logged[0][0] == 7 + 2  # after the training updates and the two earlier evaluation files
@@ -1162,6 +1167,327 @@ def test_downstream_outputs_are_json_only(tmp_path, monkeypatch):
         downstream_module.evaluate_saved_output(cfg)
     assert downstream_main.saved_output_milestone(cfg, milestone) is None
     assert sorted(p.name for p in (output / "evaluations").iterdir()) == sorted([report.name, path.name])
+
+# ---------------------------------------------------------------- result collection and comparison (CPU only)
+
+EVAL_SEEDS = list(range(3001, 3031))  # the production 30-seed protocol
+METHOD_KEYS = {"uniform": None, "lcg": "lcg", "full-ensemble": "ensemble_disagreement",
+               "laplace-ensemble": "laplace_disagreement", "plan2explore": "plan2explore_disagreement"}
+
+
+def synthetic_returns(steps, n):
+    """Deterministic returns per milestone, spread over the thresholds."""
+    return [float((steps // 10 + 37 * i) % 700) + 0.25 for i in range(n)]
+
+
+def synthetic_output(run, steps, returns, seeds=EVAL_SEEDS, max_steps=500, task="walk", seed=0, member=0,
+                     settings_steps=5, action_repeat=2):
+    """One milestone of a synthetic exploration run and its completed downstream output (JSON metadata,
+    saved config and one evaluation report), as the trainers write them."""
+    milestone = run / f"milestones/steps_{steps:06d}"
+    milestone.mkdir(parents=True, exist_ok=True)
+    identity = dict(denoiser_sha256=f"denoiser-{steps}", dataset_sha256=f"index-{steps}", collected_steps=steps)
+    if not (milestone / "manifest.json").exists():
+        write_json(milestone / "manifest.json", dict(schema_version=1, collected_steps=steps, identity=identity))
+    output = downstream_module.downstream_output_dir(milestone, task, seed, member)
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output / "summary.json", dict(milestone=dict(collected_steps=steps, identity=identity, member_index=member),
+                                             task_name=task, seed=seed, num_updates=dict(rew_end_model=5, actor_critic=5)))
+    env = dict(domain_name="walker", task_names=["stand", "walk", "run"], size=64, camera_id=0, action_repeat=action_repeat,
+               time_limit=None)
+    OmegaConf.save(OmegaConf.create(dict(env=dict(train=env), agent=dict(actor_critic=dict(actor_objective="sign")),
+                                         world_model_env=dict(horizon=10),
+                                         rew_end_model=dict(training=dict(steps=settings_steps), optimizer=dict(lr=1e-4)),
+                                         actor_critic=dict(training=dict(steps=5)), checkpointing=dict(every=100))),
+                   output / "config.yaml")
+    values = np.array(returns, dtype=float)
+    result = dict(task_name=task, domain_name="walker", seeds=list(seeds), max_steps=max_steps,
+                  action_repeat=action_repeat, policy="deterministic (Beta mean)",
+                  return_convention=downstream_module.RETURN_CONVENTION,
+                  episodes=[dict(seed=s, episode_return=float(r), length=max_steps) for s, r in zip(seeds, values)],
+                  return_mean=float(values.mean()), return_median=float(np.median(values)), return_std=float(values.std()),
+                  return_min=float(values.min()), return_max=float(values.max()))
+    path = downstream_module.evaluation_path(output, task, seeds, max_steps, {"w": torch.tensor([steps, member])})
+    path.parent.mkdir(exist_ok=True)
+    write_json(path, result)
+    return output, path
+
+
+def synthetic_run(root, method, steps=(300, 400, 500), exploration_seed=0, **kwargs):
+    run = root / "outputs" / method / "walker" / f"seed_{exploration_seed}"
+    (run / "config").mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(OmegaConf.create(dict(common=dict(seed=exploration_seed), env=dict(train=dict(domain_name="walker")),
+                                         intrinsic_reward=dict(enabled=METHOD_KEYS[method] is not None,
+                                                               method=METHOD_KEYS[method] or "lcg"))),
+                   run / "config/exploration.yaml")
+    for s in steps:
+        synthetic_output(run, s, synthetic_returns(s, len(kwargs.get("seeds", EVAL_SEEDS))), **kwargs)
+    return run
+
+
+def test_result_table_statistics_strict_thresholds_and_30_seeds(tmp_path):
+    run = synthetic_run(tmp_path, "plan2explore", steps=(500, 300))
+    at_threshold = [200.0, 400.0, 500.0, 600.0, 200.5, 600.25] + [100.0] * 24  # returns exactly at the thresholds
+    synthetic_output(run, 400, at_threshold)
+    before = tree_hashes(run)
+    path, rows, missing = downstream_module.collect_results(run, "walk", 0)
+    assert path == run / "result/walk/seed_0/result.csv" and not missing
+    with open(path, encoding="utf-8", newline="") as f:
+        header = next(csv.reader(f))
+    assert header == downstream_module.RESULT_COLUMNS + [f"return_seed_{s}" for s in EVAL_SEEDS] + ["source_evaluation_file"]
+    table = downstream_module.read_csv(path)
+    assert [r["train_env_steps"] for r in table] == [300, 400, 500] and [r["milestone"] for r in table] == [
+        "steps_000300", "steps_000400", "steps_000500"]
+    row = table[1]
+    assert (row["method"], row["domain"], row["exploration_seed"], row["task"], row["adaptation_seed"],
+            row["member_index"], row["num_eval_episodes"]) == ("plan2explore", "walker", 0, "walk", 0, 0, 30)
+    values = np.array(at_threshold)
+    assert row["return_mean"] == float(values.mean()) and row["return_std"] == float(values.std())
+    assert (row["return_median"], row["return_min"], row["return_max"]) == (100.0, 100.0, 600.25)
+    # Strictly greater: 200 is not over 200, 600 is not over 600.
+    assert (row["frac_over_200"], row["frac_over_400"], row["frac_over_500"], row["frac_over_600"]) == (
+        5 / 30, 3 / 30, 2 / 30, 1 / 30)
+    assert [row[f"return_seed_{s}"] for s in EVAL_SEEDS] == at_threshold
+    report = run / row["source_evaluation_file"]
+    assert report.is_file() and report.suffix == ".json" and row["evaluation_max_steps"] == 500
+    assert {k: v for k, v in tree_hashes(run).items() if "result" not in Path(k).relative_to(run).parts} == before
+
+    # Saved aggregates that disagree with the episodes are rejected.
+    data = json.loads(report.read_text(encoding="utf-8"))
+    data["return_mean"] += 1.0
+    report.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="saved return_mean .* differs from the episodes"):
+        downstream_module.collect_results(run, "walk", 0)
+
+
+def test_result_collection_missing_ambiguous_protocols_settings_and_members(tmp_path):
+    run = synthetic_run(tmp_path, "uniform", steps=(300, 400, 500, 600), seeds=[3001, 3002], max_steps=50)
+    shutil.rmtree(run / "downstream/steps_000400")  # never adapted
+    work = run / "downstream/steps_000500/walk"
+    shutil.move(str(work / "seed_0"), str(work / ".seed_0.tmp"))  # interrupted
+    path, rows, missing = downstream_module.collect_results(run, "walk", 0)
+    assert [r["train_env_steps"] for r in rows] == [300, 600]
+    assert [(m["milestone"], m["reason"]) for m in missing] == [("steps_000400", "no downstream output"),
+                                                                ("steps_000500", "incomplete (work folder .seed_0.tmp only)")]
+    # A second evaluation protocol on one milestone: ambiguous until one is selected.
+    output, extra = synthetic_output(run, 600, [1.0, 2.0, 3.0], seeds=[1, 2, 3], max_steps=50)
+    with pytest.raises(ValueError, match="several evaluation protocols .*select one with analysis.protocol"):
+        downstream_module.collect_results(run, "walk", 0)
+    chosen = downstream_module.protocol_id(extra)
+    path, rows, missing = downstream_module.collect_results(run, "walk", 0, protocol=chosen)
+    assert [r["train_env_steps"] for r in rows] == [600] and [r["return_seed_2"] for r in rows] == [2.0]
+    assert ("steps_000300", f"completed, but no evaluation with protocol {chosen}") in [(m["milestone"], m["reason"])
+                                                                                       for m in missing]
+    # Denoiser members are separate tables; different downstream settings are never combined.
+    synthetic_output(run, 300, [5.0, 6.0], seeds=[3001, 3002], max_steps=50, member=1)
+    path, rows, _ = downstream_module.collect_results(run, "walk", 0, member_index=1)
+    assert path == run / "result/walk/seed_0_member_1/result.csv" and [r["member_index"] for r in rows] == [1]
+    other = synthetic_run(tmp_path / "b", "uniform", steps=(300,), seeds=[3001, 3002], max_steps=50)
+    synthetic_output(other, 400, [1.0, 2.0], seeds=[3001, 3002], max_steps=50, settings_steps=6)
+    with pytest.raises(ValueError, match="not comparable: .* differ in rew_end_model.training.steps: 5 vs 6"):
+        downstream_module.collect_results(other, "walk", 0)
+
+
+def test_method_comparison_files_inputs_and_checks(tmp_path):
+    root = tmp_path / "outputs"
+    uniform = synthetic_run(tmp_path, "uniform", steps=(300, 400, 500))
+    p2e = synthetic_run(tmp_path, "plan2explore", steps=(300, 400, 500))
+    shutil.rmtree(p2e / "downstream/steps_000400")  # a milestone without a result: recorded, not interpolated
+    for run in (uniform, p2e):
+        assert downstream_module.collect_results(run, "walk", 0)[0] is not None
+    before = tree_hashes(uniform, p2e)
+    command = [sys.executable, str(ROOT / "src/downstream_main.py"), "downstream.mode=compare", "common.devices=cpu",
+               f"analysis.output_root={root.as_posix()}", "analysis.domain=walker", "analysis.exploration_seed=0",
+               "downstream.task_name=walk", "downstream.seed=0"]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+    out = root / "comparisons/walker/exploration_seed_0/walk/adaptation_seed_0"
+    assert sorted(p.name for p in out.iterdir()) == ["analysis.json", "comparison.csv", "fraction_over_thresholds.pdf",
+                                                    "fraction_over_thresholds.png", "task_return.pdf", "task_return.png"]
+    assert all((out / name).stat().st_size > 1000 for name in ("task_return.png", "fraction_over_thresholds.pdf"))
+    assert "Comparison: uniform, plan2explore | 1 missing results" in result.stdout
+    table = downstream_module.read_csv(out / "comparison.csv")
+    assert [(r["method"], r["train_env_steps"]) for r in table] == [("uniform", 300), ("uniform", 400), ("uniform", 500),
+                                                                    ("plan2explore", 300), ("plan2explore", 500)]
+    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["methods"] == ["uniform", "plan2explore"]
+    assert analysis["missing"] == [dict(method="plan2explore", train_env_steps=400, reason="no result row")]
+    assert analysis["evaluation_protocol"]["seeds"] == EVAL_SEEDS and analysis["evaluation_protocol"]["max_steps"] == 500
+    assert analysis["selection"] == dict(output_root=str(root.resolve()), domain="walker", exploration_seed=0, task="walk",
+                                         adaptation_seed=0, member_index=0, protocol=None)
+    p2e_input = next(i for i in analysis["inputs"] if i["method"] == "plan2explore")
+    csv_path = p2e / "result/walk/seed_0/result.csv"
+    assert p2e_input["result_csv_sha256"] == file_sha256(csv_path) and len(p2e_input["evaluations"]) == 2
+    assert tree_hashes(uniform, p2e) == before  # analysis only reads its inputs
+
+    # Methods come from the saved configuration: a second run recording the same method is ambiguous.
+    shutil.copytree(uniform, root / "lcg/walker/seed_0")
+    with pytest.raises(ValueError, match="Two runs record method uniform"):
+        downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+    shutil.rmtree(root / "lcg")
+    # Different evaluation protocols or downstream settings are not compared.
+    synthetic_output(p2e, 600, [1.0, 2.0], seeds=[3001, 3002], max_steps=50)
+    downstream_module.collect_results(p2e, "walk", 0, protocol=downstream_module.protocol_id(
+        next((p2e / "downstream/steps_000600/walk/seed_0/evaluations").iterdir())))
+    with pytest.raises(ValueError, match="different evaluation protocols"):
+        downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+
+
+def test_comparison_needs_the_same_effective_environment_evaluation_and_training_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(downstream_module, "plot_comparison", lambda spec: None)
+    root = tmp_path / "outputs"
+
+    def compare_with(change):
+        shutil.rmtree(root, ignore_errors=True)
+        uniform, p2e = synthetic_run(tmp_path, "uniform"), synthetic_run(tmp_path, "plan2explore")
+        for output in sorted(p2e.glob("downstream/*/walk/seed_0")):
+            change(output)
+        for run in (uniform, p2e):
+            downstream_module.collect_results(run, "walk", 0)
+        return downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+
+    def config_change(**changes):
+        def change(output):
+            cfg = OmegaConf.load(output / "config.yaml")
+            for key, value in changes.items():
+                OmegaConf.update(cfg, key, value, force_add=True)
+            OmegaConf.save(cfg, output / "config.yaml")
+        return change
+
+    def report_change(key, value):
+        def change(output):
+            (report,) = (output / "evaluations").iterdir()
+            data = json.loads(report.read_text(encoding="utf-8"))
+            data[key] = value
+            report.write_text(json.dumps(data), encoding="utf-8")
+        return change
+
+    for change, key in ((config_change(**{"env.train.action_repeat": 4}), "env.train.action_repeat"),
+                        (config_change(**{"env.train.time_limit": 100}), "env.train.time_limit"),
+                        (config_change(**{"env.train.camera_id": 1}), "env.train.camera_id"),
+                        (config_change(**{"env.train.size": 32}), "env.train.size"),
+                        (config_change(**{"world_model_env.horizon": 15}), "world_model_env.horizon"),
+                        (config_change(**{"agent.actor_critic.actor_objective": "advantage_weighted"}),
+                         "agent.actor_critic.actor_objective"),
+                        (report_change("return_convention", "another convention"), "evaluation.return_convention"),
+                        (report_change("action_repeat", 4), "evaluation.action_repeat")):
+        with pytest.raises(ValueError, match=f"not comparable: .* differ in .*{re.escape(key)}"):
+            compare_with(change)
+    # Logging/diagnostics, checkpoint cadence and W&B alone do not make identical science incompatible; resolved
+    # references compare by their effective values.
+    def logging_only(output):
+        config_change(**{"agent.actor_critic.debug_metrics": True, "agent.actor_critic.log_diagnostics": True,
+                         "rew_end_model.debug_metrics": True, "checkpointing.every": 2, "wandb.mode": "online",
+                         "common.action_repeat": 2})(output)
+        cfg = OmegaConf.load(output / "config.yaml")
+        cfg.env.train.action_repeat = "${common.action_repeat}"  # the same value through a reference
+        OmegaConf.save(cfg, output / "config.yaml")
+    out = compare_with(logging_only)
+    assert json.loads((out / "analysis.json").read_text())["methods"] == ["uniform", "plan2explore"]
+
+    # Within one run, mixed settings are refused, naming the setting; a table from before the environment and
+    # evaluation were part of the fingerprint is not compared.
+    run = synthetic_run(tmp_path / "mixed", "uniform")
+    config_change(**{"env.train.action_repeat": 4})(run / "downstream/steps_000400/walk/seed_0")
+    with pytest.raises(ValueError, match="not comparable: .* differ in env.train.action_repeat: 2 vs 4"):
+        downstream_module.collect_results(run, "walk", 0)
+    compare_with(lambda output: None)
+    csv_path = root / "uniform/walker/seed_0/result/walk/seed_0/result.csv"
+    csv_path.write_text(csv_path.read_text(encoding="utf-8").replace("compatibility_sha256", "downstream_settings_sha256"),
+                        encoding="utf-8")
+    with pytest.raises(ValueError, match="collected before the compatibility fingerprint .* collect it again"):
+        downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+
+
+@pytest.mark.parametrize("order", ["sorts_before", "sorts_after"])
+def test_two_policies_under_the_selected_protocol_are_refused(tmp_path, order):
+    run = synthetic_run(tmp_path, "uniform", steps=(300, 400), seeds=[3001, 3002], max_steps=50)
+    path, rows, _ = downstream_module.collect_results(run, "walk", 0)
+    assert len(rows) == 2  # one unambiguous report per milestone: collected
+    before = path.read_bytes()
+    output = run / "downstream/steps_000400/walk/seed_0"
+    (original,) = (output / "evaluations").iterdir()
+    report = json.loads(original.read_text(encoding="utf-8"))
+    for k in range(1000):  # another policy's report of the same protocol, named before or after the original
+        other = downstream_module.evaluation_path(output, "walk", [3001, 3002], 50, {"w": torch.tensor([k, 99])})
+        if (other.name < original.name) == (order == "sorts_before"):
+            break
+    write_json(other, dict(report, return_mean=report["return_mean"]))
+    assert downstream_module.protocol_id(other) == downstream_module.protocol_id(original) and other != original
+    with pytest.raises(ValueError, match=f"2 evaluation reports of different policies with protocol .*"
+                                         f"{re.escape(min(original.name, other.name))}, {re.escape(max(original.name, other.name))}"):
+        downstream_module.collect_results(run, "walk", 0)
+    assert path.read_bytes() == before  # the refused collection left the table as it was
+    # One policy with two protocols still needs a selection.
+    other.unlink()
+    synthetic_output(run, 400, [1.0, 2.0, 3.0], seeds=[1, 2, 3], max_steps=50)
+    with pytest.raises(ValueError, match="several evaluation protocols"):
+        downstream_module.collect_results(run, "walk", 0)
+
+
+def test_plot_grid_keeps_milestones_without_results_as_gaps(tmp_path, monkeypatch):
+    specs = []
+    monkeypatch.setattr(downstream_module, "plot_comparison", specs.append)
+    root = tmp_path / "outputs"
+    uniform = synthetic_run(tmp_path, "uniform", steps=(300, 400, 500, 600))
+    p2e = synthetic_run(tmp_path, "plan2explore", steps=(300, 400, 500, 600))
+    for run in (uniform, p2e):  # no method has a result at 400
+        shutil.rmtree(run / "downstream/steps_000400")
+    shutil.rmtree(uniform / "downstream/steps_000500")  # only uniform lacks 500
+    for run in (uniform, p2e):
+        downstream_module.collect_results(run, "walk", 0)
+    out = downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+    (spec,) = specs
+    assert spec["grid"] == [300, 400, 500, 600]
+    value = lambda run, s, key: downstream_module.read_csv(run / "result/walk/seed_0/result.csv")[
+        [300, 500, 600].index(s) if run == p2e else [300, 600].index(s)][key]
+    for key in ("return_mean", "frac_over_200", "frac_over_400", "frac_over_500", "frac_over_600"):
+        assert spec["series"]["uniform"][key] == [value(uniform, 300, key), None, None, value(uniform, 600, key)]
+        assert spec["series"]["plan2explore"][key] == [value(p2e, 300, key), None, value(p2e, 500, key), value(p2e, 600, key)]
+    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["plot_grid"] == [300, 400, 500, 600]
+    assert sorted((m["method"], m["train_env_steps"]) for m in analysis["missing"]) == [
+        ("plan2explore", 400), ("uniform", 400), ("uniform", 500)]
+
+
+def test_default_wandb_names_identify_the_exploration_run(tmp_path):
+    def names(run, milestone="steps_000300", member=0, members=None, *extra):
+        cfg = compose("downstream", ["initialization.milestone_path=x", "downstream.task_name=walk", "downstream.seed=0",
+                                     *extra])
+        return downstream_module.run_names(cfg, run / "milestones" / milestone, member, members)
+
+    lcg = synthetic_run(tmp_path, "lcg", steps=(300, 400))
+    assert names(lcg) == ("lcg-walker-exploration-seed0-steps_000300-walk-adaptation-seed0",
+                          "lcg-walker-exploration-seed0-walk-adaptation-seed0")
+    assert names(lcg, "steps_000400")[1] == names(lcg)[1]  # milestones of one run, task and seed share the group
+    others = [synthetic_run(tmp_path, "uniform"), synthetic_run(tmp_path, "lcg", exploration_seed=1)]
+    cheetah = synthetic_run(tmp_path / "c", "lcg")
+    cfg = OmegaConf.load(cheetah / "config/exploration.yaml")
+    cfg.env.train.domain_name = "cheetah"
+    OmegaConf.save(cfg, cheetah / "config/exploration.yaml")
+    groups = {names(r)[1] for r in [lcg, *others, cheetah]}
+    assert groups == {"lcg-walker-exploration-seed0-walk-adaptation-seed0", "uniform-walker-exploration-seed0-walk-adaptation-seed0",
+                      "lcg-walker-exploration-seed1-walk-adaptation-seed0", "lcg-cheetah-exploration-seed0-walk-adaptation-seed0"}
+    assert names(lcg, "steps_000300", 2, 5)[1] == "lcg-walker-exploration-seed0-walk-adaptation-seed0-member2"
+    assert names(lcg, "steps_000300", 0, None, "wandb.name=mine", "wandb.group=chosen") == (
+        "mine-steps_000300-walk-adaptation-seed0", "chosen")
+    # Without the exploration run's saved configuration: what the manifest records, the rest labelled.
+    (lcg / "config/exploration.yaml").unlink()
+    assert downstream_module.exploration_label(lcg, dict(domain="walker", exploration=dict(method="lcg"))) == \
+        "lcg-walker-exploration-seed-unrecorded"
+    assert downstream_module.exploration_label(lcg, None, "walker") == "unrecorded-walker-exploration-seed-unrecorded"
+
+    # An existing run keeps its identity, name and group (resume, evaluate-only).
+    fake = FakeWandb()
+    cfg = compose("downstream", ["initialization.milestone_path=x", "downstream.task_name=walk", *ONLINE])
+    downstream_module.wandb, saved = fake, downstream_module.wandb
+    try:
+        downstream_module.init_wandb(cfg, dict(id="old1", name="old-name", group="old-group"), "new-name", "new-group",
+                                     "adaptation", torch.device("cpu"))
+    finally:
+        downstream_module.wandb = saved
+    assert {k: fake.inits[0][k] for k in ("id", "name", "group", "resume")} == dict(
+        id="old1", name="old-name", group="old-group", resume="allow")
 
 # ---------------------------------------------------------------- Gaussian H10 EMA-critic controller
 

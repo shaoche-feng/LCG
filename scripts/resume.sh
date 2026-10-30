@@ -4,9 +4,10 @@
 # Usage:
 #   [PYTHON=/path/to/python] [DEVICE=N|cpu] bash scripts/resume.sh [RUN_DIR] [overrides...]
 #
-# RUN_DIR (default: the current directory) is a run folder created by src/main.py. It is
-# resumed with that folder's own copied src/main.py, saved config/trainer.yaml and
-# checkpoints/state.pt -- never with this checkout's source or the repository defaults.
+# RUN_DIR (default: the current directory) is a run folder created by src/exploration_main.py. It
+# is resumed with that folder's own copied src/exploration_main.py, saved config/exploration.yaml and
+# checkpoints/state.pt -- never with this checkout's source or the repository defaults. Run folders
+# created before the rename (2026-10-30) hold src/main.py and config/trainer.yaml; those are used.
 # Saved settings are kept; Hydra overrides given after RUN_DIR are applied on top, e.g.
 # pmpo_diagnostic.max_epochs=300. Overrides in any form (key=, +key=, ++key=, ~key) that
 # change or delete common.devices, common.resume, hydra.run.dir, hydra.job.chdir or
@@ -16,7 +17,7 @@
 #
 # Environment:
 #   PYTHON           Interpreter (default: python on PATH). Paths with spaces are fine.
-#   DEVICE           GPU index or "cpu" (default: the saved common.devices). src/main.py
+#   DEVICE           GPU index or "cpu" (default: the saved common.devices). The entry point
 #                    exports it as CUDA_VISIBLE_DEVICES, so it names a physical GPU; a
 #                    different pre-set CUDA_VISIBLE_DEVICES is rejected, not overridden.
 #   MUJOCO_GL        Linux: defaults to egl, and MUJOCO_EGL_DEVICE_ID to the GPU index (a
@@ -24,7 +25,7 @@
 #                    MuJoCo's platform default unless MUJOCO_GL is set.
 #   OMP_NUM_THREADS  Defaults to 1, as in the launch scripts.
 #
-# A finished run has a .run_is_over sentinel (written whenever src/main.py returns
+# A finished run has a .run_is_over sentinel (written whenever the entry point returns
 # normally, including at a pmpo_diagnostic.max_epochs cap) and is refused. To extend it
 # deliberately, rename the sentinel (mv .run_is_over .run_is_over.<date>) and pass the
 # override that raises the bound.
@@ -56,25 +57,31 @@ done
 [ -d "$RUN_DIR" ] || die "$RUN_DIR is not a directory. Pass the run folder containing checkpoints/state.pt; diagnostic snapshots are not supported resume inputs."
 cd "$RUN_DIR"
 RUN_DIR=$(pwd -W 2>/dev/null || pwd -P)
-for f in src/main.py config/trainer.yaml checkpoints/state.pt; do
-  [ -f "$f" ] || die "$RUN_DIR/$f is missing: not a run folder created by src/main.py"
+# The run's own entry point and saved configuration (named main.py/trainer.yaml before 2026-10-30).
+if [ -e src/exploration_main.py ] || [ -e config/exploration.yaml ]; then
+  ENTRY=src/exploration_main.py CONFIG=config/exploration.yaml
+else
+  ENTRY=src/main.py CONFIG=config/trainer.yaml
+fi
+for f in "$ENTRY" "$CONFIG" checkpoints/state.pt; do
+  [ -f "$f" ] || die "$RUN_DIR/$f is missing: not a run folder created by src/exploration_main.py (or src/main.py)"
 done
 [ ! -e .run_is_over ] || die "$RUN_DIR is marked finished (.run_is_over). To extend it deliberately, rename the sentinel and pass the override that raises the bound (see --help)."
 
 PYTHON=${PYTHON:-python}
 command -v "$PYTHON" >/dev/null 2>&1 || die "interpreter not found: $PYTHON (set PYTHON=/full/path/to/python)"
-saved=$("$PYTHON" - <<'EOF' | tr -d '\r'
+saved=$("$PYTHON" - "$CONFIG" <<'EOF' | tr -d '\r'
 import sys
 from omegaconf import OmegaConf
-cfg = OmegaConf.load("config/trainer.yaml")
+cfg = OmegaConf.load(sys.argv[1])
 for key in ("common.devices", "agent", "env", "static_dataset"):
     if OmegaConf.select(cfg, key, default="<missing>") == "<missing>":
-        sys.exit(f"resume.sh: error: config/trainer.yaml has no {key}")
+        sys.exit(f"resume.sh: error: {sys.argv[1]} has no {key}")
 print(sys.executable)
 print(OmegaConf.select(cfg, "common.devices"))
 print(OmegaConf.select(cfg, "static_dataset.path"))
 EOF
-) || die "could not read config/trainer.yaml with $PYTHON"
+) || die "could not read $CONFIG with $PYTHON"
 { read -r PYTHON_EXE; read -r SAVED_DEVICE; read -r STATIC_DATASET; } <<< "$saved"
 if [ "$STATIC_DATASET" = None ]; then
   [ -f dataset/train/info.pt ] || die "$RUN_DIR/dataset/train/info.pt is missing; the replay dataset is required to resume"
@@ -93,7 +100,7 @@ case $DEVICE in
   ''|*[!0-9]*) die "device '$DEVICE' ($device_source) is not one GPU index or cpu; PMPO trains on one device (set DEVICE=N or DEVICE=cpu)" ;;
   *)
     if [ -n "${CUDA_VISIBLE_DEVICES+x}" ] && [ "$CUDA_VISIBLE_DEVICES" != "$DEVICE" ]; then
-      die "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES conflicts with GPU $DEVICE: src/main.py would export CUDA_VISIBLE_DEVICES=$DEVICE (a physical index). Unset it, or set DEVICE to the physical GPU to use."
+      die "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES conflicts with GPU $DEVICE: $ENTRY would export CUDA_VISIBLE_DEVICES=$DEVICE (a physical index). Unset it, or set DEVICE to the physical GPU to use."
     fi ;;
 esac
 
@@ -114,5 +121,5 @@ echo "resume.sh: interpreter:   $PYTHON_EXE"
 echo "resume.sh: run directory: $RUN_DIR"
 echo "resume.sh: device:        $DEVICE ($device_source)"
 echo "resume.sh: rendering:     MUJOCO_GL=${MUJOCO_GL-<platform default>} MUJOCO_EGL_DEVICE_ID=${MUJOCO_EGL_DEVICE_ID-<unset>}"
-echo "resume.sh: command:       $PYTHON src/main.py ${overrides[*]} $*"
-exec "$PYTHON" src/main.py "${overrides[@]}" "$@"
+echo "resume.sh: command:       $PYTHON $ENTRY ${overrides[*]} $*"
+exec "$PYTHON" "$ENTRY" "${overrides[@]}" "$@"

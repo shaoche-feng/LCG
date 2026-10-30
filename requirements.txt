@@ -1,5 +1,7 @@
 gymnasium==0.29.1
 h5py==3.11.0
+# Only for downstream_main.py downstream.mode=compare (comparison plots); training never imports it.
+matplotlib==3.10.9
 hydra-core==1.3
 numpy==1.26.4
 opencv-python==4.10.0.84

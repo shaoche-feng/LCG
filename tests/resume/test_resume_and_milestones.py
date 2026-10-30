@@ -3,7 +3,10 @@ immutable replay versions, atomic saves, and downstream milestones."""
 import hashlib
 import pickle
 import random
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -53,7 +56,7 @@ def compose(overrides):
     from hydra import compose as hydra_compose, initialize_config_dir
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     with initialize_config_dir(version_base="1.3", config_dir=str(ROOT / "config")):
-        return hydra_compose(config_name="trainer", overrides=list(overrides))
+        return hydra_compose(config_name="exploration", overrides=list(overrides))
 
 
 def start(run_dir, monkeypatch, overrides, resume=False):
@@ -66,7 +69,7 @@ def start(run_dir, monkeypatch, overrides, resume=False):
     run_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(run_dir)
     if resume:
-        cfg = OmegaConf.load(run_dir / "config/trainer.yaml")
+        cfg = OmegaConf.load(run_dir / "config/exploration.yaml")
         cfg.common.resume = True
     else:
         keys = {o.split("=")[0] for o in overrides}  # a test's own value replaces REAL's
@@ -227,7 +230,7 @@ def test_milestones_are_immutable_movable_and_validated(tmp_path, monkeypatch):
     milestone = load_milestone(Path(moved) / "milestones/steps_000018", "run")
     assert milestone.dataset.num_steps == 18 and milestone.task_index == 2
     assert all(Path(moved) in p.resolve().parents for p in milestone.dataset.episode_files())
-    assert milestone.manifest["collected_steps"] == 18 and milestone.manifest["run_config"] == "../../config/trainer.yaml"
+    assert milestone.manifest["collected_steps"] == 18 and milestone.manifest["run_config"] == "../../config/exploration.yaml"
     assert (milestone.path / milestone.manifest["run_config"]).is_file()
     assert set(milestone.denoiser_state) == set(trainer.agent.denoiser.state_dict())
     with pytest.raises(Exception):
@@ -472,3 +475,31 @@ def test_env_state_rejects_a_different_model():
     hopper = DMControlEnv("hopper", ["hop"], size=8)
     with pytest.raises(ValueError, match="different MuJoCo model"):
         hopper.collection_state = walker.collection_state
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("entry, config", [("src/exploration_main.py", "config/exploration.yaml"),
+                                           ("src/main.py", "config/trainer.yaml")])  # before the 2026-10-30 rename
+def test_resume_script_runs_the_run_folders_own_entry_point_and_config(tmp_path, entry, config):
+    """scripts/resume.sh with the run folder's copied entry point (a stub recording its arguments here)."""
+    run = tmp_path / "run"
+    for path in (entry, config, "checkpoints/state.pt", "dataset/train/info.pt"):
+        (run / path).parent.mkdir(parents=True, exist_ok=True)
+    (run / entry).write_text("import pathlib, sys\npathlib.Path('argv.txt').write_text(' '.join(sys.argv))\n")
+    OmegaConf.save(OmegaConf.create(dict(common=dict(devices="cpu"), agent={}, env={}, static_dataset=dict(path=None))),
+                   run / config)
+    (run / "checkpoints/state.pt").write_bytes(b"x")
+    (run / "dataset/train/info.pt").write_bytes(b"x")
+    env = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "MUJOCO_EGL_DEVICE_ID")}
+    env["PYTHON"] = Path(sys.executable).as_posix()
+    bash = shutil.which("bash")  # PATH's bash (on Windows a bare "bash" can resolve to WSL's in System32)
+    result = subprocess.run([bash, (ROOT / "scripts/resume.sh").as_posix(), run.as_posix(), "pmpo_diagnostic.max_epochs=3"],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    argv = (run / "argv.txt").read_text()
+    assert argv.split()[0] == entry and "common.resume=true" in argv and "hydra.run.dir=." in argv
+    assert argv.split()[-1] == "pmpo_diagnostic.max_epochs=3" and f"command:       {env['PYTHON']} {entry}" in result.stdout
+    (run / entry).unlink()
+    result = subprocess.run([bash, (ROOT / "scripts/resume.sh").as_posix(), run.as_posix()], env=env, capture_output=True,
+                            text=True)
+    assert result.returncode != 0 and f"{entry} is missing" in result.stderr

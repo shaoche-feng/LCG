@@ -117,7 +117,7 @@ def main():
         return
 
     with initialize(version_base="1.3", config_path="../config"):
-        cfg = compose(config_name="trainer")
+        cfg = compose(config_name="exploration")
     cfg = normalize_saved_config(cfg)
 
     env, keymap = prepare_dataset_mode(cfg) if args.dataset_mode else prepare_play_mode(cfg, args)

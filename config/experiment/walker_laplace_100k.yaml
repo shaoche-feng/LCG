@@ -3,7 +3,7 @@
 # LCG-selected R1 parameters from LCG's historical precision; full-ensemble pixel disagreement).
 # Settings: config/intrinsic_reward/laplace_disagreement.yaml.
 #
-#   python src/main.py +experiment=walker_laplace_100k common.devices=0 common.seed=0 \
+#   python src/exploration_main.py +experiment=walker_laplace_100k common.devices=0 common.seed=0 \
 #       hydra.run.dir=outputs/<run name>
 # On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
 # scripts/resume.sh <run folder>.

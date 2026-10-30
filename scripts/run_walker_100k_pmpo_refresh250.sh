@@ -43,7 +43,7 @@ mkdir -p "${OUTPUT_DIR}"
 
 LAUNCH_CMD=(
   env MUJOCO_GL=egl "MUJOCO_EGL_DEVICE_ID=${DEVICE}" OMP_NUM_THREADS=1
-  "${PYTHON}" -u src/main.py
+  "${PYTHON}" -u src/exploration_main.py
   agent=pmpo_beta
   env=dm_control env.train.domain_name=walker env.train.task_name=walk
   "common.devices=${DEVICE}" common.seed=0

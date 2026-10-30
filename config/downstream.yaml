@@ -44,6 +44,20 @@ common:
   devices: 0  # GPU index or cpu
   seed: ${downstream.seed}  # read by agent.actor_critic.seed
 
+# Results (downstream.mode=collect | compare; CPU only, nothing is trained or evaluated; the task, adaptation seed
+# and initialization.member_index select the outputs):
+#   collect: python src/downstream_main.py downstream.mode=collect analysis.run_dir=<exploration run> \
+#                downstream.task_name=walk downstream.seed=0   -> <run>/result/<task>/seed_<s>/result.csv
+#   compare: python src/downstream_main.py downstream.mode=compare analysis.domain=walker analysis.exploration_seed=0 \
+#                downstream.task_name=walk downstream.seed=0
+#            -> <output_root>/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<s>/
+analysis:
+  run_dir: null  # collect: the exploration run folder
+  output_root: outputs  # compare: holds <method>/<domain>/seed_<N>/ runs (custom output roots: pending)
+  domain: null
+  exploration_seed: null
+  protocol: null  # evaluation protocol id (eval_*_protocol-<id>.json), required when several exist
+
 # W&B: one run per milestone x task x adaptation seed x denoiser member (a folder launch starts one per child;
 # the launcher none). disabled (default) | offline | online. A resume continues the run named in the work
 # folder's wandb_run.json; evaluate-only adds to the output's run when it has one. Logging settings may

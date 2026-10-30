@@ -20,7 +20,7 @@ def compose_cleanup_config(overrides=()):
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     root = Path(__file__).resolve().parents[2]
     with initialize_config_dir(version_base="1.3", config_dir=str(root / "config")):
-        return compose(config_name="trainer", overrides=list(overrides))
+        return compose(config_name="exploration", overrides=list(overrides))
 
 
 def test_default_hydra_agent_and_checkpoint(tmp_path):
@@ -926,7 +926,7 @@ def test_trainer_world_model_pmpo_diagnostic_and_resume_with_the_h10_controller(
     Gaussian H10 EMA-critic controller): diagnostic rows carry Gaussian parameters only."""
     import json
     test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatch, True)
-    saved = (tmp_path / "config/trainer.yaml").read_text()
+    saved = (tmp_path / "config/exploration.yaml").read_text()
     for line in ("actor_distribution: tanh_gaussian", "slow_critic_coef: 1.0", "imagination_history: repeat_anchor"):
         assert line in saved
     rows = [json.loads(line) for line in (tmp_path / "pmpo_diagnostic/updates.jsonl").read_text().splitlines()]

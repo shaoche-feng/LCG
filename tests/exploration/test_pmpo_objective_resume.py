@@ -21,7 +21,7 @@ def test_objective_is_resolved_and_its_diagnostics_are_logged(tmp_path, monkeypa
     trainer, logs = start(tmp_path / "run", monkeypatch, BASE + OFF + [f"agent.actor_critic.actor_objective={objective}",
                                                                        "agent.actor_critic.debug_metrics=true"])
     trainer._run()
-    saved = OmegaConf.load("config/trainer.yaml").agent.actor_critic
+    saved = OmegaConf.load("config/exploration.yaml").agent.actor_critic
     assert (saved.actor_objective, saved.advantage_weight_cap) == (objective, 5.0)
     rows = [r for _, r in logs if "actor_critic/train/debug/weight_mean_positive" in r]
     assert len(rows) == trainer.agent.actor_critic.updates.item() == 3
@@ -85,7 +85,7 @@ def test_exploration_controller_is_resolved_recorded_and_imagines_from_the_repea
     monkeypatch.setattr(PMPOBeta, "collect_imagination", spy)
     trainer, logs = start(tmp_path / "run", monkeypatch, BASE + OFF + WEIGHTED)
     trainer._run()
-    saved = OmegaConf.load("config/trainer.yaml").agent.actor_critic
+    saved = OmegaConf.load("config/exploration.yaml").agent.actor_critic
     assert (saved.actor_distribution, saved.slow_critic_coef, saved.slow_critic_rate, saved.imagination_history,
             saved.actor_objective) == ("tanh_gaussian", 1.0, 0.02, "repeat_anchor", "advantage_weighted")
     controller = trainer.provenance()["controller"]

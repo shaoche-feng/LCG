@@ -201,10 +201,11 @@ class ExplorationTrainer(StateDictMixin):
             save_info_for_import_script, run_name=cfg.wandb.name, path_ckpt_dir=self._path_ckpt_dir
         )
 
-        # First time, init files hierarchy
+        # First time, init files hierarchy (never inside an existing run: resume it with common.resume=true)
         if not cfg.common.resume and self._rank == 0:
+            check_no_run_outputs(Path.cwd())
             self._path_ckpt_dir.mkdir(exist_ok=False, parents=False)
-            path_config = Path("config") / "trainer.yaml"
+            path_config = Path("config") / "exploration.yaml"
             path_config.parent.mkdir(exist_ok=False, parents=False)
             shutil.move(".hydra/config.yaml", path_config)
             try:
@@ -1311,7 +1312,7 @@ class ExplorationTrainer(StateDictMixin):
                              **(dict(method=self._method) if self._method else {})),
             model=dict(denoiser=OmegaConf.to_container(cfg.agent.denoiser),
                        env=OmegaConf.to_container(cfg.env.train)),
-            run_config="../../config/trainer.yaml",
+            run_config="../../config/exploration.yaml",
             source=self.source,
         )
         member_states = None
@@ -1383,6 +1384,39 @@ INTRINSIC_UNITS_NOTE = ("Intrinsic returns are in each method's own units (LCG s
 
 
 MISSING = object()  # a checkpoint field that older code did not save
+
+# Output folder label of each exploration method (default run folder outputs/<label>/<domain>/seed_<seed>);
+# the keys are the intrinsic_reward.method identifiers (None: intrinsic reward disabled, uniform random).
+OUTPUT_LABELS = {None: "uniform", "lcg": "lcg", "ensemble_disagreement": "full-ensemble",
+                 "laplace_disagreement": "laplace-ensemble", "plan2explore_disagreement": "plan2explore"}
+# What a run folder holds once a run started in it (Hydra's own .hydra/ and main.log come first, and
+# launch scripts may add their logs; neither counts).
+RUN_OUTPUTS = ("checkpoints", "dataset", "milestones", "config", "src", "scripts", "downstream", "result")
+
+
+def method_label(intrinsic_enabled: bool, method: Optional[str]) -> str:
+    """The output label of an exploration configuration (intrinsic_reward.enabled and .method)."""
+    key = (method or "lcg") if intrinsic_enabled else None
+    if key not in OUTPUT_LABELS:
+        raise ValueError(f"Unknown intrinsic_reward.method {method!r}; known: {sorted(k for k in OUTPUT_LABELS if k)}")
+    return OUTPUT_LABELS[key]
+
+
+def default_run_dir(intrinsic_enabled: Any, method: Any, domain: Any, seed: Any) -> str:
+    """hydra.run.dir resolver: outputs/<method label>/<domain>/seed_<exploration seed>."""
+    if seed is None or isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f"The default run folder needs a fixed exploration seed (common.seed), got {seed!r}")
+    enabled = intrinsic_enabled if isinstance(intrinsic_enabled, bool) else str(intrinsic_enabled).lower() == "true"
+    return f"outputs/{method_label(enabled, method)}/{domain}/seed_{seed}"
+
+
+def check_no_run_outputs(run_dir: Path) -> None:
+    """Refuse to start a new run where a run's outputs already are (before anything is collected)."""
+    found = sorted(name for name in RUN_OUTPUTS if (Path(run_dir) / name).exists())
+    if found:
+        raise FileExistsError(f"{Path(run_dir).resolve()} already holds run outputs ({', '.join(found)}); not starting a "
+                              f"new run over them. Resume it (scripts/resume.sh, common.resume=true) or choose another "
+                              f"folder or seed.")
 
 
 def published_row(row: Dict[str, Any]) -> Dict[str, Any]:

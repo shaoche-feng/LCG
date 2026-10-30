@@ -95,7 +95,7 @@ def test_old_and_new_layouts_resume_identically_and_changes_are_refused(tmp_path
         crashed._run()
     monkeypatch.setattr(ExplorationTrainer, "train_agent", original)
     # The saved run config rewritten in the older layout (a test fixture for a pre-refactor run).
-    saved = tmp_path / "split/config/trainer.yaml"
+    saved = tmp_path / "split/config/exploration.yaml"
     OmegaConf.save(to_old_layout(OmegaConf.load(saved)), saved)
     assert "ensemble" in OmegaConf.load(saved)
     with pytest.raises(ValueError, match="Conflicting ensemble settings"):  # new-field change vs the old file

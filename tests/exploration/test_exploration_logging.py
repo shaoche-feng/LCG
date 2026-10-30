@@ -101,7 +101,7 @@ def launch(run_dir, monkeypatch, tiny, overrides, resume=False, fake_wandb=None)
     monkeypatch.setattr(trainer_module, "wandb_log", lambda rows, epoch: logs.extend((epoch, r) for r in rows))
     if resume:
         monkeypatch.chdir(run_dir)
-        cfg = OmegaConf.load(run_dir / "config/trainer.yaml")
+        cfg = OmegaConf.load(run_dir / "config/exploration.yaml")
         cfg.common.resume = True
         for override in overrides:
             key, value = override.split("=")

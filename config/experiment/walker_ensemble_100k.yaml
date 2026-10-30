@@ -3,7 +3,7 @@
 # ExplorationTrainer with 5 independently initialized, bootstrapped denoisers and PMPO on their
 # disagreement.
 #
-#   python src/main.py +experiment=walker_ensemble_100k common.devices=0 common.seed=0 \
+#   python src/exploration_main.py +experiment=walker_ensemble_100k common.devices=0 common.seed=0 \
 #       hydra.run.dir=outputs/<run name>
 #
 # Member count and bootstrap are intrinsic_reward settings (defaults 5 and true, from

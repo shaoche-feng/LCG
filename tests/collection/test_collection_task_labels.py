@@ -83,7 +83,7 @@ def compose(overrides=()):
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     root = Path(__file__).resolve().parents[2]
     with initialize_config_dir(version_base="1.3", config_dir=str(root / "config")):
-        return hydra_compose(config_name="trainer", overrides=list(overrides))
+        return hydra_compose(config_name="exploration", overrides=list(overrides))
 
 
 def test_config_interpolation_and_collection_modes():

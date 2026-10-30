@@ -2,7 +2,7 @@
 # requires `enabled: True` when collection.train.mode=policy and `enabled: False` for the
 # uniform baseline (collection.train.mode=uniform). Other values are read only when enabled.
 #
-# This is a config GROUP (config/intrinsic_reward/), selected via trainer.yaml's
+# This is a config GROUP (config/intrinsic_reward/), selected via exploration.yaml's
 # `defaults: - intrinsic_reward: lcg`, so a future baseline (RND, ICM, ...) can be added
 # as a sibling file (config/intrinsic_reward/rnd.yaml, ...) and swapped in the same way,
 # instead of accumulating multiple mutually-exclusive top-level `enabled` blocks.

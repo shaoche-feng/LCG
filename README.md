@@ -6,7 +6,8 @@ This project trains a PMPO-Beta controller through a DIAMOND-derived diffusion w
 
 Use the established `lcg` conda environment. On kingplus0 its interpreter is `/home/bigking/anaconda3/envs/lcg/bin/python`. Dependency versions are in [requirements.txt](requirements.txt).
 
-- [config/trainer.yaml](config/trainer.yaml): collection budgets, world-model training, evaluation, checkpoints, and optional LCG.
+- [config/exploration.yaml](config/exploration.yaml) (entry point `src/exploration_main.py`; named `config/trainer.yaml` and `src/main.py` before 2026-10-30): collection budgets, world-model training, evaluation, checkpoints, the exploration method and the default run folder.
+- [config/downstream.yaml](config/downstream.yaml) (entry point `src/downstream_main.py`): downstream adaptation, evaluation, W&B, and result collection and comparison.
 - [config/agent/pmpo_beta.yaml](config/agent/pmpo_beta.yaml): PMPO architecture and learning settings; includes the shared world-model architecture in [default.yaml](config/agent/default.yaml).
 - [config/env/dm_control.yaml](config/env/dm_control.yaml): task, RGB size, camera, action repeat, and time limit.
 - [config/pmpo_diagnostic/](config/pmpo_diagnostic/): optional bounded diagnostics and checkpoint recording.
@@ -31,7 +32,7 @@ For tests without training:
 OMP_NUM_THREADS=1 MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 /home/bigking/anaconda3/envs/lcg/bin/python -m pytest -q tests
 ```
 
-Runs save the effective Hydra configuration, source/scripts, datasets, agent versions, and full resume state under their output directory. `static_dataset.path` retains training from an existing dataset. `intrinsic_reward.enabled` controls the optional LCG lifecycle; it is disabled by default.
+Runs save the effective Hydra configuration (`config/exploration.yaml`), source/scripts, datasets, agent versions, milestones and full resume state under their output directory. By default an exploration run's folder is `outputs/<method>/<domain>/seed_<exploration seed>/` (method: `uniform`, `lcg`, `full-ensemble`, `laplace-ensemble` or `plan2explore`; a fixed `common.seed` is required), and a new run refuses a folder that already holds run outputs; resume it instead. Downstream outputs go to `<run>/downstream/steps_<N>/<task>/seed_<s>/`; `downstream.mode=collect` writes `<run>/result/<task>/seed_<s>/result.csv` and `downstream.mode=compare` writes `outputs/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<s>/` (CSV, analysis.json and plots; matplotlib needed). Custom output roots are pending. `static_dataset.path` retains training from an existing dataset. `intrinsic_reward.enabled` controls the optional LCG lifecycle; it is disabled by default.
 
 To resume a run, pass its folder to the resume script, from the repository or anywhere else:
 
@@ -39,13 +40,13 @@ To resume a run, pass its folder to the resume script, from the repository or an
 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/resume.sh outputs/<run> [overrides...]
 ```
 
-The script resumes with the run folder's own copied `src/`, saved `config/trainer.yaml` and `checkpoints/state.pt`, never this checkout's source or defaults. The folder defaults to the current directory. Saved settings are kept, and Hydra overrides after the folder apply on top. Two kinds of argument are rejected:
+The script resumes with the run folder's own copied `src/`, saved `config/exploration.yaml` (`config/trainer.yaml` in run folders created before 2026-10-30) and `checkpoints/state.pt`, never this checkout's source or defaults. The folder defaults to the current directory. Saved settings are kept, and Hydra overrides after the folder apply on top. Two kinds of argument are rejected:
 
 - An override in any form (`key=`, `+key=`, `++key=`, `~key`) that changes or deletes a key the script sets. That covers `common.devices`, `common.resume`, `hydra.run.dir`, `hydra.job.chdir` and `hydra.output_subdir`, and parent mappings such as `common` or `hydra.job`.
 - A Hydra option such as `--config-name` or `--multirun`. The script refuses to start, with a nonzero exit, when any of these is missing. Diagnostic snapshots under `pmpo_diagnostic/` are not resume inputs. It prints the resolved interpreter, run folder, device and rendering settings before launching, and returns the training process's exit status.
 
 - `PYTHON`: interpreter (default `python`; paths with spaces are fine).
-- `DEVICE`: GPU index or `cpu` (default: the saved `common.devices`). `src/main.py` exports it as `CUDA_VISIBLE_DEVICES`, so it is a physical GPU index; a conflicting pre-set `CUDA_VISIBLE_DEVICES` is an error.
+- `DEVICE`: GPU index or `cpu` (default: the saved `common.devices`). `src/exploration_main.py` exports it as `CUDA_VISIBLE_DEVICES`, so it is a physical GPU index; a conflicting pre-set `CUDA_VISIBLE_DEVICES` is an error.
 - `MUJOCO_GL` / `MUJOCO_EGL_DEVICE_ID`: on Linux they default to `egl` and the same GPU index; a conflicting EGL device is an error. On Windows and macOS, MuJoCo's platform default is used unless `MUJOCO_GL` is set.
 - `OMP_NUM_THREADS`: defaults to 1, as in the launch scripts.
 

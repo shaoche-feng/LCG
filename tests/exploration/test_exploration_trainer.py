@@ -51,7 +51,7 @@ def compose(overrides):
     from hydra import compose as hydra_compose, initialize_config_dir
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     with initialize_config_dir(version_base="1.3", config_dir=str(ROOT / "config")):
-        return hydra_compose(config_name="trainer", overrides=list(overrides))
+        return hydra_compose(config_name="exploration", overrides=list(overrides))
 
 
 class FakeEnv:
@@ -355,3 +355,56 @@ def test_pmpo_needs_a_reward_source_without_reward_end_model():
     model.set_intrinsic_reward_fn(hook)
     loss, metrics = model()
     assert torch.isfinite(loss) and rewards and metrics["return_mean"] > 0
+
+
+# ---------------------------------------------------------------- default run folder and existing outputs
+
+@pytest.mark.parametrize("preset, label", [("uniform", "uniform"), ("lcg", "lcg"), ("ensemble", "full-ensemble"),
+                                           ("laplace", "laplace-ensemble"), ("plan2explore", "plan2explore")])
+def test_default_run_folder_is_method_domain_and_seed(preset, label):
+    import exploration_main  # noqa: F401  (registers the run-folder resolver, as the entry point does)
+    from hydra import compose as hydra_compose, initialize_config_dir
+    with initialize_config_dir(version_base="1.3", config_dir=str(ROOT / "config")):
+        cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment=walker_{preset}_100k"],
+                            return_hydra_config=True)
+        assert cfg.hydra.run.dir == f"outputs/{label}/walker/seed_0"
+        # The configured domain and seed, whatever they are; the method label is the preset's.
+        cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment=walker_{preset}_100k", "common.seed=7",
+                                                                  "env.train.domain_name=cheetah"], return_hydra_config=True)
+        assert cfg.hydra.run.dir == f"outputs/{label}/cheetah/seed_7"
+        if preset == "uniform":  # without a fixed seed there is no default run folder
+            cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment=walker_{preset}_100k", "common.seed=null"],
+                                return_hydra_config=True)
+            with pytest.raises(Exception, match="needs a fixed exploration seed"):
+                cfg.hydra.run.dir
+    assert trainer_module.method_label(True, "laplace_disagreement") == "laplace-ensemble"
+    with pytest.raises(ValueError, match="Unknown intrinsic_reward.method 'other'"):
+        trainer_module.method_label(True, "other")
+
+
+@pytest.mark.parametrize("existing", ["dataset", "milestones", "checkpoints", "config"])
+def test_a_new_run_refuses_a_folder_that_holds_run_outputs(tmp_path, monkeypatch, existing):
+    run_dir = tmp_path / "run"
+    (run_dir / existing).mkdir(parents=True)
+    (run_dir / "stdout.log").write_text("launch script log\n")  # not a run output
+    with pytest.raises(FileExistsError, match=f"already holds run outputs \\({existing}\\)(.|\\n)*Resume it"):
+        run_trainer(tmp_path, monkeypatch, UNIFORM, build_only=True)
+    # Refused before anything was written: nothing collected, copied or saved.
+    assert sorted(p.name for p in run_dir.iterdir()) == sorted([".hydra", existing, "stdout.log"])
+    assert not any((run_dir / existing).iterdir())
+
+
+def test_the_entry_point_refuses_a_new_run_in_a_finished_run_folder(tmp_path):
+    """A finished run (.run_is_over) is refused too, not skipped with exit status 0; resume is unaffected."""
+    import subprocess
+    import sys
+    run_dir = tmp_path / "outputs/uniform/walker/seed_0"
+    (run_dir / "checkpoints").mkdir(parents=True)
+    (run_dir / ".run_is_over").touch()
+    before = sorted(p.name for p in run_dir.iterdir())
+    result = subprocess.run([sys.executable, str(ROOT / "src/exploration_main.py"), "+experiment=walker_uniform_100k",
+                             "common.devices=cpu", f"hydra.run.dir={run_dir.as_posix()}"], cwd=tmp_path,
+                            capture_output=True, text=True)
+    assert result.returncode != 0 and "already holds run outputs (checkpoints)" in result.stderr
+    assert "Run is marked as finished" not in result.stdout
+    assert sorted(p.name for p in run_dir.iterdir() if p.name not in (".hydra", "exploration_main.log")) == before

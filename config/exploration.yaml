@@ -8,6 +8,13 @@ defaults:
 hydra:
   job:
     chdir: True
+  # Default run folder: outputs/<method>/<domain>/seed_<exploration seed>, relative to the launch directory.
+  # <method>: uniform, lcg, full-ensemble, laplace-ensemble or plan2explore (exploration_trainer.OUTPUT_LABELS),
+  # from intrinsic_reward.enabled/method; <domain> and the seed are the configured env.train.domain_name and
+  # common.seed (which must be set). A folder that already holds run outputs is refused unless common.resume.
+  # Custom output roots: pending (hydra.run.dir can still be overridden).
+  run:
+    dir: ${exploration_run_dir:${intrinsic_reward.enabled},${oc.select:intrinsic_reward.method,lcg},${env.train.domain_name},${common.seed}}
 
 wandb:
   mode: disabled

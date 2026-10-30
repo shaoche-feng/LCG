@@ -17,7 +17,7 @@ def build_ensemble_milestone(root, members=3):
     """build_milestone's replay and member 0, plus members 1..K-1 (different weights)."""
     single = build_milestone(root)
     manifest = read_manifest(single)
-    cfg = compose("trainer", TINY_DENOISER)
+    cfg = compose("exploration", TINY_DENOISER)
     denoiser_cfg = instantiate(cfg.agent.denoiser)
     denoiser_cfg.inner_model.continuous_action_dim = 6
     states = []
