@@ -28,7 +28,7 @@ from agent import Agent
 from coroutines.frame_history import FrameHistory
 from data import BatchSampler, collate_segments_without_rewards
 from data.milestone import (SUMMARY_FILE, downstream_output_dir, downstream_summary, load_milestone, milestone_members,
-                            read_json, state_sha256, write_json)
+                            read_json, read_manifest, state_sha256, write_json)
 from data.utils import make_task_reward_collate
 from utils import physical_gpu_index
 from envs import DMControlEnv, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
@@ -38,8 +38,8 @@ from utils import (Progress, check_same_packages, configure_opt, file_sha256, ge
                    say, set_rng_state, set_seed, source_identity)
 
 # Bumped when the checkpoint contents needed for faithful resume change. 2: milestone
-# replay content checksum (dataset.pt, which lists every episode file's checksum).
-DOWNSTREAM_RESUME_FORMAT = 2
+# replay content checksum; 3: committed metrics-log byte boundary and prefix checksum.
+DOWNSTREAM_RESUME_FORMAT = 3
 # Settings a resume may change: how it is launched, where the (moved) milestone is, and logging
 # (W&B mode/names and the diagnostics-only debug flags; they change no loss, update or RNG draw).
 RESUME_MAY_CHANGE = ("downstream.mode", "initialization.milestone_path", "wandb", "rew_end_model.debug_metrics",
@@ -161,7 +161,6 @@ class DownstreamTrainer:
         rng = None
         if resume:
             rng = self.load_checkpoint()
-            recover_metrics_log(self._work_dir / "metrics.jsonl")
             self.log_row(dict(phase="resume", resumed_phase=self.phase, num_updates=dict(self.num_updates)))
         state = rng_state()
         self.start_wandb(resume)  # W&B draws no training random numbers: the state is put back
@@ -410,8 +409,18 @@ class DownstreamTrainer:
 
     def save_checkpoint(self) -> None:
         """Atomic: an interrupted write leaves the previous checkpoint usable."""
+        with open(self._work_dir / "metrics.jsonl", "a+b") as metrics:
+            metrics.flush()
+            os.fsync(metrics.fileno())
+            metrics_bytes = metrics.tell()
+            metrics.seek(0)
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: metrics.read(1 << 20), b""):
+                digest.update(chunk)
         state = dict(
             format=DOWNSTREAM_RESUME_FORMAT,
+            metrics_bytes=metrics_bytes,
+            metrics_sha256=digest.hexdigest(),
             phase=self.phase,
             num_updates=dict(self.num_updates),
             rew_end_model=self.agent.rew_end_model.state_dict(),
@@ -437,6 +446,10 @@ class DownstreamTrainer:
         if state.get("format") == 1:
             raise ValueError(f"{self._path_checkpoint} predates the replay content checksum (format 1); "
                              f"it cannot be resumed faithfully. Start a new run.")
+        if state.get("format") == 2 or (state.get("format") == DOWNSTREAM_RESUME_FORMAT and
+                                        not {"metrics_bytes", "metrics_sha256"} <= state.keys()):
+            raise ValueError(f"{self._path_checkpoint} predates the committed metrics boundary; "
+                             "its history cannot be verified. Resume with its own copied source or start a new run.")
         if state.get("format") != DOWNSTREAM_RESUME_FORMAT:
             raise ValueError(f"{self._path_checkpoint} is not a downstream training checkpoint")
         check_same_packages(state["source"])
@@ -451,6 +464,7 @@ class DownstreamTrainer:
             raise ValueError(f"Cannot resume with different settings: {changed}")
         check_controller_state(state["actor_critic"].get("_extra_state"), self.agent.actor_critic.cfg,
                                source=f"{self._path_checkpoint}'s controller")  # before any weights
+        recover_metrics_log(self._work_dir / "metrics.jsonl", state["metrics_bytes"], state["metrics_sha256"])
         self.agent.rew_end_model.load_state_dict(state["rew_end_model"])
         self.agent.actor_critic.load_state_dict(state["actor_critic"])
         self.rew_end_opt.load_state_dict(state["rew_end_opt"])
@@ -606,34 +620,57 @@ def evaluation_protocol(c: DictConfig) -> Dict[str, Any]:
                 policy="deterministic (mean action)", return_convention=RETURN_CONVENTION)
 
 
-def recover_metrics_log(path: Path) -> Optional[Path]:
+def recover_metrics_log(path: Path, committed_bytes: Optional[int] = None,
+                        committed_sha256: Optional[str] = None) -> Optional[Path]:
     """Repair a log whose last row a crash cut short; returns the recovery file, if any.
     Complete rows (including updates newer than the checkpoint) stay unchanged; the cut
-    bytes are kept verbatim in metrics.jsonl.interrupted-<n>. Running it again is a no-op."""
+    bytes are kept verbatim in metrics.jsonl.interrupted-<n>. Running it again is a no-op.
+    A committed boundary must end on an intact complete row; the prefix checksum also detects
+    readable same-length changes. None is for standalone legacy
+    repair only; training resume refuses checkpoints without a recorded boundary."""
+    if committed_bytes is not None and (type(committed_bytes) is not int or committed_bytes < 0):
+        raise ValueError(f"{path}: invalid committed metrics boundary {committed_bytes!r}")
     if not path.is_file():
+        if committed_bytes:
+            raise ValueError(f"{path}: missing committed metrics history ({committed_bytes} bytes)")
         return None
     data = path.read_bytes()
+    if committed_bytes is not None and (len(data) < committed_bytes or
+                                        (committed_bytes and data[committed_bytes - 1:committed_bytes] != b"\n")):
+        raise ValueError(f"{path}: damaged committed metrics history (boundary {committed_bytes} bytes)")
+    if committed_sha256 is not None and hashlib.sha256(data[:committed_bytes]).hexdigest() != committed_sha256:
+        raise ValueError(f"{path}: damaged committed metrics history (prefix checksum differs)")
     *rows, tail = data.split(b"\n")
+    offset = 0
     for number, row in enumerate(rows, start=1):
         try:
-            json.loads(row)
+            if not isinstance(json.loads(row), dict):
+                raise ValueError("metrics record is not an object")
         except ValueError:
-            raise ValueError(f"{path}: row {number} is corrupt; not resuming over it") from None
+            committed = committed_bytes is not None and offset < committed_bytes
+            raise ValueError(f"{path}: {'committed ' if committed else ''}row {number} is corrupt; not resuming over it") from None
+        offset += len(row) + 1
     if not tail.strip():
         return None
     try:
-        json.loads(tail)
+        if not isinstance(json.loads(tail), dict):
+            raise ValueError("metrics record is not an object")
     except ValueError:
         pass
     else:
-        with open(path, "a", encoding="utf-8") as f:  # a complete record that lost only its newline
-            f.write("\n")
+        with open(path, "ab") as f:  # a complete uncommitted record that lost only its newline
+            f.write(b"\n")
+            f.flush()
+            os.fsync(f.fileno())
         return None
     number = 1
     while path.with_name(f"{path.name}.interrupted-{number}").exists():
         number += 1
     recovery = path.with_name(f"{path.name}.interrupted-{number}")
-    recovery.write_bytes(tail)
+    with open(recovery, "xb") as f:
+        f.write(tail)
+        f.flush()
+        os.fsync(f.fileno())
     tmp = path.with_suffix(".tmp")
     tmp.write_bytes(data[:len(data) - len(tail)])
     tmp.replace(path)
@@ -724,10 +761,15 @@ def evaluate_policy(model: PMPOBeta, env_cfg: DictConfig, task_name: str, seeds:
         set_rng_state(rng)
     returns = np.array([e["episode_return"] for e in episodes])
     return dict(task_name=task_name, domain_name=env_cfg.domain_name, seeds=[int(s) for s in seeds],
-                max_steps=int(max_steps), action_repeat=int(env_cfg.action_repeat), policy="deterministic (Beta mean)",
+                max_steps=int(max_steps), action_repeat=int(env_cfg.action_repeat),
+                policy=deterministic_policy_description(model.cfg.actor_distribution),
                 return_convention=RETURN_CONVENTION, episodes=episodes,
                 return_mean=float(returns.mean()), return_median=float(np.median(returns)),
                 return_std=float(returns.std()), return_min=float(returns.min()), return_max=float(returns.max()))
+
+
+def deterministic_policy_description(actor_distribution: str) -> str:
+    return {"tanh_gaussian": "deterministic (tanh(mu))", "beta": "deterministic (Beta mean)"}[actor_distribution]
 
 
 def frame_tensor(image: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -940,14 +982,66 @@ def result_row(report_path: Path, report: Dict[str, Any], identity: Dict[str, An
                output_dir: Path, run_dir: Path) -> Dict[str, Any]:
     """One milestone's row: statistics recomputed from the episode returns (the saved aggregates are checked
     against them), strict threshold fractions and every evaluation seed's return."""
-    seeds = [int(s) for s in report["seeds"]]
+    saved = OmegaConf.load(output_dir / "config.yaml")
+    milestone_path = run_dir / "milestones" / output_dir.parent.parent.name
+    manifest = read_manifest(milestone_path)
+    task, seed = summary["task_name"], summary["seed"]
+    member = summary["milestone"].get("member_index", 0)
+    if summary["milestone"]["identity"] != manifest["identity"] or \
+            summary["milestone"]["collected_steps"] != manifest["collected_steps"] or \
+            (output_dir / summary["milestone"]["path"]).resolve() != milestone_path.resolve():
+        raise ValueError(f"{output_dir}: summary does not match its milestone")
+    recorded = manifest["exploration"]
+    from exploration_trainer import method_label
+    if method_label(recorded["intrinsic_reward_enabled"], recorded.get("method", "lcg")) != identity["method"]:
+        raise ValueError(f"{milestone_path}: exploration method differs from the saved run configuration")
+    if manifest["domain"] != identity["domain"] or task not in manifest["task_names"]:
+        raise ValueError(f"{milestone_path}: domain or task identity differs from the selected result")
+    exploration_cfg = OmegaConf.load(run_dir / "config/exploration.yaml")
+    for key, recorded_value in (("env.train", manifest["model"]["env"]),
+                                ("agent.denoiser", manifest["model"]["denoiser"])):
+        current_value = OmegaConf.to_container(OmegaConf.select(exploration_cfg, key), resolve=True)
+        if current_value != recorded_value:
+            raise ValueError(f"{milestone_path}: exploration configuration differs in "
+                             f"{settings_difference({key: recorded_value}, {key: current_value})}")
+    if (saved.downstream.task_name, saved.downstream.seed,
+            OmegaConf.select(saved, "initialization.member_index", default=0)) != (task, seed, member):
+        raise ValueError(f"{output_dir}: saved task, adaptation seed or member differs from its summary")
+    if OmegaConf.to_container(saved.env.train, resolve=True) != manifest["model"]["env"]:
+        difference = settings_difference({"env.train": manifest["model"]["env"]},
+                                          {"env.train": OmegaConf.to_container(saved.env.train, resolve=True)})
+        raise ValueError(f"not comparable: {output_dir} and its milestone differ in {difference}")
+    if OmegaConf.to_container(saved.agent.denoiser, resolve=True) != manifest["model"]["denoiser"]:
+        raise ValueError(f"{output_dir}: agent.denoiser differs from its milestone")
+    expected_member = (manifest["identity"].get("member_sha256") or [manifest["identity"]["denoiser_sha256"]])
+    if not 0 <= member < len(expected_member) or summary["milestone"]["member_sha256"] != expected_member[member]:
+        raise ValueError(f"{output_dir}: denoiser member identity differs from its milestone")
+    if report["task_name"] != task or report["domain_name"] != identity["domain"]:
+        raise ValueError(f"{report_path}: evaluation task or domain differs from its policy")
+    if report["action_repeat"] != saved.env.train.action_repeat or report["return_convention"] != RETURN_CONVENTION:
+        difference = settings_difference(dict(evaluation=dict(action_repeat=saved.env.train.action_repeat,
+                                                               return_convention=RETURN_CONVENTION)),
+                                          dict(evaluation={k: report[k] for k in ("action_repeat", "return_convention")}))
+        raise ValueError(f"not comparable: {report_path} and its saved environment differ in {difference}")
+    distribution = OmegaConf.select(saved, "agent.actor_critic.actor_distribution", default="beta")
+    if report["policy"] != deterministic_policy_description(distribution):
+        raise ValueError(f"{report_path}: evaluation.policy differs from its actor distribution; re-evaluate the policy")
+    seeds = list(report["seeds"])
+    check_evaluation_config(OmegaConf.create(dict(seeds=seeds, max_steps=report["max_steps"])))
     episodes = report["episodes"]
     if [int(e["seed"]) for e in episodes] != seeds:
         raise ValueError(f"{report_path}: episode seeds {[e['seed'] for e in episodes]} differ from the protocol {seeds}")
     expected = hashlib.sha256(repr((seeds, int(report["max_steps"]))).encode()).hexdigest()[:12]
     if expected != protocol_id(report_path):
         raise ValueError(f"{report_path}: its seeds and step limit do not match the protocol in its name")
+    policy_state = torch.load(output_dir / "actor_critic.pt", map_location="cpu", weights_only=False)
+    expected_path = evaluation_path(output_dir, task, seeds, report["max_steps"], policy_state)
+    policy_hash = expected_path.stem.split("_policy-", 1)[1].split("_protocol-", 1)[0]
+    if report_path.resolve() != expected_path.resolve() or report.get("policy_sha256_prefix") != policy_hash:
+        raise ValueError(f"{report_path}: report policy identity does not match actor_critic.pt")
     returns = np.array([float(e["episode_return"]) for e in episodes])
+    if not np.isfinite(returns).all():
+        raise ValueError(f"{report_path}: non-finite episode returns")
     stats = dict(return_mean=float(returns.mean()), return_median=float(np.median(returns)),
                  return_std=float(returns.std()), return_min=float(returns.min()), return_max=float(returns.max()))
     for key, value in stats.items():
@@ -965,7 +1059,8 @@ def result_row(report_path: Path, report: Dict[str, Any], identity: Dict[str, An
 
 
 def collect_results(run_dir: Path, task_name: str, seed: int, member_index: int = 0,
-                    protocol: Optional[str] = None) -> Tuple[Optional[Path], List[Dict[str, Any]], List[Dict[str, Any]]]:
+                    protocol: Optional[str] = None, write: bool = True
+                    ) -> Tuple[Optional[Path], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Every milestone of the run, in collected-step order: its completed downstream output's evaluation of
     the one (selected) protocol -> result.csv. Returns (csv path or None, rows, missing). Different
     protocols or downstream settings are never mixed; ambiguity is an error asking for a selection."""
@@ -982,6 +1077,8 @@ def collect_results(run_dir: Path, task_name: str, seed: int, member_index: int 
             missing.append(dict(entry, reason="incomplete (work folder " + work.name + " only)" if work.exists()
                                 else "no downstream output"))
             continue
+        if (summary["task_name"], summary["seed"], summary["milestone"].get("member_index", 0)) != (task_name, seed, member_index):
+            raise ValueError(f"{output}: summary task, adaptation seed or member differs from the selection")
         if summary["milestone"]["collected_steps"] != manifest["collected_steps"] or \
                 summary["milestone"].get("identity") != manifest["identity"]:
             raise ValueError(f"{output}: its summary does not match milestone {path.name}")
@@ -1016,7 +1113,8 @@ def collect_results(run_dir: Path, task_name: str, seed: int, member_index: int 
     rows.sort(key=lambda r: r["train_env_steps"])
     seed_columns = [k for k in rows[0] if k.startswith("return_seed_")]
     path = result_dir(run_dir, task_name, seed, member_index) / "result.csv"
-    write_csv(path, rows, RESULT_COLUMNS + seed_columns + ["source_evaluation_file"])
+    if write:
+        write_csv(path, rows, RESULT_COLUMNS + seed_columns + ["source_evaluation_file"])
     return path, rows, missing
 
 
@@ -1083,6 +1181,26 @@ def compare_methods(output_root: Path, domain: str, exploration_seed: int, task_
         steps = [r["train_env_steps"] for r in method_rows]
         if len(set(steps)) != len(steps):
             raise ValueError(f"{csv_path}: duplicate milestones {sorted(s for s in steps if steps.count(s) > 1)}")
+        # Re-run collection read-only against current configs, manifests, policy weights and
+        # reports. Cached fingerprints and statistics are evidence to verify, not authority.
+        try:
+            table_protocols = {r["protocol"] for r in method_rows}
+            if len(table_protocols) != 1:
+                raise ValueError("the table must contain exactly one evaluation protocol")
+            _, current_rows, _ = collect_results(run_dir, task_name, seed, member_index,
+                                                  next(iter(table_protocols)), write=False)
+            current = {r["milestone"]: r for r in current_rows}
+            if len(current) != len(method_rows):
+                raise ValueError("the completed evaluation set changed after collection")
+            for row in method_rows:
+                fresh = current.get(row["milestone"])
+                if fresh != row:
+                    differences = settings_difference(row, fresh or {})
+                    raise ValueError(f"{row['milestone']} differs from its current sources: {differences}")
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+            raise ValueError(f"{csv_path}: stale or inconsistent result table ({error}); recollect with "
+                             "downstream_main.py downstream.mode=collect analysis.run_dir=<run> "
+                             "and the selected task, seed, member and protocol") from error
         evaluations = [run_dir / r["source_evaluation_file"] for r in method_rows]
         inputs.append(dict(method=identity["method"], run=str(run_dir.resolve()), result_csv=str(csv_path.resolve()),
                            result_csv_sha256=file_sha256(csv_path), evaluations={str(p.resolve()): file_sha256(p)
@@ -1099,6 +1217,8 @@ def compare_methods(output_root: Path, domain: str, exploration_seed: int, task_
     elif len(protocols) > 1:
         raise ValueError(f"The methods' results use different evaluation protocols ({', '.join(protocols)}); "
                          "select one with analysis.protocol=<id>")
+    if not rows:
+        raise ValueError(f"No results for selected protocol {protocol}; collect that protocol first")
     if len({r["compatibility_sha256"] for r in rows}) > 1:  # name the differing settings
         sources = []
         for r in rows:

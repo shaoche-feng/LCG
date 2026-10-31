@@ -135,9 +135,12 @@ class Denoiser(nn.Module):
     def forward(self, batch: Batch) -> LossAndLogs:
         n = self.cfg.inner_model.num_steps_conditioning
         seq_length = batch.obs.size(1) - n
+        if seq_length <= 0 or not batch.mask_padding[:, n:].any():
+            raise ValueError("Denoiser batch contains no valid prediction targets after conditioning")
 
         all_obs = batch.obs.clone()
         loss = 0
+        num_loss_terms = 0
 
         for i in range(seq_length):
             obs = all_obs[:, i : n + i]
@@ -155,10 +158,14 @@ class Denoiser(nn.Module):
             model_output = self.compute_model_output(noisy_next_obs, obs, act, cs)
 
             target = (next_obs - cs.c_skip * noisy_next_obs) / cs.c_out
-            loss += F.mse_loss(model_output[mask], target[mask])
+            if mask.any():
+                # Keep the mean pixel/example MSE per autoregressive position, then average
+                # over positions with targets. Empty positions contribute no loss term.
+                loss += F.mse_loss(model_output[mask], target[mask])
+                num_loss_terms += 1
 
             denoised = self.wrap_model_output(noisy_next_obs, model_output, cs)
             all_obs[:, n + i] = denoised
 
-        loss /= seq_length
+        loss /= num_loss_terms
         return loss, {"loss_denoising": loss.detach()}

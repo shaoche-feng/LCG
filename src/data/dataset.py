@@ -162,6 +162,26 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         """The episode versions this index refers to, in episode order."""
         return [self._get_episode_path(i) for i in range(self.num_episodes)]
 
+    def verify_episode_files(self) -> None:
+        """Validate this checkpoint's immutable replay once on resume, bypassing the cache."""
+        if len(self.file_sha256) != self.num_episodes or any(s is None for s in self.file_sha256):
+            raise ValueError(f"{self.name}: checkpoint has no complete replay checksums; cannot resume faithfully")
+        for episode_id, (path, expected) in enumerate(zip(self.episode_files(), self.file_sha256)):
+            try:
+                actual = file_sha256(path)
+            except FileNotFoundError as error:
+                raise FileNotFoundError(f"{self.name}: checkpoint episode {path} is missing") from error
+            except OSError as error:
+                raise ValueError(f"{self.name}: missing or unreadable checkpoint episode {path}: {error}") from error
+            if actual != expected:
+                raise ValueError(f"{self.name}: checkpoint episode {path} does not match its checksum")
+            try:
+                episode = Episode.load(path, map_location=torch.device("cpu"))
+                if len(episode) != self.lengths[episode_id] or episode.task_names != self.task_names:
+                    raise ValueError("episode length or task labels differ from the checkpoint index")
+            except Exception as error:
+                raise ValueError(f"{self.name}: unreadable checkpoint episode {path}: {error}") from error
+
     def prune_versions(self, keep: Set[Path]) -> int:
         """Delete episode versions (and interrupted writes) not in keep; returns the count."""
         self.assert_not_static()

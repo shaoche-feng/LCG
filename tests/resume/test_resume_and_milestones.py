@@ -90,10 +90,10 @@ def finish(trainer):
 def numeric(rows, after_epoch=0):
     out = []
     for epoch, row in rows:
-        # NaN compares unequal to itself; the tiny test episodes give a NaN test loss.
-        values = {k: "nan" if np.isnan(float(v)) else float(v) for k, v in row.items()
+        values = {k: float(v) for k, v in row.items()
                   if k not in ("duration", "progress/train_env_steps")  # the per-row env-step axis
                   and not k.startswith(("resume/", "timing/")) and np.ndim(v) == 0}
+        assert all(np.isfinite(v) for v in values.values()), values
         if epoch > after_epoch and values:
             out.append((epoch, values))
     return out

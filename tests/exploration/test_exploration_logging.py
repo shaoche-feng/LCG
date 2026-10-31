@@ -672,13 +672,16 @@ def test_denoiser_test_loss_is_one_mean_per_diagnostic_and_unpublished_values_st
     monkeypatch.setattr(ExplorationTrainer, "test_component", spy_test)
     monkeypatch.setattr(ExplorationTrainer, "train_agent", spy_train)
     trainer, logs = launch(tmp_path / "run", monkeypatch, TINY, BASE + SEEDED + ["collection.test.num_episodes=4",
+                                                                                 "collection.test.num_final_episodes=4",
+                                                                                 "evaluation.final_reset_seeds=[11,12,13,14]",
                                                                                  "denoiser.training.batch_size=2"])
     run(trainer)
     # Several test batches per diagnostic; W&B gets their unweighted mean (periodic, then final).
     assert len(batches) == 3 and all(len(b) > 1 and np.isfinite(b).all() for b in batches)
     logged = [r.get("denoiser/test/loss_denoising", r.get("denoiser/final_test/loss_denoising")) for _, r in logs
               if "denoiser/test/loss_denoising" in r or "denoiser/final_test/loss_denoising" in r]
-    assert logged == [pytest.approx(float(np.mean(b)), nan_ok=True) for b in batches]
+    assert all(np.isfinite(v) for b in batches for v in b)
+    assert logged == [pytest.approx(float(np.mean(b))) for b in batches]
     assert trainer.num_batch_test.denoiser == sum(map(len, batches))  # the checkpointed counter still counts
     # The trainer's rows keep the learning rate and gradient norm (the PMPO diagnostic reads them);
     # W&B and the mirror do not.
@@ -814,7 +817,7 @@ def test_resume_backfills_rows_the_wandb_server_lost_and_counts_replayed_ones(tm
         assert backfilled == expected
     else:
         assert not backfilled and resume_row["server_rows_beyond_checkpoint"] == 7
-        assert resumed.wandb_steps == committed + 7
+        assert resumed.wandb_steps == committed  # logical rows replay from the checkpoint
     run(resumed)
     # The mirror's latest entry per step continues from the reconciled step.
     steps = [json.loads(line)["step"] for line in Path("wandb_history.jsonl").read_text().splitlines()]
@@ -825,6 +828,93 @@ def test_resume_backfills_rows_the_wandb_server_lost_and_counts_replayed_ones(tm
 
 def history_line(step, value=0.0, segment=0):
     return (json.dumps(dict(step=step, epoch=1, segment=segment, values={"x": value})) + "\n").encode()
+
+
+@pytest.mark.parametrize("outcome", ["matched", "mismatched", "unavailable"])
+def test_two_committed_three_server_rows_replay_once(tmp_path, monkeypatch, capsys, outcome):
+    fake = FakeWandb(starting_step=3)
+    fake.init()
+    monkeypatch.setattr(trainer_module, "wandb", fake)
+    monkeypatch.setattr(trainer_module, "wandb_log", lambda rows, epoch: [fake.log(dict(epoch=epoch, **r)) for r in rows])
+    trainer = ExplorationTrainer.__new__(ExplorationTrainer)
+    trainer.wandb_steps, trainer.epoch, trainer.resume_count = 2, 2, 1
+    trainer._local_history, trainer._resume_event = True, {}
+    trainer.train_dataset = SimpleNamespace(num_steps=500)
+    trainer._path_history = tmp_path / "wandb_history.jsonl"
+    axis = "denoiser/train/num_batch_train_denoiser"
+    records = [dict(step=i, epoch=1 if i < 2 else 2, segment=0,
+                    values={axis: float(i), "denoiser/train/loss_denoising": .25, "progress/train_env_steps": 500.})
+               for i in range(3)]
+    committed = "".join(json.dumps(r) + "\n" for r in records[:2]).encode()
+    tail = b"" if outcome == "unavailable" else (json.dumps(records[2]) + "\n").encode()
+    trainer._path_history.write_bytes(committed + tail)
+    trainer._committed_history_bytes = len(committed)
+    trainer._resume_event.update(trainer.reconcile_wandb_history())
+    fake.logged = [dict(epoch=r["epoch"], **r["values"]) for r in records]  # rows the server already holds
+    trainer.log_rows([{axis: 2, "denoiser/train/loss_denoising": .5 if outcome == "mismatched" else .25},
+                      {axis: 3, "denoiser/train/loss_denoising": .125}])
+    assert trainer.wandb_steps == 4
+    assert [r[axis] for r in fake.logged] == [0, 1, 2, 3]
+    assert fake.logged[2]["denoiser/train/loss_denoising"] == .25
+    assert trainer._resume_event[f"replayed_{outcome}"] == 1
+    warning = "differs from the interrupted segment; the server keeps the earlier value"
+    assert (warning in capsys.readouterr().out) == (outcome == "mismatched")
+
+
+@pytest.mark.parametrize("reference", ["present", "missing", "ambiguous_legacy"])
+def test_two_crashes_preserve_server_row_reference(tmp_path, monkeypatch, capsys, reference):
+    fake = FakeWandb(starting_step=3)
+    fake.init()
+    monkeypatch.setattr(trainer_module, "wandb", fake)
+    monkeypatch.setattr(trainer_module, "wandb_log", lambda rows, epoch: [fake.log(dict(epoch=epoch, **r)) for r in rows])
+    axis, loss = "denoiser/train/num_batch_train_denoiser", "denoiser/train/loss_denoising"
+    records = [dict(step=i, epoch=1 if i < 2 else 2, segment=0,
+                    values={axis: float(i), loss: .25, "progress/train_env_steps": 500.}) for i in range(3)]
+    fake.logged = [dict(epoch=r["epoch"], **r["values"]) for r in records]
+    committed = "".join(json.dumps(r) + "\n" for r in records[:2]).encode()
+    path = tmp_path / "wandb_history.jsonl"
+    tail = b"" if reference == "missing" else (json.dumps(records[2]) + "\n").encode()
+    if reference == "ambiguous_legacy":
+        # Older source mirrored a suppressed replay without recording its server reference.
+        replay = dict(records[2], segment=1, values={**records[2]["values"], loss: .5})
+        tail += (json.dumps(replay) + "\n").encode()
+    path.write_bytes(committed + tail)
+    outcome = "mismatched" if reference == "present" else "unavailable"
+    events = []
+    before = rng_state()
+    for resume_count in (1, 2):  # both processes restore the SAME checkpoint; no new commit
+        trainer = ExplorationTrainer.__new__(ExplorationTrainer)
+        trainer.wandb_steps, trainer.epoch, trainer.resume_count = 2, 2, resume_count
+        trainer.wandb_history_bytes = len(committed)
+        trainer._local_history, trainer._resume_event = True, {}
+        trainer.train_dataset = SimpleNamespace(num_steps=500)
+        trainer._path_history = path
+        trainer.repair_wandb_history()
+        trainer._resume_event.update(trainer.reconcile_wandb_history())
+        capsys.readouterr()
+        trainer.log_rows([{axis: 2, loss: .5}])
+        events.append(dict(trainer._resume_event))
+        warning = "differs from the interrupted segment; the server keeps the earlier value"
+        assert capsys.readouterr().out.count(warning) == (1 if outcome == "mismatched" else 0)
+        assert trainer._resume_event.get("replayed_matched", 0) == 0
+        assert trainer._resume_event[f"replayed_{outcome}"] == 1
+        assert [r[axis] for r in fake.logged] == [0, 1, 2]
+        assert fake.logged[2][loss] == .25
+        assert path.read_bytes().startswith(committed)
+        assert list(history_records(path))[-1]["values"][loss] == .5  # actual replay still mirrored
+        assert trainer.wandb_steps == 3
+    assert sum(e.get(f"replayed_{outcome}", 0) for e in events) == 2
+    assert same(before, rng_state())
+    # A later checkpoint commits the replay: if the server loses it, normal committed backfill
+    # still uses the actual replay value, independently of the earlier server reference.
+    fake.run.starting_step = 2
+    fake.logged = fake.logged[:2]  # the server has actually lost row 2
+    trainer._committed_history_bytes = path.stat().st_size
+    stats = trainer.reconcile_wandb_history()
+    assert stats["backfilled_rows"] == 1
+    assert fake.logged[-1][loss] == .5 and fake.logged[-1]["resume/backfilled"] == 1
+    assert [r[axis] for r in fake.logged] == [0, 1, 2]
+    assert same(before, rng_state())
 
 
 def test_history_repair_keeps_committed_rows_and_moves_an_interrupted_tail(tmp_path):

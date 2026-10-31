@@ -311,7 +311,8 @@ class ExplorationTrainer(StateDictMixin):
         seq_length = cfg.agent.denoiser.inner_model.num_steps_conditioning + 1 + c.num_autoregressive_steps
         bs = make_batch_sampler(c.batch_size, seq_length, get_sample_weights(c.sample_weights))
         dl_denoiser_train = make_data_loader(batch_sampler=bs)
-        dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length, collate_segments_without_rewards)
+        dl_denoiser_test = DatasetTraverser(self.test_dataset, c.batch_size, seq_length, collate_segments_without_rewards,
+                                            num_steps_conditioning=cfg.agent.denoiser.inner_model.num_steps_conditioning)
 
         self._data_loader_train = CommonTools(dl_denoiser_train, None, None)
         # Ensemble: one sampler per member (bootstrap multiplicities when enabled), shared replay.
@@ -419,9 +420,11 @@ class ExplorationTrainer(StateDictMixin):
         self.milestones = []  # dict(name, epoch, retired); retired ones are deleted by retention
         self.test_episode_seeds = []  # reset seed of each current test episode (None: drawn at random)
         self.resume_count = 0  # resumes of this run folder (logging only)
-        self.wandb_steps = 0  # W&B rows logged (and mirrored) up to this checkpoint
+        self.wandb_steps = 0  # logical W&B rows; replayed rows keep their original step
         self.wandb_history_bytes = 0  # wandb_history.jsonl length at this checkpoint: its committed records
         self._committed_history_bytes = None  # on resume: the loaded checkpoint's value (backfill reads only these)
+        self._wandb_next = 0  # next server row; wandb_steps remains the logical training-row counter
+        self._replayed_rows = {}  # interrupted local records of server-held logical rows
 
         self._path_milestones = Path("milestones")
         self._resume_event = None  # this process's resume (W&B summary "resume"; not a history row)
@@ -722,19 +725,46 @@ class ExplorationTrainer(StateDictMixin):
     def log_rows(self, rows: Logs) -> None:
         """Log rows to W&B (each with the env-step axis) and mirror each one, keyed by its W&B
         step, to wandb_history.jsonl before the checkpoint that commits it. Only the published
-        keys (published_row) are sent and mirrored."""
+        keys (published_row) are sent and mirrored. Suppressed attempts keep their actual
+        values for committed backfill, plus a separate reference to the server-held row."""
         rows = self.with_env_steps([row for row in map(published_row, rows) if row])
+        publish = []
+        server_references = {}
+        for i, row in enumerate(rows):
+            step = self.wandb_steps + i
+            values = {k: float(v) for k, v in row.items() if np.ndim(v) == 0 and not isinstance(v, str)}
+            if step < self._wandb_next:
+                earlier = self._replayed_rows.pop(step, None)
+                # Persist the reference, not this replay's values, across another crash before
+                # the next checkpoint. None must remain unknown on subsequent resumes too.
+                server_references[step] = None if earlier is None else {
+                    "epoch": earlier["epoch"], "values": earlier["values"]}
+                outcome = "unavailable" if earlier is None else "matched" if (
+                    earlier["epoch"] == self.epoch and earlier["values"] == values) else "mismatched"
+                key = f"replayed_{outcome}"
+                self._resume_event[key] = self._resume_event.get(key, 0) + 1
+                if wandb.run is not None:
+                    wandb.summary["resume"] = self._resume_event
+                if outcome == "mismatched":
+                    say(f"W&B warning: replayed logical row {step} (epoch {self.epoch}) differs from the "
+                        "interrupted segment; the server keeps the earlier value")
+            else:
+                publish.append(row)
         if self._local_history:
             with open(self._path_history, "a", encoding="utf-8") as f:
                 for i, row in enumerate(rows):
                     values = {k: float(v) for k, v in row.items() if np.ndim(v) == 0 and not isinstance(v, str)}
-                    f.write(json.dumps(dict(step=self.wandb_steps + i, epoch=self.epoch, segment=self.resume_count,
-                                            values=values)) + "\n")
+                    step = self.wandb_steps + i
+                    record = dict(step=step, epoch=self.epoch, segment=self.resume_count, values=values)
+                    if step in server_references:
+                        record["server_reference"] = server_references[step]
+                    f.write(json.dumps(record) + "\n")
                 f.flush()
                 os.fsync(f.fileno())  # on disk before the checkpoint that commits these rows
                 self.wandb_history_bytes = f.tell()
-        wandb_log(rows, self.epoch)
+        wandb_log(publish, self.epoch)
         self.wandb_steps += len(rows)
+        self._wandb_next = max(self._wandb_next, self.wandb_steps)
 
     def repair_wandb_history(self) -> None:
         """On resume, before anything is appended or backfilled: keep an interrupted last record
@@ -755,11 +785,14 @@ class ExplorationTrainer(StateDictMixin):
         "resume")."""
         server = int(getattr(wandb.run, "starting_step", 0) or 0)
         committed = self.wandb_steps
+        self._wandb_next = server
+        self._replayed_rows = {}
         if getattr(wandb.run, "offline", False) and committed is not None:
             # Offline W&B knows no server rows (starting_step 0) and writes a new offline file per
             # segment: backfilling would re-log every committed row, duplicated when both are synced.
             say("W&B offline: the server's row count is unknown, so no rows are backfilled "
                 f"({self._path_history} keeps every committed row)")
+            self._wandb_next = committed
             return {"wandb_committed_rows": committed}
         stats = {"wandb_server_rows": server}
         if committed is None:  # checkpoint from before the mirror
@@ -785,9 +818,22 @@ class ExplorationTrainer(StateDictMixin):
         elif server > committed:
             stats["server_rows_beyond_checkpoint"] = server - committed
             say(f"W&B: {server - committed} rows logged after the checkpoint are on the server; their epochs are replayed")
-            self.wandb_steps = server
-        else:
-            self.wandb_steps = max(committed, server)
+            if self._local_history and self._path_history.is_file():
+                for record in history_records(self._path_history):
+                    step = record["step"]
+                    if committed <= step < server:
+                        if "server_reference" in record:
+                            reference = record["server_reference"]
+                            self._replayed_rows[step] = reference if (
+                                isinstance(reference, dict) and isinstance(reference.get("epoch"), int)
+                                and isinstance(reference.get("values"), dict)) else None
+                        elif step in self._replayed_rows:
+                            # Old mirrors did not distinguish publication from suppressed
+                            # replay. Multiple unmarked entries cannot identify the server row.
+                            self._replayed_rows[step] = None
+                        else:
+                            self._replayed_rows[step] = record
+        self._wandb_next = max(committed, server)
         return stats
 
     def epoch_row(self, seconds: float) -> Dict[str, Any]:
@@ -1160,6 +1206,8 @@ class ExplorationTrainer(StateDictMixin):
                                source="Checkpoint's exploration controller")
         check_same_packages(state_dict["source"])
         super().load_state_dict(state_dict)
+        self.train_dataset.verify_episode_files()
+        self.test_dataset.verify_episode_files()
         self.restore_collection_state(collection)
         self.restore_scorers(lcg_state, scale_state)
         if self._pmpo_diagnostic is not None:

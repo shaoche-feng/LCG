@@ -68,12 +68,16 @@ def last_rows(path):
 
 # ---------------------------------------------------------------- evaluation
 
-def test_evaluation_protocol_task_actions_history_and_returns(tmp_path, monkeypatch):
-    trainer = make(build_milestone(tmp_path), monkeypatch)  # milestone env: walker, first task stand
+@pytest.mark.parametrize("actor_distribution", ["tanh_gaussian", "beta"])
+def test_evaluation_protocol_task_actions_history_and_returns(tmp_path, monkeypatch, actor_distribution):
+    trainer = make(build_milestone(tmp_path), monkeypatch,
+                   [f"agent.actor_critic.actor_distribution={actor_distribution}"])
     model, env_cfg = trainer.agent.actor_critic, trainer.cfg.env.train
     inputs = []
     handle = model.actor.register_forward_pre_hook(lambda m, args: inputs.append(args[0].clone()))
     result = evaluate_policy(model, env_cfg, "walk", [5, 6], max_steps=7)
+    assert result["policy"] == ("deterministic (tanh(mu))" if actor_distribution == "tanh_gaussian"
+                                else "deterministic (Beta mean)")
     handle.remove()
     assert [e["seed"] for e in result["episodes"]] == [5, 6] and result["task_name"] == "walk"
     for i, episode in enumerate(result["episodes"]):
@@ -402,6 +406,80 @@ def test_metrics_log_recovery_cases(tmp_path):
         recover_metrics_log(path)
 
 
+@pytest.mark.parametrize("damage", ["missing", "cut_tail", "corrupt_row", "readable_change", "non_boundary"])
+def test_resume_refuses_damaged_committed_metrics(tmp_path, monkeypatch, damage):
+    milestone = build_milestone(tmp_path)
+    trainer = make(milestone, monkeypatch)
+    trainer.reward_model_update()
+    trainer.save_checkpoint()
+    path = trainer._work_dir / "metrics.jsonl"
+    data = path.read_bytes()
+    state = torch.load(trainer._path_checkpoint, weights_only=False)
+    assert state["metrics_bytes"] == len(data) and data.endswith(b"\n")
+    if damage == "missing":
+        path.unlink()
+    elif damage == "cut_tail":
+        path.write_bytes(data[:len(data) // 2])
+    elif damage == "corrupt_row":
+        path.write_bytes(b"!" + data[1:])
+    elif damage == "readable_change":
+        altered = data.replace(b'"update": 1', b'"update": 9', 1)
+        assert altered != data and len(altered) == len(data)
+        assert json.loads(altered)["update"] == 9
+        path.write_bytes(altered)
+    else:
+        state["metrics_bytes"] -= 1
+        torch.save(state, trainer._path_checkpoint)
+    before = path.read_bytes() if path.exists() else None
+    with pytest.raises(ValueError, match="committed.*(history|corrupt)"):
+        make(milestone, monkeypatch, resume=True)
+    assert (path.read_bytes() if path.exists() else None) == before
+    assert not list(path.parent.glob("metrics.jsonl.interrupted-*"))
+
+
+def test_metrics_boundary_fsync_precedes_checkpoint_and_tail_repair_is_idempotent(tmp_path, monkeypatch):
+    milestone = build_milestone(tmp_path)
+    trainer = make(milestone, monkeypatch)
+    trainer.reward_model_update()
+    events = []
+    fsync, save = downstream_module.os.fsync, downstream_module.save_atomically
+    def synced(fd):
+        events.append("fsync")
+        fsync(fd)
+    def publish(state, path):
+        events.append("checkpoint")
+        assert state["metrics_bytes"] == (trainer._work_dir / "metrics.jsonl").stat().st_size
+        save(state, path)
+    with monkeypatch.context() as patch:
+        patch.setattr(downstream_module.os, "fsync", synced)
+        patch.setattr(downstream_module, "save_atomically", publish)
+        trainer.save_checkpoint()
+    assert events.index("fsync") < events.index("checkpoint")
+    path = trainer._work_dir / "metrics.jsonl"
+    committed = path.read_bytes()
+    fragment = b'{"phase": "rew_end_model", "update": 2'
+    path.write_bytes(committed + fragment)
+    resumed = make(milestone, monkeypatch, resume=True)
+    assert resumed.num_updates == dict(rew_end_model=1, actor_critic=0)
+    assert path.read_bytes().startswith(committed)
+    assert path.with_name("metrics.jsonl.interrupted-1").read_bytes() == fragment
+    repaired = path.read_bytes()
+    assert recover_metrics_log(path, len(committed)) is None and path.read_bytes() == repaired
+
+
+@pytest.mark.parametrize("legacy_format", [2, 3])
+def test_resume_explicitly_refuses_checkpoints_without_metrics_boundary(tmp_path, monkeypatch, legacy_format):
+    milestone = build_milestone(tmp_path)
+    trainer = make(milestone, monkeypatch)
+    trainer.save_checkpoint()
+    state = torch.load(trainer._path_checkpoint, weights_only=False)
+    state["format"] = legacy_format
+    state.pop("metrics_bytes")
+    torch.save(state, trainer._path_checkpoint)
+    with pytest.raises(ValueError, match="predates the committed metrics boundary"):
+        make(milestone, monkeypatch, resume=True)
+
+
 def test_resume_after_an_interrupted_metrics_row(tmp_path, monkeypatch):
     full, full_rng, full_output = run_uninterrupted(tmp_path, monkeypatch)
     milestone = build_milestone(tmp_path / "split")
@@ -580,9 +658,16 @@ def test_resume_continues_the_wandb_run_without_duplicate_updates(tmp_path, monk
 
 
 def test_resume_of_a_run_without_wandb_starts_one_and_backfills_its_committed_updates(tmp_path, monkeypatch):
-    """Legacy: a checkpoint written without W&B (and metrics rows without the new reward keys)."""
+    """A fenced checkpoint without W&B and with older optional metric columns absent."""
     milestone = build_milestone(tmp_path)
     original = DownstreamTrainer.policy_update
+    original_log_row = DownstreamTrainer.log_row
+    old_keys = ("predicted_reward_mean", "target_reward_mean", "task_reward_mean", "task_reward_max")
+
+    def older_columns(self, row):
+        # Construct the older row schema before checkpointing it. Rewriting committed
+        # bytes afterwards is now correctly refused as corruption.
+        original_log_row(self, {k: v for k, v in row.items() if k not in old_keys})
 
     def crash(self):
         original(self)
@@ -590,16 +675,15 @@ def test_resume_of_a_run_without_wandb_starts_one_and_backfills_its_committed_up
             raise Crash()
 
     monkeypatch.setattr(DownstreamTrainer, "policy_update", crash)
+    monkeypatch.setattr(DownstreamTrainer, "log_row", older_columns)
     with pytest.raises(Crash):
         make(milestone, monkeypatch).run()
     monkeypatch.setattr(DownstreamTrainer, "policy_update", original)
+    monkeypatch.setattr(DownstreamTrainer, "log_row", original_log_row)
     work = tmp_path / "run/downstream/steps_000026/walk/.seed_0.tmp"
     path = work / "metrics.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines()]
-    for row in rows:  # as written before these keys existed
-        for key in ("predicted_reward_mean", "target_reward_mean", "task_reward_mean", "task_reward_max"):
-            row.pop(key, None)
-    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert all(not set(row).intersection(old_keys) for row in rows)
     fake = FakeWandb()
     wandb_run(milestone, monkeypatch, fake, resume=True).run()
     event = fake.summary["resume"]

@@ -1187,16 +1187,30 @@ def synthetic_output(run, steps, returns, seeds=EVAL_SEEDS, max_steps=500, task=
     saved config and one evaluation report), as the trainers write them."""
     milestone = run / f"milestones/steps_{steps:06d}"
     milestone.mkdir(parents=True, exist_ok=True)
-    identity = dict(denoiser_sha256=f"denoiser-{steps}", dataset_sha256=f"index-{steps}", collected_steps=steps)
-    if not (milestone / "manifest.json").exists():
-        write_json(milestone / "manifest.json", dict(schema_version=1, collected_steps=steps, identity=identity))
-    output = downstream_module.downstream_output_dir(milestone, task, seed, member)
-    output.mkdir(parents=True, exist_ok=True)
-    write_json(output / "summary.json", dict(milestone=dict(collected_steps=steps, identity=identity, member_index=member),
-                                             task_name=task, seed=seed, num_updates=dict(rew_end_model=5, actor_critic=5)))
     env = dict(domain_name="walker", task_names=["stand", "walk", "run"], size=64, camera_id=0, action_repeat=action_repeat,
                time_limit=None)
-    OmegaConf.save(OmegaConf.create(dict(env=dict(train=env), agent=dict(actor_critic=dict(actor_objective="sign")),
+    denoiser = dict(architecture="synthetic")
+    identity = dict(denoiser_sha256=f"denoiser-{steps}", dataset_sha256=f"index-{steps}", collected_steps=steps)
+    if member:
+        identity["member_sha256"] = [identity["denoiser_sha256"], *(f"denoiser-{steps}-{k}" for k in range(1, member + 1))]
+    if not (milestone / "manifest.json").exists():
+        method = METHOD_KEYS[run.parents[1].name]
+        write_json(milestone / "manifest.json", dict(schema_version=1, collected_steps=steps, identity=identity,
+                   domain="walker", task_names=env["task_names"], model=dict(env=env, denoiser=denoiser),
+                   exploration=dict(intrinsic_reward_enabled=method is not None, method=method or "lcg")))
+    elif member:  # this fixture can add a selected member's result to an existing synthetic milestone
+        manifest = read_manifest(milestone)
+        manifest["identity"] = identity
+        write_json(milestone / "manifest.json", manifest)
+    output = downstream_module.downstream_output_dir(milestone, task, seed, member)
+    output.mkdir(parents=True, exist_ok=True)
+    member_sha = identity.get("member_sha256", [identity["denoiser_sha256"]])[member]
+    write_json(output / "summary.json", dict(milestone=dict(collected_steps=steps, identity=identity, member_index=member,
+                                             member_sha256=member_sha, path=Path(os.path.relpath(milestone, output)).as_posix()),
+                                             task_name=task, seed=seed, num_updates=dict(rew_end_model=5, actor_critic=5)))
+    OmegaConf.save(OmegaConf.create(dict(env=dict(train=env), agent=dict(denoiser=denoiser, actor_critic=dict(actor_objective="sign",
+                                         actor_distribution="beta")), downstream=dict(task_name=task, seed=seed),
+                                         initialization=dict(member_index=member),
                                          world_model_env=dict(horizon=10),
                                          rew_end_model=dict(training=dict(steps=settings_steps), optimizer=dict(lr=1e-4)),
                                          actor_critic=dict(training=dict(steps=5)), checkpointing=dict(every=100))),
@@ -1208,7 +1222,10 @@ def synthetic_output(run, steps, returns, seeds=EVAL_SEEDS, max_steps=500, task=
                   episodes=[dict(seed=s, episode_return=float(r), length=max_steps) for s, r in zip(seeds, values)],
                   return_mean=float(values.mean()), return_median=float(np.median(values)), return_std=float(values.std()),
                   return_min=float(values.min()), return_max=float(values.max()))
-    path = downstream_module.evaluation_path(output, task, seeds, max_steps, {"w": torch.tensor([steps, member])})
+    policy_state = {"w": torch.tensor([steps, member])}
+    torch.save(policy_state, output / "actor_critic.pt")
+    path = downstream_module.evaluation_path(output, task, seeds, max_steps, policy_state)
+    result["policy_sha256_prefix"] = path.stem.split("_policy-")[1].split("_protocol-")[0]
     path.parent.mkdir(exist_ok=True)
     write_json(path, result)
     return output, path
@@ -1217,7 +1234,10 @@ def synthetic_output(run, steps, returns, seeds=EVAL_SEEDS, max_steps=500, task=
 def synthetic_run(root, method, steps=(300, 400, 500), exploration_seed=0, **kwargs):
     run = root / "outputs" / method / "walker" / f"seed_{exploration_seed}"
     (run / "config").mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(OmegaConf.create(dict(common=dict(seed=exploration_seed), env=dict(train=dict(domain_name="walker")),
+    env = dict(domain_name="walker", task_names=["stand", "walk", "run"], size=64, camera_id=0,
+               action_repeat=kwargs.get("action_repeat", 2), time_limit=None)
+    OmegaConf.save(OmegaConf.create(dict(common=dict(seed=exploration_seed), env=dict(train=env),
+                                         agent=dict(denoiser=dict(architecture="synthetic")),
                                          intrinsic_reward=dict(enabled=METHOD_KEYS[method] is not None,
                                                                method=METHOD_KEYS[method] or "lcg"))),
                    run / "config/exploration.yaml")
@@ -1287,6 +1307,51 @@ def test_result_collection_missing_ambiguous_protocols_settings_and_members(tmp_
     synthetic_output(other, 400, [1.0, 2.0], seeds=[3001, 3002], max_steps=50, settings_steps=6)
     with pytest.raises(ValueError, match="not comparable: .* differ in rew_end_model.training.steps: 5 vs 6"):
         downstream_module.collect_results(other, "walk", 0)
+
+
+@pytest.mark.parametrize("change", ["action_repeat", "exploration_action_repeat", "return_mean", "frac_over_600", "policy_weights",
+                                  "report_task", "report_protocol", "report_policy", "milestone", "missing_report",
+                                  "second_policy"])
+def test_comparison_revalidates_sources_after_collection(tmp_path, monkeypatch, change):
+    runs = [synthetic_run(tmp_path, method, steps=(300,)) for method in ("uniform", "plan2explore")]
+    for run in runs:
+        downstream_module.collect_results(run, "walk", 0)
+    run = runs[1]
+    output = run / "downstream/steps_000300/walk/seed_0"
+    csv_path = run / "result/walk/seed_0/result.csv"
+    (report_path,) = (output / "evaluations").iterdir()
+    if change in ("action_repeat", "exploration_action_repeat"):
+        config_path = output / "config.yaml" if change == "action_repeat" else run / "config/exploration.yaml"
+        cfg = OmegaConf.load(config_path)
+        cfg.env.train.action_repeat = 4
+        OmegaConf.save(cfg, config_path)
+    elif change in ("return_mean", "frac_over_600"):
+        rows = downstream_module.read_csv(csv_path)
+        rows[0][change] = 9999. if change == "return_mean" else 1.
+        downstream_module.write_csv(csv_path, rows, list(rows[0]))
+    elif change == "policy_weights":
+        torch.save({"w": torch.tensor([-1, -1])}, output / "actor_critic.pt")
+    elif change.startswith("report_"):
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report[dict(report_task="task_name", report_protocol="max_steps", report_policy="policy_sha256_prefix")[change]] = \
+            dict(report_task="stand", report_protocol=499, report_policy="000000000000")[change]
+        write_json(report_path, report)
+    elif change == "milestone":
+        path = run / "milestones/steps_000300/manifest.json"
+        manifest = read_manifest(path.parent)
+        manifest["identity"]["denoiser_sha256"] = "another-model"
+        write_json(path, manifest)
+    elif change == "missing_report":
+        report_path.unlink()
+    else:
+        extra = downstream_module.evaluation_path(output, "walk", EVAL_SEEDS, 500, {"w": torch.tensor([-9])})
+        write_json(extra, json.loads(report_path.read_text(encoding="utf-8")))
+    before = tree_hashes(*runs)
+    monkeypatch.setattr(downstream_module, "plot_comparison", lambda spec: pytest.fail("published invalid comparison"))
+    with pytest.raises(ValueError, match="stale or inconsistent result table .*recollect with"):
+        downstream_module.compare_methods(tmp_path / "outputs", "walker", 0, "walk", 0)
+    assert tree_hashes(*runs) == before
+    assert not (tmp_path / "outputs/comparisons").exists()
 
 
 def test_method_comparison_files_inputs_and_checks(tmp_path):

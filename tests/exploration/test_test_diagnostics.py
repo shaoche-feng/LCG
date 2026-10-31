@@ -15,6 +15,133 @@ from exploration_trainer import check_evaluation_config, ExplorationTrainer
 from test_exploration_trainer import COLLECT, compose, FakeEnv, ROOT, TASKS, TINY, UNIFORM
 from utils import rng_state
 
+
+def denoiser_padding_example():
+    from hydra.utils import instantiate
+    from models.diffusion import Denoiser
+    cfg = compose(TINY + ["agent.denoiser.inner_model.num_steps_conditioning=4"])
+    denoiser_cfg = instantiate(cfg.agent.denoiser)
+    denoiser_cfg.inner_model.continuous_action_dim = 2
+    model = Denoiser(denoiser_cfg)
+    model.setup_training(instantiate(cfg.denoiser.sigma_distribution))
+    obs = torch.linspace(-1, 1, 8)[:, None, None, None].expand(8, 3, 8, 8).clone()
+    ep = Episode(obs, torch.zeros(8, 2), torch.zeros(8), torch.zeros(8, dtype=torch.long),
+                 torch.zeros(8, dtype=torch.long), {})
+    return model, ep
+
+
+def test_denoiser_eight_frame_traversal_keeps_only_valid_targets(tmp_path):
+    from data import DatasetTraverser, collate_segments_without_rewards
+    model, ep = denoiser_padding_example()
+    dataset = Dataset(tmp_path / "replay", cache_in_ram=True, save_on_disk=False)
+    dataset.add_episode(ep)
+    traversal = DatasetTraverser(dataset, 1, 6, collate_segments_without_rewards, num_steps_conditioning=4)
+    batches = list(traversal)
+    assert len(traversal) == len(batches) == 1
+    assert batches[0].segment_ids[0].start == 0 and batches[0].segment_ids[0].stop == 6
+    assert batches[0].mask_padding[:, 4:].sum() == 2
+    assert torch.equal(batches[0].obs[0, 4:], ep.obs[4:6])
+    loss, _ = model(batches[0])
+    assert torch.isfinite(loss)
+    # A dataset whose only chunk has conditioning frames but no targets yields no batches.
+    short = Dataset(tmp_path / "short", cache_in_ram=True, save_on_disk=False)
+    short.add_episode(Episode(ep.obs[:2], ep.act[:2], ep.rew[:2], ep.end[:2], ep.trunc[:2], {}))
+    empty = DatasetTraverser(short, 1, 6, collate_segments_without_rewards, num_steps_conditioning=4)
+    assert len(empty) == 0 and list(empty) == []
+
+
+def test_denoiser_left_padded_single_target_has_finite_undiluted_loss(monkeypatch):
+    from data import collate_segments_without_rewards
+    from data.segment import SegmentId
+    from data.utils import make_segment
+    import models.diffusion.denoiser as denoiser_module
+    model, ep = denoiser_padding_example()
+    batch = collate_segments_without_rewards([make_segment(ep, SegmentId(0, -5, 1))])
+    assert batch.mask_padding.tolist() == [[False, False, False, False, False, True]]
+    terms = []
+    mse = denoiser_module.F.mse_loss
+    def capture(prediction, target):
+        terms.append((prediction.detach().clone(), target.detach().clone()))
+        return mse(prediction, target)
+    monkeypatch.setattr(denoiser_module.F, "mse_loss", capture)
+    loss, _ = model(batch)
+    assert torch.isfinite(loss) and len(terms) == 1 and terms[0][0].shape[0] == 1
+    torch.testing.assert_close(loss, mse(*terms[0]), rtol=0, atol=0)
+    loss.backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
+
+def test_denoiser_rejects_completely_unusable_batch_before_rng_or_forward(monkeypatch):
+    from data import collate_segments_without_rewards
+    from data.segment import SegmentId
+    from data.utils import make_segment
+    model, ep = denoiser_padding_example()
+    batch = collate_segments_without_rewards([make_segment(ep, SegmentId(0, 6, 12))])
+    before = torch.get_rng_state().clone()
+    monkeypatch.setattr(model, "compute_model_output", lambda *a: pytest.fail("unusable batch reached the model"))
+    with pytest.raises(ValueError, match="no valid prediction targets"):
+        model(batch)
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+@pytest.mark.parametrize("split", ["train", "test"])
+@pytest.mark.parametrize("damage", ["altered", "missing", "unreadable"])
+def test_resume_verifies_checkpoint_replay_once(tmp_path, monkeypatch, split, damage):
+    import data.dataset as dataset_module
+    trainer, _ = start(tmp_path / "run", monkeypatch, BASE + FRESH + UNIFORM + ["training.should=false"])
+    trainer._run()
+    dataset = getattr(trainer, f"{split}_dataset")
+    path = dataset.episode_files()[0].resolve()
+    if damage == "altered":
+        stored = torch.load(path, weights_only=False)
+        shape = stored["obs"].shape
+        stored["obs"] = stored["obs"].roll(1, dims=0)
+        assert stored["obs"].shape == shape
+        assert not torch.equal(stored["obs"], torch.load(path, weights_only=False)["obs"])
+        torch.save(stored, path)
+    elif damage == "missing":
+        path.unlink()
+    else:
+        original = dataset_module.file_sha256
+        def unreadable(file):
+            if Path(file).resolve() == path:
+                raise PermissionError("test: cannot read episode")
+            return original(file)
+        monkeypatch.setattr(dataset_module, "file_sha256", unreadable)
+    error_type = FileNotFoundError if damage == "missing" else ValueError
+    with pytest.raises(error_type, match=f"{split}_dataset:.*(checksum|missing|unreadable)"):
+        start(tmp_path / "run", monkeypatch, [], resume=True)
+
+
+def test_replay_verification_runs_once_per_resume_not_per_update(tmp_path, monkeypatch):
+    crash_at_test_agent(monkeypatch, epoch=2)
+    trainer, _ = start(tmp_path / "run", monkeypatch, BASE + FRESH + UNIFORM)
+    with pytest.raises(Crash):
+        trainer._run()
+    monkeypatch.undo()
+    calls, verify = [], Dataset.verify_episode_files
+    def checked(dataset):
+        calls.append(dataset.name)
+        return verify(dataset)
+    monkeypatch.setattr(Dataset, "verify_episode_files", checked)
+    resumed, _ = start(tmp_path / "run", monkeypatch, [], resume=True)
+    assert calls == ["train_dataset", "test_dataset"]
+    resumed._run()
+    assert calls == ["train_dataset", "test_dataset"]
+
+
+def test_resume_refuses_unreadable_episode_payload_even_with_matching_digest(tmp_path, monkeypatch):
+    from utils import file_sha256
+    trainer, _ = start(tmp_path / "run", monkeypatch, BASE + OFF + UNIFORM + ["training.should=false"])
+    trainer._run()
+    path = trainer.train_dataset.episode_files()[0]
+    path.write_bytes(b"unreadable episode payload")
+    state = torch.load(trainer._path_state_ckpt, weights_only=False)
+    state["train_dataset"]["file_sha256"][0] = file_sha256(path)
+    torch.save(state, trainer._path_state_ckpt)
+    with pytest.raises(ValueError, match="train_dataset: unreadable checkpoint episode"):
+        start(tmp_path / "run", monkeypatch, [], resume=True)
+
 BASE = [o for o in COLLECT if not o.startswith("evaluation.")]  # 12 + 2 x 6 train steps
 OFF = ["evaluation.should=false"]
 # Fresh test data every epoch: 2 episodes of 6 steps; final: 3 episodes.

@@ -88,18 +88,23 @@ def make_segment(episode: Episode, segment_id: SegmentId, should_pad: bool = Tru
 
 
 class DatasetTraverser:
-    def __init__(self, dataset, batch_num_samples: int, chunk_size: int, collate_fn=collate_segments_to_batch) -> None:
+    """Fixed replay chunks with at least one real target after the conditioning prefix."""
+    def __init__(self, dataset, batch_num_samples: int, chunk_size: int, collate_fn=collate_segments_to_batch,
+                 num_steps_conditioning: int = 1) -> None:
         self.dataset = dataset
         self.batch_num_samples = batch_num_samples
         self.chunk_size = chunk_size
         self.collate_fn = collate_fn
+        if not 0 <= num_steps_conditioning < chunk_size:
+            raise ValueError("Traversal chunk must contain at least one position after conditioning")
+        self.num_steps_conditioning = num_steps_conditioning
 
     def __len__(self):
         return math.ceil(
             sum(
                 [
                     math.ceil(self.dataset.lengths[episode_id] / self.chunk_size)
-                    - int(self.dataset.lengths[episode_id] % self.chunk_size == 1)
+                    - int(0 < self.dataset.lengths[episode_id] % self.chunk_size <= self.num_steps_conditioning)
                     for episode_id in range(self.dataset.num_episodes)
                 ]
             )
@@ -117,9 +122,8 @@ class DatasetTraverser:
                     should_pad=True,
                 )
                 for i in range(math.ceil(len(episode) / self.chunk_size))
+                if len(episode) - i * self.chunk_size > self.num_steps_conditioning
             )
-            if chunks[-1].effective_size < 2:
-                chunks.pop()
 
             while len(chunks) >= self.batch_num_samples:
                 yield self.collate_fn(chunks[: self.batch_num_samples])
