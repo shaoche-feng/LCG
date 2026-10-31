@@ -24,9 +24,9 @@ def _find_repo_root(start: Path) -> Path:
 sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
 
 from data import Dataset, Episode  # noqa: E402
-from lcg import lifecycle as lcg_lifecycle  # noqa: E402
-from lcg.lifecycle import LCGConfig, LCGLifecycle  # noqa: E402
-from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters  # noqa: E402
+from intrinsic_reward.lcg import lifecycle as lcg_lifecycle  # noqa: E402
+from intrinsic_reward.lcg.lifecycle import LCGConfig, LCGLifecycle  # noqa: E402
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters  # noqa: E402
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig  # noqa: E402
 from models.diffusion.inner_model import InnerModelConfig  # noqa: E402
 

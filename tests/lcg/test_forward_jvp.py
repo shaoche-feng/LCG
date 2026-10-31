@@ -1,19 +1,19 @@
 """
-Permanent regression tests for the production forward-JVP scorer (src/lcg/forward_jvp.py),
+Permanent regression tests for the production forward-JVP scorer (src/intrinsic_reward/lcg/forward_jvp.py),
 extracted from scripts/forward_JVP/integration/{audit_D_vs_F_convention,
 validate_lcg_forward_jvp_integration}.py. Tiny real Denoiser (see conftest.py) so explicit
 Jacobians are cheap to build on CPU.
 """
 import torch
 import torch.func as func
-from lcg.forward_jvp import (
+from intrinsic_reward.lcg.forward_jvp import (
     JVPBank,
     jvp_through_F,
     make_jvp_bank,
     score_one_jvp_bank,
     unflatten_to_dict,
 )
-from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters, selected_parameters
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters, selected_parameters
 from models.diffusion import SigmaDistributionConfig
 from models.diffusion.denoiser import apply_noise_from_samples
 

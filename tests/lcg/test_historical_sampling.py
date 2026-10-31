@@ -32,8 +32,8 @@ sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
 
 from data import Dataset, Episode  # noqa: E402
 from data.utils import make_segment  # noqa: E402
-from lcg.precision import historical_precision, load_transition, sample_uniform_historical_transitions  # noqa: E402
-from lcg.theta_s import ThetaSConfig, selected_parameters  # noqa: E402
+from intrinsic_reward.lcg.precision import historical_precision, load_transition, sample_uniform_historical_transitions  # noqa: E402
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, selected_parameters  # noqa: E402
 from models.diffusion import SigmaDistributionConfig  # noqa: E402
 
 

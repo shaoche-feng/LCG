@@ -13,7 +13,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 import exploration_trainer as trainer_module
-import plan2explore as p2e_module
+import intrinsic_reward.plan2explore as p2e_module
 import test_exploration_trainer as base
 import test_test_diagnostics as diag
 from data import BatchSampler, collate_segments_without_rewards, Dataset, Episode
@@ -22,7 +22,7 @@ from envs import WorldModelEnv, WorldModelEnvConfig
 from exploration_trainer import ExplorationTrainer
 from models.diffusion import Denoiser, DenoiserConfig, DiffusionSamplerConfig
 from models.diffusion.inner_model import InnerModelConfig
-from plan2explore import (build_feature_cache, FeatureCache, FeatureExtractor, Plan2Explore, Plan2ExploreConfig,
+from intrinsic_reward.plan2explore import (build_feature_cache, FeatureCache, FeatureExtractor, Plan2Explore, Plan2ExploreConfig,
                           predictor_disagreement)
 from test_exploration_trainer import COLLECT, compose, run_trainer, TASKS, write_static_dataset
 from test_test_diagnostics import BASE, Crash, same, start

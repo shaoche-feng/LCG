@@ -7,9 +7,9 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from lcg.lifecycle import LCGConfig, LCGLifecycle
-from lcg.reward_normalization import RunningRMS, RunningRMSConfig
-from lcg.theta_s import ThetaSConfig, selected_named_parameters
+from intrinsic_reward.lcg.lifecycle import LCGConfig, LCGLifecycle
+from intrinsic_reward.lcg.reward_normalization import RunningRMS, RunningRMSConfig
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, selected_named_parameters
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
 from models.diffusion.inner_model import InnerModelConfig
 
@@ -90,8 +90,8 @@ def test_inconsistent_scaling_settings_are_rejected(overrides, match):
 
 def test_older_configs_keep_their_meaning():
     # Saved configs from before reward_scaling existed: rms_enabled alone decides.
-    old = OmegaConf.create(dict(_target_="lcg.LCGConfig", enabled=True, rms_enabled=True,
-                                theta_s=dict(_target_="lcg.theta_s.ThetaSConfig", include=["conv_out.*"], exclude=[])))
+    old = OmegaConf.create(dict(_target_="intrinsic_reward.lcg.LCGConfig", enabled=True, rms_enabled=True,
+                                theta_s=dict(_target_="intrinsic_reward.lcg.theta_s.ThetaSConfig", include=["conv_out.*"], exclude=[])))
     assert instantiate(old).reward_scaling == "rms"
     old.rms_enabled = False
     cfg = instantiate(old)

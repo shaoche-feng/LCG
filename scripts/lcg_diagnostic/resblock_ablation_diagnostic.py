@@ -3,7 +3,7 @@
 Final decoder-stage ResBlock ablation: which subset of {R1, R2, R3, norm_out, conv_out}
 (the 3 ResBlocks inside denoiser.inner_model.unet.u_blocks[-1], plus the output head)
 preserves the current full/default theta_S's LCG ranking, and at what M / runtime / memory
-cost. DIAGNOSTIC ONLY -- does not modify src/lcg/*.py or any production default
+cost. DIAGNOSTIC ONLY -- does not modify src/intrinsic_reward/lcg/*.py or any production default
 (config/intrinsic_reward/lcg.yaml's theta_s/candidate_num_mc=12/precision_reference_size=320/
 precision_num_mc=3 are all left untouched). Does not start Random-vs-LCG training.
 
@@ -66,10 +66,10 @@ import torch
 from torch import Tensor
 
 from data import Dataset
-from lcg.forward_jvp import JVPBank, make_jvp_bank, score_one_jvp_bank
-from lcg.precision import historical_precision
-from lcg.reward_normalization import RunningRMS, RunningRMSConfig
-from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
+from intrinsic_reward.lcg.forward_jvp import JVPBank, make_jvp_bank, score_one_jvp_bank
+from intrinsic_reward.lcg.precision import historical_precision
+from intrinsic_reward.lcg.reward_normalization import RunningRMS, RunningRMSConfig
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
 from models.diffusion.inner_model import InnerModelConfig
 

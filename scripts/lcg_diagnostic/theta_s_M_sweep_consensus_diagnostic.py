@@ -2,7 +2,7 @@
 """
 theta_S x candidate-MC(M) sweep, held-out consensus-margin decile reversal diagnostic.
 
-DIAGNOSTIC ONLY. Does not modify src/lcg/*.py or any production default. Does not change
+DIAGNOSTIC ONLY. Does not modify src/intrinsic_reward/lcg/*.py or any production default. Does not change
 candidate_num_mc (M_r=12) in config/intrinsic_reward/lcg.yaml. Does not start Random-vs-LCG
 training. Uses the durable real checkpoint/candidate set under
 docs/lcg_diagnostic/checkpoint/ (lcg_diag_denoiser_converged.pt, frozen_candidates_480.pt --
@@ -63,10 +63,10 @@ import torch
 from torch import Tensor
 
 from data import Dataset
-from lcg.forward_jvp import JVPBank, make_jvp_bank, score_one_jvp_bank
-from lcg.precision import historical_precision
-from lcg.reward_normalization import RunningRMS, RunningRMSConfig
-from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
+from intrinsic_reward.lcg.forward_jvp import JVPBank, make_jvp_bank, score_one_jvp_bank
+from intrinsic_reward.lcg.precision import historical_precision
+from intrinsic_reward.lcg.reward_normalization import RunningRMS, RunningRMSConfig
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
 from models.diffusion.inner_model import InnerModelConfig
 

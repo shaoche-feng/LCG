@@ -1,7 +1,7 @@
 """Phase 8a -- pilot: does the walk-vs-run LCG separation survive when the
 candidate target y is the model's OWN diffusion-sampled prediction (as
 production actually does during imagined rollouts -- see
-src/lcg/intrinsic_reward.py + src/envs/world_model_env.py, where `y` is
+src/intrinsic_reward/lcg/intrinsic_reward.py + src/envs/world_model_env.py, where `y` is
 literally `self.sampler.sample(...)`'s output, never a ground-truth frame),
 instead of the real next observation every prior diagnostic phase (5/5b-f/
 multiseed/6/7) has used?
@@ -43,9 +43,9 @@ _PROJECT_ROOT = _LCG_ROOT.parent
 sys.path.insert(0, str(_LCG_ROOT / "src"))
 sys.path.insert(0, str(_THIS_DIR))
 
-from lcg.forward_jvp import make_jvp_bank, score_one_jvp_bank  # noqa: E402 -- production, unmodified
-from lcg.theta_s import selected_named_parameters, frozen_named_parameters  # noqa: E402
-from lcg.precision import historical_precision, assert_setup_valid  # noqa: E402
+from intrinsic_reward.lcg.forward_jvp import make_jvp_bank, score_one_jvp_bank  # noqa: E402 -- production, unmodified
+from intrinsic_reward.lcg.theta_s import selected_named_parameters, frozen_named_parameters  # noqa: E402
+from intrinsic_reward.lcg.precision import historical_precision, assert_setup_valid  # noqa: E402
 from models.diffusion.diffusion_sampler import build_sigmas  # noqa: E402
 from data import Dataset, SegmentId  # noqa: E402
 

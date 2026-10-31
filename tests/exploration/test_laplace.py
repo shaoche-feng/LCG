@@ -12,8 +12,8 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 import exploration_trainer as trainer_module
-import laplace as laplace_module
-import lcg.precision as precision_module
+import intrinsic_reward.laplace as laplace_module
+import intrinsic_reward.lcg.precision as precision_module
 import test_exploration_trainer as base
 import test_test_diagnostics as diag
 from data import BatchSampler, collate_segments_without_rewards, Dataset, Episode
@@ -21,8 +21,8 @@ from data.milestone import load_milestone, publish_milestone, read_manifest
 from envs import WorldModelEnv, WorldModelEnvConfig
 from envs.world_model_env import ensemble_disagreement
 from exploration_trainer import ExplorationTrainer
-from laplace import (LaplaceConfig, LaplaceEnsemble, perturbation_scale, shared_prefix_first_evaluation)
-from lcg import LCGConfig, LCGLifecycle, selected_named_parameters, ThetaSConfig
+from intrinsic_reward.laplace import (LaplaceConfig, LaplaceEnsemble, perturbation_scale, shared_prefix_first_evaluation)
+from intrinsic_reward.lcg import LCGConfig, LCGLifecycle, selected_named_parameters, ThetaSConfig
 from models.diffusion import Denoiser, DenoiserConfig, DiffusionSampler, DiffusionSamplerConfig, SigmaDistributionConfig
 from models.diffusion.inner_model import InnerModelConfig
 from test_exploration_trainer import COLLECT, compose, run_trainer, TASKS, write_static_dataset
@@ -125,7 +125,7 @@ def test_config_group_and_preset():
     assert OmegaConf.to_container(preset.intrinsic_reward.theta_s) == OmegaConf.to_container(lcg.intrinsic_reward.theta_s)
     # LCG uses the same exploration controller (advantage-weighted) and the default method is LCG.
     assert OmegaConf.to_container(lcg.agent) == OmegaConf.to_container(preset.agent)
-    assert lcg.agent.actor_critic.actor_objective == "advantage_weighted" and compose([]).intrinsic_reward._target_ == "lcg.LCGConfig"
+    assert lcg.agent.actor_critic.actor_objective == "advantage_weighted" and compose([]).intrinsic_reward._target_ == "intrinsic_reward.lcg.LCGConfig"
     # The R1 guards hold on the real architecture (10 tensors, 217,664 scalars).
     from hydra.utils import instantiate
     den_cfg = instantiate(preset.agent.denoiser)

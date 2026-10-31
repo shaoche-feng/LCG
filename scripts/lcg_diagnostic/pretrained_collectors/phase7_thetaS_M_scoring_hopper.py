@@ -36,9 +36,9 @@ sys.path.insert(0, str(_LCG_ROOT / "src"))
 sys.path.insert(0, str(_THIS_DIR))
 sys.path.insert(0, str(_THIS_DIR.parent))  # for resblock_ablation_diagnostic.py's THETA_S_CONFIGS
 
-from lcg.theta_s import selected_named_parameters, frozen_named_parameters  # noqa: E402
-from lcg.precision import historical_precision, assert_setup_valid  # noqa: E402
-from lcg.forward_jvp import make_jvp_bank  # noqa: E402
+from intrinsic_reward.lcg.theta_s import selected_named_parameters, frozen_named_parameters  # noqa: E402
+from intrinsic_reward.lcg.precision import historical_precision, assert_setup_valid  # noqa: E402
+from intrinsic_reward.lcg.forward_jvp import make_jvp_bank  # noqa: E402
 from data import Dataset  # noqa: E402
 
 from phase5_lcg_scoring import (  # noqa: E402

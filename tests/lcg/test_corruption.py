@@ -9,8 +9,8 @@ All tests use fixed, controlled tensors -- never only distributional statistics.
 """
 from unittest import mock
 
-import lcg.forward_jvp as lcg_forward_jvp
-import lcg.precision as lcg_precision
+import intrinsic_reward.lcg.forward_jvp as lcg_forward_jvp
+import intrinsic_reward.lcg.precision as lcg_precision
 import torch
 from models.diffusion.denoiser import add_dims, apply_noise_from_samples
 

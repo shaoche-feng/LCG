@@ -15,7 +15,7 @@ import torch
 
 from data.milestone import (SUMMARY_FILE, discover_milestones, downstream_output_dir, downstream_summary, load_milestone,
                             milestone_members, read_manifest)
-from device_report import device_lines
+from utils import device_lines
 from downstream_trainer import DownstreamTrainer, collect_results, compare_methods, evaluate_saved_output, seed_span
 from utils import say, setup_visible_cuda_devices
 
@@ -191,7 +191,7 @@ def saved_output_milestone(cfg: DictConfig, path: Path) -> Optional[Dict[str, An
 
 
 def announce(cfg: DictConfig, label: str, source: Path, milestones: List[Tuple[Path, Dict[str, Any]]]) -> None:
-    """The banner and the batch plan, once per command: settings, verified devices (device_report:
+    """The banner and the batch plan, once per command: settings, verified devices (utils.device_lines:
     physical GPUs by UUID, never from the process-local index) and the milestones in order. Reads
     nothing itself: `milestones` holds each milestone's manifest, or for evaluate-only the
     saved_output_milestone information (steps None: not recorded)."""

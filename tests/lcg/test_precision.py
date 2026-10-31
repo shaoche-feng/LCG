@@ -13,8 +13,8 @@ the permanent numerical proof of that equivalence: it explicitly reconstructs D_
 locally, purely to document/verify the identity -- production itself never does this.
 """
 import torch
-from lcg.precision import _backward_vjp_probe
-from lcg.theta_s import ThetaSConfig, selected_parameters
+from intrinsic_reward.lcg.precision import _backward_vjp_probe
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, selected_parameters
 from models.diffusion.denoiser import apply_noise_from_samples
 
 

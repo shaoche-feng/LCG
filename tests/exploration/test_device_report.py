@@ -5,8 +5,8 @@ import subprocess
 import pytest
 import torch
 
-import device_report
-from device_report import compute_device_line, device_lines, rendering_device_line
+import utils
+from utils import compute_device_line, device_lines, rendering_device_line
 from utils import rate_text
 
 GPUS = [dict(index="0", uuid="GPU-c92ce703-bfdc-65db-41a9-592f149e455f", name="NVIDIA GeForce RTX 5090"),
@@ -55,10 +55,10 @@ def test_device_lines_cpu_run_queries_nothing(monkeypatch):
 def test_device_lines_gpu_run_wiring(monkeypatch):
     env = dict(MUJOCO_GL="egl", MUJOCO_EGL_DEVICE_ID="1", CUDA_VISIBLE_DEVICES=GPU1)
     probed = []
-    monkeypatch.setattr(device_report, "nvidia_smi_gpus", lambda: GPUS)
-    monkeypatch.setattr(device_report, "cuda_uuid", lambda device: GPU1)
+    monkeypatch.setattr(utils, "nvidia_smi_gpus", lambda: GPUS)
+    monkeypatch.setattr(utils, "cuda_uuid", lambda device: GPU1)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "NVIDIA GeForce RTX 5090")
-    monkeypatch.setattr(device_report, "probe_egl", lambda e: probed.append(dict(e)) or dict(uuid=GPU1))
+    monkeypatch.setattr(utils, "probe_egl", lambda e: probed.append(dict(e)) or dict(uuid=GPU1))
     assert device_lines(CUDA0, env) == ["Compute device: NVIDIA GeForce RTX 5090 | physical GPU 1 | process cuda:0",
                                         "Rendering device: EGL | physical GPU 1"]
     assert probed == [env]  # the probe sees the env workers' environment
@@ -68,8 +68,8 @@ def test_failed_probe_or_nvidia_smi_means_unverified(monkeypatch):
     def broken(*args, **kwargs):
         raise subprocess.TimeoutExpired("x", 1)
     monkeypatch.setattr(subprocess, "run", broken)
-    assert device_report.nvidia_smi_gpus() is None
-    assert device_report.probe_egl(dict(MUJOCO_GL="egl", MUJOCO_EGL_DEVICE_ID="1")) is None
+    assert utils.nvidia_smi_gpus() is None
+    assert utils.probe_egl(dict(MUJOCO_GL="egl", MUJOCO_EGL_DEVICE_ID="1")) is None
 
 
 def test_rate_text_has_a_space_and_inverts_below_one_per_second():

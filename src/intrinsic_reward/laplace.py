@@ -27,8 +27,8 @@ from torch.func import functional_call
 import torch.nn.functional as F
 
 from data import Dataset
-from ensemble import EnsembleScorer
-from lcg import lcg_historical_precision, selected_named_parameters, ThetaSConfig
+from intrinsic_reward.ensemble import EnsembleScorer
+from intrinsic_reward.lcg import lcg_historical_precision, selected_named_parameters, ThetaSConfig
 from models.diffusion import Denoiser, DiffusionSampler
 from models.diffusion.denoiser import SigmaDistributionConfig
 

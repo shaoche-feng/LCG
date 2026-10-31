@@ -11,6 +11,7 @@ Use the established `lcg` conda environment. On kingplus0 its interpreter is `/h
 - [config/agent/pmpo_beta.yaml](config/agent/pmpo_beta.yaml): PMPO architecture and learning settings; includes the shared world-model architecture in [default.yaml](config/agent/default.yaml).
 - [config/env/dm_control.yaml](config/env/dm_control.yaml): task, RGB size, camera, action repeat, and time limit.
 - [config/pmpo_diagnostic/](config/pmpo_diagnostic/): optional bounded diagnostics and checkpoint recording.
+- Source: `src/exploration_main.py`/`exploration_trainer.py` (exploration), `src/downstream_main.py`/`downstream_trainer.py` (downstream, results), `src/intrinsic_reward/` (LCG in `lcg/`, full ensemble, Plan2Explore, Laplace and the real-episode intrinsic evaluation), `src/models/` (denoiser, reward predictor, PMPO), `src/data/` (replay, sampling, milestones), `src/pmpo_diagnostic.py` (opt-in PMPO controller diagnostics) and `src/utils.py` (shared helpers, including compute/rendering device reporting).
 
 Action dimensions and bounds come from the task's action specification. RGB pixels are normalized to [-1, 1]. Each agent action executes `action_repeat` physics steps, summing their raw rewards. True termination suppresses bootstrapping; time-limit truncation uses the pre-reset final observation. Real collection continues across epoch boundaries.
 

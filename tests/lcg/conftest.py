@@ -24,7 +24,7 @@ def _find_repo_root(start: Path) -> Path:
 _REPO_ROOT = _find_repo_root(Path(__file__).parent)
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from lcg.theta_s import ThetaSConfig  # noqa: E402
+from intrinsic_reward.lcg.theta_s import ThetaSConfig  # noqa: E402
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig  # noqa: E402
 from models.diffusion.inner_model import InnerModelConfig  # noqa: E402
 

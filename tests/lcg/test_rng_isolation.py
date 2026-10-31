@@ -26,12 +26,12 @@ def _find_repo_root(start: Path) -> Path:
 sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
 
 from data import Dataset, Episode  # noqa: E402
-from lcg.forward_jvp import (  # noqa: E402
+from intrinsic_reward.lcg.forward_jvp import (  # noqa: E402
     make_jvp_bank,
     score_one_jvp_bank,
 )
-from lcg.precision import historical_precision, sample_uniform_historical_transitions  # noqa: E402
-from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters, selected_parameters  # noqa: E402
+from intrinsic_reward.lcg.precision import historical_precision, sample_uniform_historical_transitions  # noqa: E402
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters, selected_parameters  # noqa: E402
 from models.diffusion import SigmaDistributionConfig  # noqa: E402
 
 IMG_CHANNELS, IMG_SIZE, ACTION_DIM = 3, 8, 2

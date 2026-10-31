@@ -20,17 +20,17 @@ from data.segment import SegmentId
 from data.utils import make_segment
 from envs.world_model_env import ImaginedCandidate, WorldModelEnv
 from exploration_trainer import ExplorationTrainer
-from intrinsic_eval import sampler_windows
+from intrinsic_reward.intrinsic_eval import sampler_windows
 from test_ensemble import ENS
 from test_exploration_trainer import compose, FakeEnv, ROOT, TINY, UNIFORM
 from test_laplace import LAP
 from test_plan2explore import P2E
 from test_test_diagnostics import assert_same_training, BASE, Crash, crash_at_test_agent, FRESH, REUSE, run, \
     same, training_rows, yaml_value
-from laplace import LaplaceEnsemble
-from lcg.lifecycle import LCGLifecycle
+from intrinsic_reward.laplace import LaplaceEnsemble
+from intrinsic_reward.lcg.lifecycle import LCGLifecycle
 from models.pmpo_beta import PMPOBeta, PMPOOptimizers
-from plan2explore import FeatureExtractor, Plan2Explore
+from intrinsic_reward.plan2explore import FeatureExtractor, Plan2Explore
 from utils import history_records, RegionTimer, repair_history, rng_state
 
 SEEDS = [3001, 3002, 3003, 3004]
@@ -1195,3 +1195,54 @@ def test_region_timer_counts_nested_regions_once(monkeypatch):
     assert timer.seconds() == 6.0
     timer.reset()
     assert timer.seconds() == 0
+
+
+# ---------------------------------------------------------------- source layout (intrinsic_reward package)
+
+def test_intrinsic_reward_package_layout_targets_and_scorers(tmp_path, monkeypatch):
+    """The methods live in src/intrinsic_reward/; the old top-level modules are gone; every Hydra target
+    resolves; LCG and Laplace share one historical-precision function; each method constructs its own
+    scorer and uniform random none; device reporting comes from utils."""
+    import importlib
+    from hydra.utils import get_class
+    import intrinsic_reward.laplace
+    import intrinsic_reward.lcg
+    for name in ("lcg", "ensemble", "plan2explore", "laplace", "intrinsic_eval", "device_report"):  # moved or folded
+        assert not (ROOT / "src" / name).exists() and not (ROOT / "src" / f"{name}.py").exists(), f"stale src/{name}"
+    for name in ("intrinsic_reward.lcg", "intrinsic_reward.ensemble", "intrinsic_reward.plan2explore",
+                 "intrinsic_reward.laplace", "intrinsic_reward.intrinsic_eval", "pmpo_diagnostic"):
+        importlib.import_module(name)
+    for path in sorted((ROOT / "config/intrinsic_reward").glob("*.yaml")):
+        targets = re.findall(r"_target_: (\S+)", path.read_text(encoding="utf-8"))
+        assert targets and all(t.startswith("intrinsic_reward.") for t in targets), path.name
+        for target in targets:
+            get_class(target)
+    assert intrinsic_reward.laplace.lcg_historical_precision is intrinsic_reward.lcg.lcg_historical_precision
+    assert trainer_module.device_lines is utils.device_lines and trainer_module.physical_gpu_index is utils.physical_gpu_index
+
+    expected = dict(uniform=(None, None), lcg=("LCGLifecycle", None), ensemble=(None, "EnsembleScorer"),
+                    laplace=(None, "LaplaceScorer"), plan2explore=(None, None))
+    for method, (tiny, extra) in METHOD_SETUPS.items():
+        trainer, _ = launch(tmp_path / method, monkeypatch, tiny, BASE + extra)
+        lifecycle, scorer = trainer._lcg_lifecycle, trainer._ensemble_scorer
+        assert (type(lifecycle).__name__ if lifecycle else None, type(scorer).__name__ if scorer else None) == expected[method]
+        assert (trainer.plan2explore is not None) == (method == "plan2explore")
+        assert (trainer.laplace is not None) == (method == "laplace")
+        assert (trainer.ensemble is not None) == (method == "ensemble")
+        for obj in (lifecycle, scorer, trainer.plan2explore, trainer.laplace, trainer.ensemble):
+            assert obj is None or type(obj).__module__.startswith("intrinsic_reward."), type(obj).__module__
+        assert (trainer._method is None) == (method == "uniform")
+        monkeypatch.chdir(tmp_path)
+    # A new run copies the reorganized source; resume runs that copy, which imports its own package.
+    import subprocess
+    import sys
+    copied = tmp_path / "lcg/src"  # launch() uses the given folder as the run folder
+    assert (copied / "intrinsic_reward/lcg/lifecycle.py").is_file() and not (copied / "device_report.py").exists()
+    probe = ("import sys; sys.path.insert(0, 'src'); import exploration_trainer, intrinsic_reward.lcg, utils; "
+             "print(intrinsic_reward.lcg.__file__); print(exploration_trainer.LCGLifecycle.__module__); "
+             "print(callable(utils.device_lines))")
+    out = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path / "lcg", capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr[-2000:]
+    lines = out.stdout.splitlines()
+    assert Path(lines[0]).resolve() == (copied / "intrinsic_reward/lcg/__init__.py").resolve()
+    assert lines[1:] == ["intrinsic_reward.lcg.lifecycle", "True"]

@@ -11,7 +11,7 @@
 # With num_noise_samples > 1 the score is computed per shared-noise sample and averaged; the
 # next observation always comes from the first noise sample, from one member drawn uniformly at
 # random, independently for each trajectory and at every transition.
-_target_: ensemble.EnsembleDisagreementConfig
+_target_: intrinsic_reward.ensemble.EnsembleDisagreementConfig
 
 method: ensemble_disagreement
 enabled: True

@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 from data import Dataset
 from data.milestone import state_sha256
-from ensemble import episode_multiplicity
+from intrinsic_reward.ensemble import episode_multiplicity
 from models.diffusion.denoiser import apply_noise_from_samples, Denoiser
 from utils import Progress
 

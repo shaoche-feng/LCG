@@ -14,12 +14,12 @@
 # (candidate_num_mc draws per candidate), with Full CRN (every candidate in a scoring
 # batch shares the same (sigma, eps, eps_offset, eta) per MC sample). There is no
 # alternative estimator to select -- this is the only candidate-scoring backend.
-_target_: lcg.LCGConfig
+_target_: intrinsic_reward.lcg.LCGConfig
 
 enabled: True
 
 theta_s:
-  _target_: lcg.theta_s.ThetaSConfig
+  _target_: intrinsic_reward.lcg.theta_s.ThetaSConfig
   # theta_S = the final decoder level's ResBlocks + output norm + output conv (d_S=654,851
   # under the current agent.denoiser.inner_model.depths=[2,2,2,2] architecture -- "3" below
   # is that architecture's last u_block index, confirmed by inspecting the real model, not

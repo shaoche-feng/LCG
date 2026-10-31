@@ -6,7 +6,7 @@ precision's use of it as plain IID Monte Carlo (not stratified sampling).
 from unittest import mock
 
 import torch
-from lcg import precision as lcg_precision
+from intrinsic_reward.lcg import precision as lcg_precision
 from models.diffusion.denoiser import sample_sigma_training_distribution
 
 
@@ -71,7 +71,7 @@ def test_historical_precision_uses_iid_full_distribution_not_stratified(tiny_den
 
     sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
     from data import Dataset, Episode
-    from lcg.theta_s import ThetaSConfig, selected_parameters
+    from intrinsic_reward.lcg.theta_s import ThetaSConfig, selected_parameters
     from models.diffusion import SigmaDistributionConfig
 
     denoiser = tiny_denoiser

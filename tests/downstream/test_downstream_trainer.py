@@ -203,7 +203,7 @@ def test_reward_targets_come_only_from_the_selected_task(tmp_path, monkeypatch):
 def test_only_an_action_spec_lookup_touches_dm_control(tmp_path, monkeypatch):
     import coroutines.collector as collector
     import envs
-    import lcg
+    import intrinsic_reward.lcg as lcg
 
     def forbidden(*args, **kwargs):
         raise AssertionError("constructed during downstream training")
@@ -632,9 +632,10 @@ BAR = re.compile(r"^(?P<desc>.+): 100%\|[^|]*\| (?P<n>\d+)/(?P=n) \[[\d:]+<[\d:]
 
 def screen_lines(raw):
     """What stays on screen: line endings normalized, and of a bar's in-place redraws (carriage
-    returns) only the last."""
+    returns) only the last, without trailing blanks (tqdm pads a redraw that is shorter than the
+    previous one, e.g. "9.84 updates/s" after "10.12 updates/s", with spaces)."""
     text = raw.decode("utf-8").replace("\r\n", "\n")
-    return [line.rsplit("\r", 1)[-1] for line in text.split("\n")]
+    return [line.rsplit("\r", 1)[-1].rstrip(" ") for line in text.split("\n")]
 
 
 def downstream_screen(*args):

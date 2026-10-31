@@ -7,9 +7,9 @@ the original 480-candidate/B=32,H=15 workload to a handful of tiny synthetic can
 from dataclasses import dataclass
 
 import torch
-from lcg.forward_jvp import make_jvp_bank
-from lcg.intrinsic_reward import imagined_candidates_from_batch, make_lcg_intrinsic_reward_fn
-from lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
+from intrinsic_reward.lcg.forward_jvp import make_jvp_bank
+from intrinsic_reward.lcg.intrinsic_reward import imagined_candidates_from_batch, make_lcg_intrinsic_reward_fn
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, frozen_named_parameters, selected_named_parameters
 from models.diffusion import SigmaDistributionConfig
 
 TINY_IMG_CHANNELS = 3

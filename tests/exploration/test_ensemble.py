@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 import exploration_trainer as trainer_module
 from data import BatchSampler, Dataset, Episode
 from data.milestone import load_milestone
-from ensemble import EnsembleTraining, episode_multiplicity, EnsembleDisagreementConfig
+from intrinsic_reward.ensemble import EnsembleTraining, episode_multiplicity, EnsembleDisagreementConfig
 from envs import WorldModelEnv, WorldModelEnvConfig
 from envs.world_model_env import ensemble_disagreement
 from exploration_trainer import ExplorationTrainer
@@ -219,7 +219,7 @@ def test_member_selection_is_uniform_per_trajectory_and_transition(monkeypatch):
 
 def test_ensemble_is_frozen_and_in_eval_mode_during_pmpo(tmp_path, monkeypatch):
     seen = []
-    import ensemble as ensemble_module
+    import intrinsic_reward.ensemble as ensemble_module
     original = ensemble_module.EnsembleScorer.__call__
 
     def spy(self, infos, env_rew):

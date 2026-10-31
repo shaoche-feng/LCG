@@ -13,7 +13,7 @@
 # Heads: f_k(z_t, a_t) -> z_{t+1}, refitted from scratch after every denoiser phase, frozen in PMPO.
 # Raw reward of an imagined transition: mean over features of the sample variance (K - 1) of the
 # heads' predicted means.
-_target_: plan2explore.Plan2ExploreConfig
+_target_: intrinsic_reward.plan2explore.Plan2ExploreConfig
 
 method: plan2explore_disagreement
 enabled: True

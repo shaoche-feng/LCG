@@ -7,7 +7,7 @@
 # sampled parameters fixed; reward and next observation are the full ensemble's (population
 # pixel variance; one uniformly drawn member per trajectory and transition). A curvature-based
 # approximation, not a calibrated posterior. Values are working placeholders, not tuned.
-_target_: laplace.LaplaceConfig
+_target_: intrinsic_reward.laplace.LaplaceConfig
 
 method: laplace_disagreement
 enabled: True
@@ -17,7 +17,7 @@ posterior_temperature: 1.0  # covariance multiplier T: perturbation std = sqrt(T
 
 # Selected parameters: LCG's R1 (first ResBlock of the last decoder level), LCG's selector.
 theta_s:
-  _target_: lcg.theta_s.ThetaSConfig
+  _target_: intrinsic_reward.lcg.theta_s.ThetaSConfig
   include: ["unet.u_blocks.3.resblocks.0.*"]
   exclude: []
   expected_num_tensors: null

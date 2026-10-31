@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 
 import test_exploration_trainer as base
 import test_test_diagnostics as diag
-from ensemble import migrate_ensemble_layout
+from intrinsic_reward.ensemble import migrate_ensemble_layout
 from exploration_trainer import ExplorationTrainer
 from test_ensemble import ENS, OFF, run_ens
 from test_exploration_trainer import COLLECT, compose, run_trainer

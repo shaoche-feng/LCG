@@ -24,9 +24,9 @@ def _find_repo_root(start: Path) -> Path:
 
 sys.path.insert(0, str(_find_repo_root(Path(__file__).parent) / "src"))
 
-from lcg.precision import assert_setup_valid, historical_precision  # noqa: E402
-from lcg.forward_jvp import make_jvp_bank, score_one_jvp_bank  # noqa: E402
-from lcg.theta_s import (  # noqa: E402
+from intrinsic_reward.lcg.precision import assert_setup_valid, historical_precision  # noqa: E402
+from intrinsic_reward.lcg.forward_jvp import make_jvp_bank, score_one_jvp_bank  # noqa: E402
+from intrinsic_reward.lcg.theta_s import (  # noqa: E402
     ThetaSConfig,
     frozen_named_parameters,
     selected_dim,
@@ -59,7 +59,7 @@ def _real_arch_denoiser() -> Denoiser:
 
 
 def _old_hardcoded_selection(denoiser: Denoiser):
-    """Reconstructs the DELETED hard-coded selection (src/lcg/theta_s.py's old
+    """Reconstructs the DELETED hard-coded selection (src/intrinsic_reward/lcg/theta_s.py's old
     selected_submodules + forward_jvp.py's old selected_named_parameters) locally, purely
     as an independent reference for proving the new config-driven default is behaviorally
     identical -- production no longer contains this logic anywhere."""

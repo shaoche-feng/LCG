@@ -19,7 +19,7 @@ import torch
 from torch import Tensor
 
 from envs.world_model_env import ensemble_disagreement  # noqa: F401  (re-exported: the score)
-from lcg.reward_normalization import RunningRMS, RunningRMSConfig
+from intrinsic_reward.lcg.reward_normalization import RunningRMS, RunningRMSConfig
 from utils import rng_state, set_rng_state, set_seed
 
 REWARD_SCALINGS = ("fixed", "rms", "none")

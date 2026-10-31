@@ -1,6 +1,6 @@
 """Phase 5: LCG scoring on held-out Walk vs Run transitions, for the two
 trained run_scarce denoisers (walker, quadruped). Uses the PRODUCTION LCG
-implementation (src/lcg/*) completely unmodified -- theta_s.py,
+implementation (src/intrinsic_reward/lcg/*) completely unmodified -- theta_s.py,
 precision.py::historical_precision, forward_jvp.py::make_jvp_bank /
 score_one_jvp_bank -- called directly rather than through the RL/actor-critic
 intrinsic-reward hook, since candidates here are real held-out transitions,
@@ -47,9 +47,9 @@ OmegaConf.register_new_resolver("eval", eval)
 from agent import Agent, get_action_space_kwargs  # noqa: E402
 from dm_control_env import DMControlEnv  # noqa: E402
 from data import Dataset, SegmentId  # noqa: E402
-from lcg.theta_s import ThetaSConfig, selected_named_parameters, frozen_named_parameters  # noqa: E402
-from lcg.precision import historical_precision, load_transition, assert_setup_valid  # noqa: E402
-from lcg.forward_jvp import make_jvp_bank, score_one_jvp_bank  # noqa: E402
+from intrinsic_reward.lcg.theta_s import ThetaSConfig, selected_named_parameters, frozen_named_parameters  # noqa: E402
+from intrinsic_reward.lcg.precision import historical_precision, load_transition, assert_setup_valid  # noqa: E402
+from intrinsic_reward.lcg.forward_jvp import make_jvp_bank, score_one_jvp_bank  # noqa: E402
 from models.diffusion.denoiser import apply_noise_from_samples, sample_sigma_training_distribution  # noqa: E402
 
 PROBE_ROOT = _PROJECT_ROOT / "docs" / "lcg_undersample_diagnostic"

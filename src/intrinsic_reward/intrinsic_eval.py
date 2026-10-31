@@ -22,7 +22,7 @@ import torch
 from torch import Tensor
 
 from envs.world_model_env import ensemble_disagreement
-from plan2explore import context_window
+from intrinsic_reward.plan2explore import context_window
 
 
 def sampler_windows(episode, n: int) -> Tuple[Tensor, Tensor, Optional[Tensor]]:

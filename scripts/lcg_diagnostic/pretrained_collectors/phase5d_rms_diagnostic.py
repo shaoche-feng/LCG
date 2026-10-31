@@ -1,5 +1,5 @@
 """Post-hoc RMS diagnostic: recovers the per-probe q_m(x) quantities that
-production `score_one_jvp_bank` (src/lcg/forward_jvp.py, UNMODIFIED) computes
+production `score_one_jvp_bank` (src/intrinsic_reward/lcg/forward_jvp.py, UNMODIFIED) computes
 internally but discards after folding into the running mean, by re-running
 the exact same JVP scoring with a local diagnostic-only wrapper that stores
 q_m instead of only accumulating mean_m(q_m).
@@ -35,10 +35,10 @@ _PROJECT_ROOT = _LCG_ROOT.parent
 sys.path.insert(0, str(_LCG_ROOT / "src"))
 sys.path.insert(0, str(_THIS_DIR))
 
-from lcg.forward_jvp import jvp_through_F, unflatten_to_dict  # noqa: E402 -- unmodified production functions
-from lcg.theta_s import selected_named_parameters, frozen_named_parameters  # noqa: E402
-from lcg.precision import historical_precision, assert_setup_valid  # noqa: E402
-from lcg.forward_jvp import make_jvp_bank  # noqa: E402
+from intrinsic_reward.lcg.forward_jvp import jvp_through_F, unflatten_to_dict  # noqa: E402 -- unmodified production functions
+from intrinsic_reward.lcg.theta_s import selected_named_parameters, frozen_named_parameters  # noqa: E402
+from intrinsic_reward.lcg.precision import historical_precision, assert_setup_valid  # noqa: E402
+from intrinsic_reward.lcg.forward_jvp import make_jvp_bank  # noqa: E402
 from models.diffusion.denoiser import apply_noise_from_samples  # noqa: E402
 from data import Dataset  # noqa: E402
 

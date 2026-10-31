@@ -30,7 +30,7 @@ from data import BatchSampler, collate_segments_without_rewards
 from data.milestone import (SUMMARY_FILE, downstream_output_dir, downstream_summary, load_milestone, milestone_members,
                             read_json, state_sha256, write_json)
 from data.utils import make_task_reward_collate
-from device_report import physical_gpu_index
+from utils import physical_gpu_index
 from envs import DMControlEnv, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from models.pmpo_beta import (PMPOBeta, PMPOOptimizers, check_controller_state, controller_settings, metric_path,
                               reward_statistics)
@@ -1146,7 +1146,7 @@ def discover_milestones_safe(milestones_dir: Path) -> List[Tuple[Path, Dict[str,
     return discover_milestones(milestones_dir) if Path(milestones_dir).is_dir() else []
 
 
-# The figures, drawn in a separate Python process that loads matplotlib but not torch (as device_report's
+# The figures, drawn in a separate Python process that loads matplotlib but not torch (as utils.probe_egl's
 # EGL probe runs in its own process): in this project's Windows conda environment torch's bundled OpenMP
 # runtime and the one matplotlib's numpy work loads abort a process holding both ("OMP: Error #15").
 PLOT_PROGRAM = r"""

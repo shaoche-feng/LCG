@@ -19,15 +19,15 @@ from utils import normalize_saved_config
 from coroutines.collector import COLLECTION_MODES, CollectorState, make_collector, NumToCollect
 from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
 from data.milestone import milestone_name, publish_milestone, read_manifest, referenced_files
-from device_report import device_lines, physical_gpu_index
+from utils import device_lines, physical_gpu_index
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
-from ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
-from lcg import LCGLifecycle, selected_named_parameters
+from intrinsic_reward.ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
+from intrinsic_reward.lcg import LCGLifecycle, selected_named_parameters
 from models.pmpo_beta import (PMPOOptimizers, check_controller_state, controller_settings, metric_path,
                               reward_statistics)
-from plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
-from laplace import LaplaceConfig, LaplaceEnsemble, LaplaceScorer
-from intrinsic_eval import aggregate, episode_record, IntrinsicEvaluator
+from intrinsic_reward.plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
+from intrinsic_reward.laplace import LaplaceConfig, LaplaceEnsemble, LaplaceScorer
+from intrinsic_reward.intrinsic_eval import aggregate, episode_record, IntrinsicEvaluator
 from pmpo_diagnostic import PMPORunDiagnostic
 from utils import (
     broadcast_if_needed,

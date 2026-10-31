@@ -68,7 +68,7 @@ FIXED = ["intrinsic_reward.reward_scaling=fixed", "intrinsic_reward.fixed_diviso
 
 def test_trainer_policy_reward_is_raw_lcg_over_the_fixed_divisor(tmp_path, monkeypatch):
     rewards = []
-    import lcg.lifecycle as lifecycle_module
+    import intrinsic_reward.lcg.lifecycle as lifecycle_module
     original = lifecycle_module.LCGLifecycle.scale
 
     def spy(self, raw):
