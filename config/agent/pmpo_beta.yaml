@@ -35,3 +35,7 @@ actor_critic:
   max_grad_norm: 10.0
   seed: ${oc.select:common.seed,0}
   log_diagnostics: false
+  # Experiment (stage3-beta-emacritic): slow EMA critic regularization; 0.0 = disabled
+  # (no EMA critic, original learning path). See PMPOBetaConfig.
+  slow_critic_coef: 0.0
+  slow_critic_rate: 0.02
