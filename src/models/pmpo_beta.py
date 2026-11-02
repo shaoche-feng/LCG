@@ -59,6 +59,25 @@ class PMPOBetaConfig:
     max_grad_norm: float = 10.0
     seed: int = 0
     log_diagnostics: bool = False
+    # Experiment (stage3-gaussian-h10-emacritic): slow EMA critic regularization adapted to the scalar
+    # critic. With slow_critic_coef > 0 an EMA copy of the critic (outside the optimizer, no gradients)
+    # is kept, value_loss += slow_critic_coef * MSE(V(s), sg(V_slow(s))) on the same states and mean
+    # reduction, and after every critic optimizer step slow = (1 - rate) * slow + rate * online.
+    # The ONLINE critic still provides lambda-return bootstraps and advantages. 0.0 (default) creates
+    # no EMA critic and leaves the learning path, state_dict and checkpoints unchanged.
+    slow_critic_coef: float = 0.0
+    slow_critic_rate: float = 0.02
+    # Experiment (stage3-gaussian-h10-ema-replayvalue): replay-value learning, the reviewed DreamerV3-controller
+    # repl_loss in scalar MSE form. With replay_value_coef > 0 the imagination prompts come from replay segments of
+    # consecutive starts (models/replay_value.py; prompts = segments * replay_starts), and the critic additionally
+    # regresses, on each segment's replay states 0..K-2, onto detached replay lambda-returns built from the real
+    # rewards and the detached imagination lambda-return started at each replay state (its value annotation):
+    #   loss_repval = mean_i w_i * [ (V(x_i) - R_i)^2 + slow_critic_coef * (V(x_i) - sg(V_slow(x_i)))^2 ]
+    #   critic loss = imagined loss + replay_value_coef * loss_repval
+    # x_i is the replay state's frame repeated frame_stack times (= the imagination start input); w_i masks padding
+    # and time-limit truncations. 0.0 (default) leaves the original sampling, RNG use, loss and state unchanged.
+    replay_value_coef: float = 0.0
+    replay_starts: int = 4
 
 
 GAUSSIAN_STD_MIN, GAUSSIAN_STD_SPAN = 0.1, 0.9
@@ -145,6 +164,10 @@ class PMPOBeta(nn.Module):
             raise ValueError("Invalid discount, lambda, or PMPO mixing coefficient")
         if min(cfg.concentration_min, cfg.actor_lr, cfg.value_lr, cfg.max_grad_norm) <= 0:
             raise ValueError("Concentration floor, learning rates and gradient clip must be positive")
+        if cfg.slow_critic_coef < 0 or not 0 < cfg.slow_critic_rate <= 1:
+            raise ValueError("Invalid slow critic coefficient or EMA rate")
+        if cfg.replay_value_coef < 0 or cfg.replay_starts < 2:
+            raise ValueError("Invalid replay-value coefficient or replay starts")
         if cfg.beta_kl < 0 or cfg.entropy_coef < 0 or cfg.prior_refresh_interval < 1 or cfg.imagination_horizon < 1:
             raise ValueError("Invalid KL/entropy coefficient or rollout/block length")
         if cfg.actor_distribution not in ("beta", "tanh_gaussian"):
@@ -167,8 +190,12 @@ class PMPOBeta(nn.Module):
         # can distinguish local (per-block) trust-region movement from total cumulative
         # drift over the whole run. Never read by the loss.
         self.initial_actor = deepcopy(self.actor).requires_grad_(False).eval()
+        if cfg.slow_critic_coef > 0:
+            # Exact copy of the freshly initialized online critic; never optimized (no gradients).
+            self.slow_value = deepcopy(self.value).requires_grad_(False)
         self.intrinsic_reward_fn = None
         self.rl_env = None
+        self.replay_loader = None
         self._fixed_obs = None
         self._rng = dict(cpu=torch.Generator().manual_seed(seed).get_state(), cuda=None,
                          python=random.Random(seed).getstate(), numpy=np.random.RandomState(seed).get_state())
@@ -276,6 +303,70 @@ class PMPOBeta(nn.Module):
         require_finite(log_probability=logp, entropy=entropy)
         return logp, entropy
 
+    @torch.no_grad()
+    def update_slow_critic(self):
+        """slow = (1 - rate) * slow + rate * online, over every floating-point tensor of the critic."""
+        rate = self.cfg.slow_critic_rate
+        for slow, online in zip(self.slow_value.state_dict().values(), self.value.state_dict().values()):
+            if slow.is_floating_point():
+                slow.mul_(1 - rate).add_(online, alpha=rate)
+
+    def replay_start_rows(self, segments):
+        """Imagination row of replay state t of segment s: s * replay_starts + t (unfold_windows order)."""
+        return torch.arange(segments * self.cfg.replay_starts, device=self.device).view(segments, self.cfg.replay_starts)
+
+    def replay_inputs(self, replay):
+        """Critic input for replay states t = 0..K-2 of every segment, segment-major: the state's own frame repeated
+        frame_stack times, exactly the input the imagination rollout started at that state used (reviewed
+        repeated-final-frame initialization), so a replay prediction and its bootstrap share one representation."""
+        K, W = self.cfg.replay_starts, self.replay_loader.window
+        starts = replay.obs[:, W - 1:W - 1 + K - 1].to(self.device)  # (S, K-1, C, H, W), never padding
+        return starts.flatten(0, 1).repeat(1, self.frame_stack, 1, 1)
+
+    def replay_value_loss(self, replay, boot, start_states):
+        """Reviewed DreamerV3-controller replay_value_loss with the scalar MSE critic and scalar EMA regularizer.
+        boot: detached imagination lambda-return at step 0 of every rollout, (S*K,), row s*K+t = replay state t of
+        segment s. start_states: stored imagination states at step 0, (S*K, C*frame_stack, H, W); the replay inputs
+        must equal them element for element."""
+        from .replay_value import replay_lambda_return
+        c, K, W = self.cfg, self.cfg.replay_starts, self.replay_loader.window
+        replay = replay.to(self.device)
+        S = replay.obs.shape[0]
+        boot = boot.detach().view(S, K)
+        stacks = self.replay_inputs(replay)
+        rows = self.replay_start_rows(S)[:, :K - 1].flatten()
+        if not torch.equal(stacks, start_states[rows]):
+            raise RuntimeError("Replay-value inputs differ from the imagination start states")
+        sl = slice(W - 1, W - 1 + K)
+        rew, term, trunc = replay.rew[:, sl].float(), replay.end[:, sl].float(), replay.trunc[:, sl].float()
+        valid = replay.mask_padding[:, sl]
+        last = torch.clamp(term + trunc, max=1)
+        targets = replay_lambda_return(rew, term, last, boot, c.gamma, c.lambda_).detach()  # (S, K-1)
+        # A transition truncated by the time limit has no stored successor: no target (cf. ~is_last).
+        weight = ((1 - trunc[:, :K - 1]) * valid[:, :K - 1].float() * valid[:, 1:].float()).detach().flatten()
+        pred = self.value(stacks).squeeze(-1)
+        target_sq = (pred - targets.flatten()).square()
+        per = target_sq
+        slow_gap = slow_sq = None
+        if c.slow_critic_coef > 0:
+            with torch.no_grad():
+                slow = self.slow_value(stacks).squeeze(-1)
+            slow_sq = (pred - slow).square()
+            per = per + c.slow_critic_coef * slow_sq
+            slow_gap = (pred.detach() - slow).abs()
+        loss = (weight * per).mean()
+        with torch.no_grad():
+            wsum = weight.sum().clamp_min(1e-12)
+            err = pred.detach() - targets.flatten()
+            stats = dict(loss_repval=loss.detach(), loss_repval_target=(weight * target_sq.detach()).mean(),
+                         replay_pred_mean=(weight * pred.detach()).sum() / wsum, replay_target_mean=(weight * targets.flatten()).sum() / wsum,
+                         replay_bias=(weight * err).sum() / wsum, replay_mae=(weight * err.abs()).sum() / wsum,
+                         replay_rmse=((weight * err.square()).sum() / wsum).sqrt(), replay_weight_mean=weight.mean(),
+                         replay_boot_mean=boot.mean(), replay_reward_mean=rew[:, :K - 1].mean())
+            if slow_sq is not None:
+                stats.update(loss_repval_slowreg=(weight * slow_sq.detach()).mean(), replay_slow_gap=(weight * slow_gap).sum() / wsum)
+        return loss, stats
+
     def predict_act_value(self, obs):
         if obs.ndim != 4 or obs.shape[1] != self.cfg.img_channels * self.frame_stack:
             raise ValueError("PMPO requires the exact channel-concatenated four-frame state")
@@ -287,6 +378,22 @@ class PMPOBeta(nn.Module):
         if rl_env.data_loader.num_workers != 0:
             raise ValueError("PMPO prototype requires num_workers_data_loaders=0 for exact prompt RNG")
         self.rl_env = rl_env
+        if self.cfg.replay_value_coef > 0:
+            # Reviewed DreamerV3-controller wiring: the replay window loader stands in for the prompt loader.
+            from data import Dataset
+            from .replay_value import ReplayWindowLoader
+            loader = rl_env.data_loader
+            dataset = getattr(loader, "dataset", None)
+            if not isinstance(dataset, Dataset):
+                raise ValueError("The replay-value loss needs the replay Dataset behind the actor-critic loader")
+            prompts, window = rl_env.num_envs, loader.batch_sampler.seq_length
+            if window < self.frame_stack:
+                raise ValueError("Replay prompts must hold at least frame_stack frames")
+            if prompts % self.cfg.replay_starts:
+                raise ValueError("actor_critic.training.batch_size must be a multiple of replay_starts")
+            self.replay_loader = ReplayWindowLoader(dataset, prompts // self.cfg.replay_starts, window,
+                                                    self.cfg.replay_starts, loader.batch_sampler.sample_weights)
+            rl_env.data_loader = self.replay_loader
 
     def set_intrinsic_reward_fn(self, fn):
         self.intrinsic_reward_fn = fn
@@ -310,6 +417,7 @@ class PMPOBeta(nn.Module):
         if not c.fixed_prior and self.updates.item() % c.prior_refresh_interval == 0:
             self.prior_actor.load_state_dict(self.actor.state_dict())
         self.prior_actor.eval()
+        blocks_before = self.replay_loader.blocks if self.replay_loader is not None else None
         obs, act, rew, end, trunc, _, old_values, bootstrap, infos = self.collect_imagination()
         if self.intrinsic_reward_fn is not None:
             rew = self.intrinsic_reward_fn(infos, rew).detach()
@@ -331,12 +439,29 @@ class PMPOBeta(nn.Module):
         entropy_loss = -c.entropy_coef * entropy.mean()
         actor_loss = pmpo_raw_loss + kl_loss + entropy_loss
         value_loss = F.mse_loss(values, targets.flatten())
+        slow_metrics = {}
+        if c.slow_critic_coef > 0:
+            with torch.no_grad():
+                slow_values = self.slow_value(flat_obs).squeeze(-1)
+            slowreg_loss = F.mse_loss(values, slow_values)  # same states, same mean reduction
+            slow_metrics = dict(loss_value_target=value_loss.detach(), loss_slowreg=slowreg_loss.detach(),
+                                slow_value_mean=slow_values.mean(), slow_value_gap=(values.detach() - slow_values).abs().mean())
+            value_loss = value_loss + c.slow_critic_coef * slowreg_loss
+        replay_metrics = {}
+        if self.replay_loader is not None:
+            if self.replay_loader.blocks != blocks_before + 1:
+                raise RuntimeError("Replay batch is not aligned with this update's imagination starts")
+            imag_value_loss = value_loss.detach()
+            repval_loss, replay_metrics = self.replay_value_loss(self.replay_loader.replay, targets[:, 0], obs[:, 0])
+            value_loss = value_loss + c.replay_value_coef * repval_loss
+            replay_metrics.update(loss_value_imag=imag_value_loss, loss_repval_weighted=c.replay_value_coef * repval_loss.detach())
         require_finite(targets=targets, values=values, kl=kl, actor_loss=actor_loss, value_loss=value_loss)
         metrics = self.diagnostics(raw.detach(), act.flatten(0, 1), logp.detach(), entropy.detach())
         metrics.update(loss_actor=actor_loss.detach(), loss_value=value_loss.detach(), kl_prior=kl.mean().detach(),
                        kl_initial=kl_initial.mean().detach(),
                        loss_pmpo_raw=pmpo_raw_loss.detach(), loss_entropy=entropy_loss.detach(),
                        loss_actor_total=actor_loss.detach(),
+                       **slow_metrics, **replay_metrics,
                        value_mean=values.mean().detach(), value_std=values.std(unbiased=False).detach(),
                        return_mean=targets.mean(), return_std=targets.std(unbiased=False),
                        positive_fraction=(advantage >= 0).float().mean(), negative_fraction=(advantage < 0).float().mean(),
@@ -455,8 +580,12 @@ class PMPOOptimizers:
             norm = nn.utils.clip_grad_norm_(getattr(self.model, name).parameters(), self.model.cfg.max_grad_norm,
                                            error_if_nonfinite=True)
             metrics[f"{name}_grad_norm"] = norm.detach()
+        if getattr(self.model, "replay_loader", None) is not None:
+            metrics["value_grad_clipped"] = (metrics["value_grad_norm"] > self.model.cfg.max_grad_norm).float()
         self.actor.step()
         self.value.step()
+        if getattr(self.model, "slow_value", None) is not None:
+            self.model.update_slow_critic()  # after the critic optimizer step
         for name in ("actor", "value"):
             require_finite(**{f"{name}.{key}": p for key, p in getattr(self.model, name).named_parameters()})
         self.model.updates.add_(1)

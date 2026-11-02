@@ -38,3 +38,11 @@ actor_critic:
   max_grad_norm: 10.0
   seed: ${oc.select:common.seed,0}
   log_diagnostics: false
+  # Experiment (stage3-gaussian-h10-emacritic): slow EMA critic regularization; 0.0 = disabled
+  # (no EMA critic, original learning path). See PMPOBetaConfig.
+  slow_critic_coef: 0.0
+  slow_critic_rate: 0.02
+  # Experiment (stage3-gaussian-h10-ema-replayvalue): replay-value learning coefficient; 0.0 = disabled (original
+  # sampling and loss). replay_starts = consecutive imagination starts per replay segment. See PMPOBetaConfig.
+  replay_value_coef: 0.0
+  replay_starts: 4
