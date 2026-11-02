@@ -38,7 +38,7 @@ initialization:
 downstream:
   task_name: ???
   seed: 0
-  mode: train  # train | resume | evaluate
+  mode: train  # src/downstream_main.py: train | resume | evaluate; src/downstream_analysis.py: collect | compare
 
 common:
   devices: 0  # GPU index or cpu
@@ -46,9 +46,9 @@ common:
 
 # Results (downstream.mode=collect | compare; CPU only, nothing is trained or evaluated; the task, adaptation seed
 # and initialization.member_index select the outputs):
-#   collect: python src/downstream_main.py downstream.mode=collect analysis.run_dir=<exploration run> \
+#   collect: python src/downstream_analysis.py downstream.mode=collect analysis.run_dir=<exploration run> \
 #                downstream.task_name=walk downstream.seed=0   -> <run>/result/<task>/seed_<s>/result.csv
-#   compare: python src/downstream_main.py downstream.mode=compare analysis.domain=walker analysis.exploration_seed=0 \
+#   compare: python src/downstream_analysis.py downstream.mode=compare analysis.domain=walker analysis.exploration_seed=0 \
 #                downstream.task_name=walk downstream.seed=0
 #            -> <output_root>/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<s>/
 analysis:

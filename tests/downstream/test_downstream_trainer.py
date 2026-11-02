@@ -17,6 +17,7 @@ import yaml
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
+import downstream_analysis as analysis_module
 import downstream_main
 import downstream_trainer as downstream_module
 from coroutines.env_loop import make_env_loop
@@ -1251,12 +1252,12 @@ def test_result_table_statistics_strict_thresholds_and_30_seeds(tmp_path):
     at_threshold = [200.0, 400.0, 500.0, 600.0, 200.5, 600.25] + [100.0] * 24  # returns exactly at the thresholds
     synthetic_output(run, 400, at_threshold)
     before = tree_hashes(run)
-    path, rows, missing = downstream_module.collect_results(run, "walk", 0)
+    path, rows, missing = analysis_module.collect_results(run, "walk", 0)
     assert path == run / "result/walk/seed_0/result.csv" and not missing
     with open(path, encoding="utf-8", newline="") as f:
         header = next(csv.reader(f))
-    assert header == downstream_module.RESULT_COLUMNS + [f"return_seed_{s}" for s in EVAL_SEEDS] + ["source_evaluation_file"]
-    table = downstream_module.read_csv(path)
+    assert header == analysis_module.RESULT_COLUMNS + [f"return_seed_{s}" for s in EVAL_SEEDS] + ["source_evaluation_file"]
+    table = analysis_module.read_csv(path)
     assert [r["train_env_steps"] for r in table] == [300, 400, 500] and [r["milestone"] for r in table] == [
         "steps_000300", "steps_000400", "steps_000500"]
     row = table[1]
@@ -1278,7 +1279,7 @@ def test_result_table_statistics_strict_thresholds_and_30_seeds(tmp_path):
     data["return_mean"] += 1.0
     report.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError, match="saved return_mean .* differs from the episodes"):
-        downstream_module.collect_results(run, "walk", 0)
+        analysis_module.collect_results(run, "walk", 0)
 
 
 def test_result_collection_missing_ambiguous_protocols_settings_and_members(tmp_path):
@@ -1286,27 +1287,27 @@ def test_result_collection_missing_ambiguous_protocols_settings_and_members(tmp_
     shutil.rmtree(run / "downstream/steps_000400")  # never adapted
     work = run / "downstream/steps_000500/walk"
     shutil.move(str(work / "seed_0"), str(work / ".seed_0.tmp"))  # interrupted
-    path, rows, missing = downstream_module.collect_results(run, "walk", 0)
+    path, rows, missing = analysis_module.collect_results(run, "walk", 0)
     assert [r["train_env_steps"] for r in rows] == [300, 600]
     assert [(m["milestone"], m["reason"]) for m in missing] == [("steps_000400", "no downstream output"),
                                                                 ("steps_000500", "incomplete (work folder .seed_0.tmp only)")]
     # A second evaluation protocol on one milestone: ambiguous until one is selected.
     output, extra = synthetic_output(run, 600, [1.0, 2.0, 3.0], seeds=[1, 2, 3], max_steps=50)
     with pytest.raises(ValueError, match="several evaluation protocols .*select one with analysis.protocol"):
-        downstream_module.collect_results(run, "walk", 0)
-    chosen = downstream_module.protocol_id(extra)
-    path, rows, missing = downstream_module.collect_results(run, "walk", 0, protocol=chosen)
+        analysis_module.collect_results(run, "walk", 0)
+    chosen = analysis_module.protocol_id(extra)
+    path, rows, missing = analysis_module.collect_results(run, "walk", 0, protocol=chosen)
     assert [r["train_env_steps"] for r in rows] == [600] and [r["return_seed_2"] for r in rows] == [2.0]
     assert ("steps_000300", f"completed, but no evaluation with protocol {chosen}") in [(m["milestone"], m["reason"])
                                                                                        for m in missing]
     # Denoiser members are separate tables; different downstream settings are never combined.
     synthetic_output(run, 300, [5.0, 6.0], seeds=[3001, 3002], max_steps=50, member=1)
-    path, rows, _ = downstream_module.collect_results(run, "walk", 0, member_index=1)
+    path, rows, _ = analysis_module.collect_results(run, "walk", 0, member_index=1)
     assert path == run / "result/walk/seed_0_member_1/result.csv" and [r["member_index"] for r in rows] == [1]
     other = synthetic_run(tmp_path / "b", "uniform", steps=(300,), seeds=[3001, 3002], max_steps=50)
     synthetic_output(other, 400, [1.0, 2.0], seeds=[3001, 3002], max_steps=50, settings_steps=6)
     with pytest.raises(ValueError, match="not comparable: .* differ in rew_end_model.training.steps: 5 vs 6"):
-        downstream_module.collect_results(other, "walk", 0)
+        analysis_module.collect_results(other, "walk", 0)
 
 
 @pytest.mark.parametrize("change", ["action_repeat", "exploration_action_repeat", "return_mean", "frac_over_600", "policy_weights",
@@ -1315,7 +1316,7 @@ def test_result_collection_missing_ambiguous_protocols_settings_and_members(tmp_
 def test_comparison_revalidates_sources_after_collection(tmp_path, monkeypatch, change):
     runs = [synthetic_run(tmp_path, method, steps=(300,)) for method in ("uniform", "plan2explore")]
     for run in runs:
-        downstream_module.collect_results(run, "walk", 0)
+        analysis_module.collect_results(run, "walk", 0)
     run = runs[1]
     output = run / "downstream/steps_000300/walk/seed_0"
     csv_path = run / "result/walk/seed_0/result.csv"
@@ -1326,9 +1327,9 @@ def test_comparison_revalidates_sources_after_collection(tmp_path, monkeypatch, 
         cfg.env.train.action_repeat = 4
         OmegaConf.save(cfg, config_path)
     elif change in ("return_mean", "frac_over_600"):
-        rows = downstream_module.read_csv(csv_path)
+        rows = analysis_module.read_csv(csv_path)
         rows[0][change] = 9999. if change == "return_mean" else 1.
-        downstream_module.write_csv(csv_path, rows, list(rows[0]))
+        analysis_module.write_csv(csv_path, rows, list(rows[0]))
     elif change == "policy_weights":
         torch.save({"w": torch.tensor([-1, -1])}, output / "actor_critic.pt")
     elif change.startswith("report_"):
@@ -1347,9 +1348,9 @@ def test_comparison_revalidates_sources_after_collection(tmp_path, monkeypatch, 
         extra = downstream_module.evaluation_path(output, "walk", EVAL_SEEDS, 500, {"w": torch.tensor([-9])})
         write_json(extra, json.loads(report_path.read_text(encoding="utf-8")))
     before = tree_hashes(*runs)
-    monkeypatch.setattr(downstream_module, "plot_comparison", lambda spec: pytest.fail("published invalid comparison"))
+    monkeypatch.setattr(analysis_module, "plot_comparison", lambda spec: pytest.fail("published invalid comparison"))
     with pytest.raises(ValueError, match="stale or inconsistent result table .*recollect with"):
-        downstream_module.compare_methods(tmp_path / "outputs", "walker", 0, "walk", 0)
+        analysis_module.compare_methods(tmp_path / "outputs", "walker", 0, "walk", 0)
     assert tree_hashes(*runs) == before
     assert not (tmp_path / "outputs/comparisons").exists()
 
@@ -1360,9 +1361,9 @@ def test_method_comparison_files_inputs_and_checks(tmp_path):
     p2e = synthetic_run(tmp_path, "plan2explore", steps=(300, 400, 500))
     shutil.rmtree(p2e / "downstream/steps_000400")  # a milestone without a result: recorded, not interpolated
     for run in (uniform, p2e):
-        assert downstream_module.collect_results(run, "walk", 0)[0] is not None
+        assert analysis_module.collect_results(run, "walk", 0)[0] is not None
     before = tree_hashes(uniform, p2e)
-    command = [sys.executable, str(ROOT / "src/downstream_main.py"), "downstream.mode=compare", "common.devices=cpu",
+    command = [sys.executable, str(ROOT / "src/downstream_analysis.py"), "downstream.mode=compare",
                f"analysis.output_root={root.as_posix()}", "analysis.domain=walker", "analysis.exploration_seed=0",
                "downstream.task_name=walk", "downstream.seed=0"]
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
@@ -1372,7 +1373,7 @@ def test_method_comparison_files_inputs_and_checks(tmp_path):
                                                     "fraction_over_thresholds.png", "task_return.pdf", "task_return.png"]
     assert all((out / name).stat().st_size > 1000 for name in ("task_return.png", "fraction_over_thresholds.pdf"))
     assert "Comparison: uniform, plan2explore | 1 missing results" in result.stdout
-    table = downstream_module.read_csv(out / "comparison.csv")
+    table = analysis_module.read_csv(out / "comparison.csv")
     assert [(r["method"], r["train_env_steps"]) for r in table] == [("uniform", 300), ("uniform", 400), ("uniform", 500),
                                                                     ("plan2explore", 300), ("plan2explore", 500)]
     analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
@@ -1389,18 +1390,18 @@ def test_method_comparison_files_inputs_and_checks(tmp_path):
     # Methods come from the saved configuration: a second run recording the same method is ambiguous.
     shutil.copytree(uniform, root / "lcg/walker/seed_0")
     with pytest.raises(ValueError, match="Two runs record method uniform"):
-        downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+        analysis_module.compare_methods(root, "walker", 0, "walk", 0)
     shutil.rmtree(root / "lcg")
     # Different evaluation protocols or downstream settings are not compared.
     synthetic_output(p2e, 600, [1.0, 2.0], seeds=[3001, 3002], max_steps=50)
-    downstream_module.collect_results(p2e, "walk", 0, protocol=downstream_module.protocol_id(
+    analysis_module.collect_results(p2e, "walk", 0, protocol=analysis_module.protocol_id(
         next((p2e / "downstream/steps_000600/walk/seed_0/evaluations").iterdir())))
     with pytest.raises(ValueError, match="different evaluation protocols"):
-        downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+        analysis_module.compare_methods(root, "walker", 0, "walk", 0)
 
 
 def test_comparison_needs_the_same_effective_environment_evaluation_and_training_settings(tmp_path, monkeypatch):
-    monkeypatch.setattr(downstream_module, "plot_comparison", lambda spec: None)
+    monkeypatch.setattr(analysis_module, "plot_comparison", lambda spec: None)
     root = tmp_path / "outputs"
 
     def compare_with(change):
@@ -1409,8 +1410,8 @@ def test_comparison_needs_the_same_effective_environment_evaluation_and_training
         for output in sorted(p2e.glob("downstream/*/walk/seed_0")):
             change(output)
         for run in (uniform, p2e):
-            downstream_module.collect_results(run, "walk", 0)
-        return downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+            analysis_module.collect_results(run, "walk", 0)
+        return analysis_module.compare_methods(root, "walker", 0, "walk", 0)
 
     def config_change(**changes):
         def change(output):
@@ -1456,19 +1457,19 @@ def test_comparison_needs_the_same_effective_environment_evaluation_and_training
     run = synthetic_run(tmp_path / "mixed", "uniform")
     config_change(**{"env.train.action_repeat": 4})(run / "downstream/steps_000400/walk/seed_0")
     with pytest.raises(ValueError, match="not comparable: .* differ in env.train.action_repeat: 2 vs 4"):
-        downstream_module.collect_results(run, "walk", 0)
+        analysis_module.collect_results(run, "walk", 0)
     compare_with(lambda output: None)
     csv_path = root / "uniform/walker/seed_0/result/walk/seed_0/result.csv"
     csv_path.write_text(csv_path.read_text(encoding="utf-8").replace("compatibility_sha256", "downstream_settings_sha256"),
                         encoding="utf-8")
     with pytest.raises(ValueError, match="collected before the compatibility fingerprint .* collect it again"):
-        downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+        analysis_module.compare_methods(root, "walker", 0, "walk", 0)
 
 
 @pytest.mark.parametrize("order", ["sorts_before", "sorts_after"])
 def test_two_policies_under_the_selected_protocol_are_refused(tmp_path, order):
     run = synthetic_run(tmp_path, "uniform", steps=(300, 400), seeds=[3001, 3002], max_steps=50)
-    path, rows, _ = downstream_module.collect_results(run, "walk", 0)
+    path, rows, _ = analysis_module.collect_results(run, "walk", 0)
     assert len(rows) == 2  # one unambiguous report per milestone: collected
     before = path.read_bytes()
     output = run / "downstream/steps_000400/walk/seed_0"
@@ -1479,21 +1480,21 @@ def test_two_policies_under_the_selected_protocol_are_refused(tmp_path, order):
         if (other.name < original.name) == (order == "sorts_before"):
             break
     write_json(other, dict(report, return_mean=report["return_mean"]))
-    assert downstream_module.protocol_id(other) == downstream_module.protocol_id(original) and other != original
+    assert analysis_module.protocol_id(other) == analysis_module.protocol_id(original) and other != original
     with pytest.raises(ValueError, match=f"2 evaluation reports of different policies with protocol .*"
                                          f"{re.escape(min(original.name, other.name))}, {re.escape(max(original.name, other.name))}"):
-        downstream_module.collect_results(run, "walk", 0)
+        analysis_module.collect_results(run, "walk", 0)
     assert path.read_bytes() == before  # the refused collection left the table as it was
     # One policy with two protocols still needs a selection.
     other.unlink()
     synthetic_output(run, 400, [1.0, 2.0, 3.0], seeds=[1, 2, 3], max_steps=50)
     with pytest.raises(ValueError, match="several evaluation protocols"):
-        downstream_module.collect_results(run, "walk", 0)
+        analysis_module.collect_results(run, "walk", 0)
 
 
 def test_plot_grid_keeps_milestones_without_results_as_gaps(tmp_path, monkeypatch):
     specs = []
-    monkeypatch.setattr(downstream_module, "plot_comparison", specs.append)
+    monkeypatch.setattr(analysis_module, "plot_comparison", specs.append)
     root = tmp_path / "outputs"
     uniform = synthetic_run(tmp_path, "uniform", steps=(300, 400, 500, 600))
     p2e = synthetic_run(tmp_path, "plan2explore", steps=(300, 400, 500, 600))
@@ -1501,11 +1502,11 @@ def test_plot_grid_keeps_milestones_without_results_as_gaps(tmp_path, monkeypatc
         shutil.rmtree(run / "downstream/steps_000400")
     shutil.rmtree(uniform / "downstream/steps_000500")  # only uniform lacks 500
     for run in (uniform, p2e):
-        downstream_module.collect_results(run, "walk", 0)
-    out = downstream_module.compare_methods(root, "walker", 0, "walk", 0)
+        analysis_module.collect_results(run, "walk", 0)
+    out = analysis_module.compare_methods(root, "walker", 0, "walk", 0)
     (spec,) = specs
     assert spec["grid"] == [300, 400, 500, 600]
-    value = lambda run, s, key: downstream_module.read_csv(run / "result/walk/seed_0/result.csv")[
+    value = lambda run, s, key: analysis_module.read_csv(run / "result/walk/seed_0/result.csv")[
         [300, 500, 600].index(s) if run == p2e else [300, 600].index(s)][key]
     for key in ("return_mean", "frac_over_200", "frac_over_400", "frac_over_500", "frac_over_600"):
         assert spec["series"]["uniform"][key] == [value(uniform, 300, key), None, None, value(uniform, 600, key)]
@@ -1514,6 +1515,94 @@ def test_plot_grid_keeps_milestones_without_results_as_gaps(tmp_path, monkeypatc
     assert analysis["plot_grid"] == [300, 400, 500, 600]
     assert sorted((m["method"], m["train_env_steps"]) for m in analysis["missing"]) == [
         ("plan2explore", 400), ("uniform", 400), ("uniform", 500)]
+
+
+# Runs an entry point as __main__ and reports, at its exit, what the process loaded and whether CUDA was initialized.
+ENTRY_POINT_PROBE = """
+import atexit, json, pathlib, runpy, sys
+def report():
+    import torch
+    print("PROBE " + json.dumps(dict(cuda=torch.cuda.is_initialized(), loaded=sorted(
+        m for m in ("agent", "dm_control", "downstream_main", "downstream_trainer", "envs", "exploration_trainer", "matplotlib",
+                    "models", "mujoco") if m in sys.modules))))
+atexit.register(report)
+script, sys.argv = sys.argv[1], sys.argv[1:]
+sys.path.insert(0, str(pathlib.Path(script).parent))
+runpy.run_path(script, run_name="__main__")
+"""
+
+
+def analysis_command(*overrides):
+    return [sys.executable, "-c", ENTRY_POINT_PROBE, str(ROOT / "src/downstream_analysis.py"), *overrides]
+
+
+def test_analysis_entry_point_collects_and_compares_without_gpu_or_training_code(tmp_path):
+    root = tmp_path / "outputs"
+    runs = [synthetic_run(tmp_path, method, steps=(300, 400)) for method in ("uniform", "plan2explore")]
+    before = tree_hashes(*runs)
+    select = ["downstream.task_name=walk", "downstream.seed=0"]
+    for run in runs:
+        result = subprocess.run(analysis_command("downstream.mode=collect", f"analysis.run_dir={run.as_posix()}", *select),
+                                cwd=ROOT, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr[-3000:]
+        assert "Result: 2 milestones" in result.stdout and "Result saved: > " in result.stdout
+        assert 'PROBE {"cuda": false, "loaded": []}' in result.stdout
+    after = tree_hashes(*runs)
+    assert {k: v for k, v in after.items() if "result" not in Path(k).relative_to(root).parts} == before  # sources only read
+    result = subprocess.run(analysis_command("downstream.mode=compare", f"analysis.output_root={root.as_posix()}",
+                                             "analysis.domain=walker", "analysis.exploration_seed=0", *select),
+                            cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "Comparison: uniform, plan2explore | 0 missing results" in result.stdout
+    assert 'PROBE {"cuda": false, "loaded": []}' in result.stdout  # the plots are drawn in their own process
+    assert (root / "comparisons/walker/exploration_seed_0/walk/adaptation_seed_0/task_return.pdf").is_file()
+
+
+@pytest.mark.parametrize("script, mode, expected", [
+    ("downstream_main.py", "collect", "src/downstream_main.py takes downstream.mode=train, resume or evaluate, got 'collect'"),
+    ("downstream_main.py", "compare", "src/downstream_main.py takes downstream.mode=train, resume or evaluate, got 'compare'"),
+    ("downstream_main.py", "other", "src/downstream_main.py takes downstream.mode=train, resume or evaluate, got 'other'"),
+    ("downstream_analysis.py", "train", "src/downstream_analysis.py takes downstream.mode=collect or compare, got 'train'"),
+    ("downstream_analysis.py", "resume", "src/downstream_analysis.py takes downstream.mode=collect or compare, got 'resume'"),
+    ("downstream_analysis.py", "evaluate", "src/downstream_analysis.py takes downstream.mode=collect or compare, got 'evaluate'"),
+    ("downstream_analysis.py", "other", "src/downstream_analysis.py takes downstream.mode=collect or compare, got 'other'")])
+def test_entry_points_reject_each_others_modes_showing_the_right_command(tmp_path, script, mode, expected):
+    command = [sys.executable, str(ROOT / "src" / script), f"downstream.mode={mode}", "downstream.task_name=walk",
+               f"analysis.run_dir={(tmp_path / 'absent').as_posix()}", "common.devices=cpu"]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 1 and expected in result.stderr
+    assert "python src/downstream_analysis.py downstream.mode=collect analysis.run_dir=<exploration run>" in result.stderr
+    assert "python src/downstream_analysis.py downstream.mode=compare analysis.domain=<domain>" in result.stderr
+    if script == "downstream_analysis.py":
+        chosen = mode if mode != "other" else "train"
+        assert f"python src/downstream_main.py downstream.mode={chosen} initialization.milestone_path=" in result.stderr
+    assert not list(tmp_path.iterdir())
+
+
+def test_analysis_arguments_are_required_and_responsibilities_stay_separate(tmp_path):
+    base = ["downstream.task_name=walk", "downstream.seed=0"]
+    with pytest.raises(ValueError, match="downstream.mode=collect needs analysis.run_dir"):
+        analysis_module.analyze(compose("downstream", ["downstream.mode=collect", *base]))
+    with pytest.raises(ValueError, match="downstream.mode=compare needs analysis.domain and analysis.exploration_seed"):
+        analysis_module.analyze(compose("downstream", ["downstream.mode=compare", *base]))
+    run = synthetic_run(tmp_path, "uniform", steps=(300,))
+    shutil.rmtree(run / "downstream")
+    with pytest.raises(ValueError, match="No completed downstream results"):
+        analysis_module.analyze(compose("downstream", ["downstream.mode=collect", f"analysis.run_dir={run.as_posix()}", *base]))
+    # One definition of what training and analysis share; analysis names live in one module only.
+    import data.milestone as milestone_module
+    import exploration_trainer
+    for name in ("RETURN_CONVENTION", "check_evaluation_config", "deterministic_policy_description", "evaluation_path",
+                 "exploration_identity", "method_label"):
+        assert getattr(downstream_module, name) is getattr(milestone_module, name)
+    assert exploration_trainer.method_label is milestone_module.method_label
+    assert exploration_trainer.OUTPUT_LABELS is milestone_module.OUTPUT_LABELS
+    for name in ("analyze", "collect_results", "compare_methods", "plot_comparison", "RESULT_COLUMNS", "THRESHOLDS"):
+        assert not hasattr(downstream_module, name) and not hasattr(downstream_main, name)
+    # Training never needs the analysis module.
+    code = "import sys; import downstream_main; print('downstream_analysis' in sys.modules, 'matplotlib' in sys.modules)"
+    result = subprocess.run([sys.executable, "-c", code], cwd=ROOT / "src", capture_output=True, text=True)
+    assert result.returncode == 0 and result.stdout.strip().endswith("False False"), result.stderr[-2000:]
 
 
 def test_default_wandb_names_identify_the_exploration_run(tmp_path):

@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 import re
@@ -16,7 +15,7 @@ import torch
 from data.milestone import (SUMMARY_FILE, discover_milestones, downstream_output_dir, downstream_summary, load_milestone,
                             milestone_members, read_manifest)
 from utils import device_lines
-from downstream_trainer import DownstreamTrainer, collect_results, compare_methods, evaluate_saved_output, seed_span
+from downstream_trainer import DownstreamTrainer, evaluate_saved_output, seed_span
 from utils import say, setup_visible_cuda_devices
 
 
@@ -33,11 +32,13 @@ BATCH_CHILD_ENV = "LCG_DOWNSTREAM_BATCH_CHILD"
 @hydra.main(config_path="../config", config_name="downstream", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     mode = cfg.downstream.mode
-    if mode not in ("train", "resume", "evaluate", "collect", "compare"):
-        raise ValueError(f"downstream.mode must be train, resume, evaluate, collect or compare, got {mode!r}")
-    if mode in ("collect", "compare"):  # results only (CPU): nothing is trained or evaluated
-        analyze(cfg)
-        return
+    if mode not in ("train", "resume", "evaluate"):
+        raise ValueError(f"src/downstream_main.py takes downstream.mode=train, resume or evaluate, got {mode!r}. Result "
+                         "analysis has its own entry point:\n"
+                         "  python src/downstream_analysis.py downstream.mode=collect analysis.run_dir=<exploration run> "
+                         "downstream.task_name=<task> downstream.seed=<adaptation seed>\n"
+                         "  python src/downstream_analysis.py downstream.mode=compare analysis.domain=<domain> "
+                         "analysis.exploration_seed=<seed> downstream.task_name=<task> downstream.seed=<adaptation seed>")
     milestones_dir = pop_milestones_dir(cfg)
     setup_visible_cuda_devices(cfg.common.devices)  # children inherit it (and set the same value)
     if milestones_dir is not None:
@@ -57,33 +58,6 @@ def main(cfg: DictConfig) -> None:
         evaluate_saved_output(cfg)
     else:
         DownstreamTrainer(cfg, resume=mode == "resume").run()
-
-
-def analyze(cfg: DictConfig) -> None:
-    """collect: one exploration run's result.csv; compare: every method's results of one domain and seed."""
-    a, task, seed = cfg.analysis, cfg.downstream.task_name, cfg.downstream.seed
-    member = OmegaConf.select(cfg, "initialization.member_index", default=0)
-    if cfg.downstream.mode == "collect":
-        if a.run_dir is None:
-            raise ValueError("downstream.mode=collect needs analysis.run_dir=<exploration run folder>")
-        path, rows, missing = collect_results(Path(a.run_dir), task, seed, member, a.protocol)
-        for entry in missing:
-            say(f"Missing: {entry['milestone']} ({entry['train_env_steps']:,} training env steps): {entry['reason']}")
-        if path is None:
-            raise ValueError(f"No completed downstream results in {a.run_dir} for {task}, adaptation seed {seed}, "
-                             f"member {member}")
-        say(f"Result: {len(rows)} milestones ({rows[0]['method']}, {rows[0]['domain']}, exploration seed "
-            f"{rows[0]['exploration_seed']}; {task}, adaptation seed {seed}); {len(missing)} missing")
-        say(f"Result saved: > {path.resolve()}")
-        return
-    if a.domain is None or a.exploration_seed is None:
-        raise ValueError("downstream.mode=compare needs analysis.domain and analysis.exploration_seed")
-    out = compare_methods(Path(a.output_root), a.domain, a.exploration_seed, task, seed, member, a.protocol)
-    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
-    say(f"Comparison: {', '.join(analysis['methods'])} | {len(analysis['missing'])} missing results")
-    for entry in analysis["missing"]:
-        say(f"Missing: {entry}")
-    say(f"Comparison saved: > {out.resolve()}")
 
 
 def pop_milestones_dir(cfg: DictConfig) -> Optional[str]:

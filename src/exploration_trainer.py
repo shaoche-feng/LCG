@@ -18,7 +18,7 @@ from agent import Agent, get_action_space_kwargs
 from utils import normalize_saved_config
 from coroutines.collector import COLLECTION_MODES, CollectorState, make_collector, NumToCollect
 from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
-from data.milestone import milestone_name, publish_milestone, read_manifest, referenced_files
+from data.milestone import OUTPUT_LABELS, method_label, milestone_name, publish_milestone, read_manifest, referenced_files
 from utils import device_lines, physical_gpu_index
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from intrinsic_reward.ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
@@ -1433,21 +1433,9 @@ INTRINSIC_UNITS_NOTE = ("Intrinsic returns are in each method's own units (LCG s
 
 MISSING = object()  # a checkpoint field that older code did not save
 
-# Output folder label of each exploration method (default run folder outputs/<label>/<domain>/seed_<seed>);
-# the keys are the intrinsic_reward.method identifiers (None: intrinsic reward disabled, uniform random).
-OUTPUT_LABELS = {None: "uniform", "lcg": "lcg", "ensemble_disagreement": "full-ensemble",
-                 "laplace_disagreement": "laplace-ensemble", "plan2explore_disagreement": "plan2explore"}
 # What a run folder holds once a run started in it (Hydra's own .hydra/ and main.log come first, and
 # launch scripts may add their logs; neither counts).
 RUN_OUTPUTS = ("checkpoints", "dataset", "milestones", "config", "src", "scripts", "downstream", "result")
-
-
-def method_label(intrinsic_enabled: bool, method: Optional[str]) -> str:
-    """The output label of an exploration configuration (intrinsic_reward.enabled and .method)."""
-    key = (method or "lcg") if intrinsic_enabled else None
-    if key not in OUTPUT_LABELS:
-        raise ValueError(f"Unknown intrinsic_reward.method {method!r}; known: {sorted(k for k in OUTPUT_LABELS if k)}")
-    return OUTPUT_LABELS[key]
 
 
 def default_run_dir(intrinsic_enabled: Any, method: Any, domain: Any, seed: Any) -> str:

@@ -23,6 +23,7 @@ import shutil
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from omegaconf import OmegaConf
 import torch
 
 from .dataset import Dataset
@@ -33,6 +34,12 @@ DENOISER_FILE = "denoiser.pt"
 DATASET_FILE = "dataset.pt"
 MANIFEST_FILE = "manifest.json"
 SUMMARY_FILE = "summary.json"  # a completed downstream output
+RETURN_CONVENTION = ("sum over environment steps of the requested task's reward; each environment step "
+                     "sums the reward of its executed action-repeat substeps")
+# Output folder label of each exploration method (default run folder outputs/<label>/<domain>/seed_<seed>);
+# the keys are the intrinsic_reward.method identifiers (None: intrinsic reward disabled, uniform random).
+OUTPUT_LABELS = {None: "uniform", "lcg": "lcg", "ensemble_disagreement": "full-ensemble",
+                 "laplace_disagreement": "laplace-ensemble", "plan2explore_disagreement": "plan2explore"}
 
 
 def write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -71,6 +78,47 @@ def downstream_summary(output_dir: Path) -> Optional[Dict[str, Any]]:
     """The completion summary (summary.json) of a downstream output; None if it was not completed."""
     path = Path(output_dir) / SUMMARY_FILE
     return read_json(path, "downstream summary") if path.is_file() else None
+
+
+def method_label(intrinsic_enabled: bool, method: Optional[str]) -> str:
+    """The output label of an exploration configuration (intrinsic_reward.enabled and .method)."""
+    key = (method or "lcg") if intrinsic_enabled else None
+    if key not in OUTPUT_LABELS:
+        raise ValueError(f"Unknown intrinsic_reward.method {method!r}; known: {sorted(k for k in OUTPUT_LABELS if k)}")
+    return OUTPUT_LABELS[key]
+
+
+def exploration_identity(run_dir: Path) -> Dict[str, Any]:
+    """Method label, domain and exploration seed of an exploration run, from its saved configuration
+    (config/exploration.yaml), never from folder names."""
+    path = Path(run_dir) / "config" / "exploration.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} is missing: not an exploration run folder")
+    cfg = OmegaConf.load(path)
+    seed = OmegaConf.select(cfg, "common.seed")
+    return dict(method=method_label(bool(OmegaConf.select(cfg, "intrinsic_reward.enabled", default=False)),
+                                    OmegaConf.select(cfg, "intrinsic_reward.method", default=None)),
+                domain=OmegaConf.select(cfg, "env.train.domain_name"), exploration_seed=seed)
+
+
+def check_evaluation_config(c: Any) -> None:
+    seeds = list(c.seeds)
+    if not seeds or not all(isinstance(s, int) for s in seeds) or len(set(seeds)) != len(seeds):
+        raise ValueError(f"evaluation.seeds must be a non-empty list of distinct integers, got {seeds}")
+    if not isinstance(c.max_steps, int) or c.max_steps < 1:
+        raise ValueError(f"evaluation.max_steps must be a positive integer, got {c.max_steps!r}")
+
+
+def deterministic_policy_description(actor_distribution: str) -> str:
+    return {"tanh_gaussian": "deterministic (tanh(mu))", "beta": "deterministic (Beta mean)"}[actor_distribution]
+
+
+def evaluation_path(output_dir: Path, task_name: str, seeds: List[int], max_steps: int,
+                    policy_state: Dict[str, Any]) -> Path:
+    """evaluations/eval_<task>_policy-<weights hash>_protocol-<seeds and step limit hash>.json"""
+    policy = state_sha256({k: v for k, v in policy_state.items() if torch.is_tensor(v)})[:12]
+    protocol = hashlib.sha256(repr(([int(s) for s in seeds], int(max_steps))).encode()).hexdigest()[:12]
+    return Path(output_dir) / "evaluations" / f"eval_{task_name}_policy-{policy}_protocol-{protocol}.json"
 
 
 def milestone_name(num_steps: int) -> str:
