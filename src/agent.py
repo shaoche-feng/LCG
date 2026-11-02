@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from envs import TorchEnv, WorldModelEnv
 from models.pmpo_beta import PMPOBeta, PMPOBetaConfig
+from models.dreamerv3_controller import DreamerV3Controller, DreamerV3ControllerConfig
 from models.diffusion import Denoiser, DenoiserConfig, SigmaDistributionConfig
 from models.rew_end_model import RewEndModel, RewEndModelConfig
 from utils import extract_state_dict
@@ -50,7 +51,10 @@ class Agent(nn.Module):
         super().__init__()
         self.denoiser = Denoiser(cfg.denoiser)
         self.rew_end_model = RewEndModel(cfg.rew_end_model)
-        self.actor_critic = PMPOBeta(cfg.actor_critic)
+        # DreamerV3ControllerConfig selects the DreamerV3-style controller; any other
+        # PMPOBetaConfig keeps the unchanged PMPO path.
+        controller = DreamerV3Controller if isinstance(cfg.actor_critic, DreamerV3ControllerConfig) else PMPOBeta
+        self.actor_critic = controller(cfg.actor_critic)
 
     @property
     def device(self):

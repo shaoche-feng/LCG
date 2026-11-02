@@ -364,7 +364,9 @@ class PromptEnv:
 
 @pytest.mark.parametrize("ending", ["end", "trunc"])
 @pytest.mark.parametrize("length", [2, 4, 6])
-def test_env_loop_seeds_and_resets_imagined_history_from_prompts(length, ending):
+def test_env_loop_repeats_final_prompt_frame_at_imagined_resets(length, ending):
+    """Reviewed repeated-final-frame initialization: an imagined start or reset repeats the
+    prompt's newest frame; older prompt frames condition only the world model."""
     model = make_controller()
     loop = make_env_loop(PromptEnv(length, ending), model, store_policy_observations=True)
     with torch.no_grad():
@@ -373,8 +375,12 @@ def test_env_loop_seeds_and_resets_imagined_history_from_prompts(length, ending)
 
     def shifted(state, value):
         return torch.cat([state[:, 3:], frame(value)], 1)
-    initial0, initial1 = prompt_stack(range(1, 1 + length)), prompt_stack(range(11, 11 + length), padded=1)
-    expected = [[initial0, shifted(initial0, 101), prompt_stack(range(31, 31 + length))],
+    initial0, initial1 = stack([length] * 4), stack([10 + length] * 4)
+    reset0 = stack([30 + length] * 4)
+    # The prompts carry motion (distinct frames): the policy stack is not the real-history stack.
+    assert not torch.equal(initial0, prompt_stack(range(1, 1 + length)))
+    assert not torch.equal(reset0, prompt_stack(range(31, 31 + length)))
+    expected = [[initial0, shifted(initial0, 101), reset0],
                 [initial1, shifted(initial1, 201), shifted(shifted(initial1, 201), 202)]]
     for env in range(2):
         for t in range(3):
@@ -390,7 +396,7 @@ def test_env_loop_seeds_and_resets_imagined_history_from_prompts(length, ending)
 
 
 @pytest.mark.parametrize("length", [2, 4, 6])
-def test_world_model_env_prompts_seed_policy_history_without_extra_draws(length):
+def test_world_model_env_resets_repeat_final_prompt_frame_without_extra_draws(length):
     from types import SimpleNamespace
     from torch.utils.data import DataLoader, IterableDataset
     from envs import WorldModelEnv, WorldModelEnvConfig
@@ -435,8 +441,12 @@ def test_world_model_env_prompts_seed_policy_history_without_extra_draws(length)
 
     assert trunc[:, 1].all() and len(drawn) == 4  # One batch per reset; history adds no draws.
     for env_index in range(2):
-        torch.testing.assert_close(states[env_index, 0][None], prompt_stack(*drawn[env_index]), rtol=0, atol=0)
-        torch.testing.assert_close(states[env_index, 2][None], prompt_stack(*drawn[2 + env_index]), rtol=0, atol=0)
+        for t, k in ((0, env_index), (2, 2 + env_index)):
+            prompt_values, padded = drawn[k]
+            # The prompt's newest frame repeated; the whole stack is checked, not only its last frame.
+            torch.testing.assert_close(states[env_index, t][None], stack([prompt_values[-1]] * 4), rtol=0, atol=0)
+            if length - padded > 1:  # prompt with motion: differs from the real-history stack
+                assert not torch.equal(states[env_index, t][None], prompt_stack(prompt_values, padded))
     torch.testing.assert_close(states[:, 1, :-3], states[:, 0, 3:], rtol=0, atol=0)
     new_frames, _ = infos[1]["prompt"]
     torch.testing.assert_close(infos[1]["burnin_obs"], new_frames[:, :-1], rtol=0, atol=0)

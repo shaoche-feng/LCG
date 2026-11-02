@@ -277,8 +277,9 @@ def normalize_saved_config(cfg: DictConfig) -> DictConfig:
     """
     cfg = deepcopy(cfg)
     agent = cfg.get("agent", cfg)
-    if agent.actor_critic.get("_target_") != "models.pmpo_beta.PMPOBetaConfig":
-        raise ValueError("Only saved PMPO-Beta configurations are supported")
+    if agent.actor_critic.get("_target_") not in ("models.pmpo_beta.PMPOBetaConfig",
+                                                 "models.dreamerv3_controller.DreamerV3ControllerConfig"):
+        raise ValueError("Only saved PMPO-Beta or DreamerV3-style controller configurations are supported")
     # A retained PMPO field may refer to an obsolete loss field. Materialize
     # those values on the copy before deleting their interpolation targets.
     OmegaConf.resolve(cfg)

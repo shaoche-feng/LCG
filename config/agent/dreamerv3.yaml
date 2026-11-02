@@ -1,0 +1,52 @@
+defaults:
+  - default
+  - _self_
+
+# DreamerV3-style actor-critic controller (models/dreamerv3_controller.py): a DreamerV3-style
+# ADAPTATION to the DIAMOND diffusion world model, not an exact DreamerV3 reproduction.
+# Reference: arXiv:2301.04104v2; github.com/danijar/dreamerv3 @ e01491fad6434b2245a3b8ca201dd7faedcc458c.
+# See docs/experiments/dreamerv3_controller.md for the mapping and every adaptation.
+actor_critic:
+  _target_: models.dreamerv3_controller.DreamerV3ControllerConfig
+  img_channels: ${agent.denoiser.inner_model.img_channels}
+  img_size: ${env.train.size}
+  channels: [32,32,64,64]
+  down: [1,1,1,1]
+  frame_stack: 4
+  actor_hidden_dims: [256, 256]
+  value_hidden_dims: [256, 256]
+  # Optimizers unchanged from the Gaussian controller (Adam, 1e-4, global-norm clip 10).
+  actor_lr: 1e-4
+  value_lr: 1e-4
+  # horizon 333 -> discount 1 - 1/333; lambda 0.95 (imag_loss / repl_loss).
+  gamma: 0.997
+  lambda_: 0.95
+  # imag_loss actent.
+  entropy_coef: 3e-4
+  # Kept tanh-transformed Gaussian actor (explicit adaptation).
+  actor_distribution: tanh_gaussian
+  value_bins: 255
+  retnorm_rate: 0.01
+  retnorm_limit: 1.0
+  retnorm_perclo: 5.0
+  retnorm_perchi: 95.0
+  slow_value_rate: 0.02
+  slow_value_every: 1
+  slowreg: 1.0
+  policy_loss_scale: 1.0
+  value_loss_scale: 1.0
+  repval_loss_scale: 0.3
+  # 32 prompts per update = 8 replay segments x 4 consecutive replay starts.
+  replay_starts: 4
+  # PMPO-only fields: alpha_pmpo/beta_kl/fixed_prior/concentration_min are unused by this
+  # controller (no PMPO objective, no reference actor). prior_refresh_interval is used ONLY as the
+  # bounded diagnostic's full-snapshot cadence (every 500 updates), kept equal to Gaussian-PMPO.
+  alpha_pmpo: 0.5
+  beta_kl: 0.0
+  prior_refresh_interval: 500
+  fixed_prior: false
+  concentration_min: 1.0
+  imagination_horizon: ${world_model_env.horizon}
+  max_grad_norm: 10.0
+  seed: ${oc.select:common.seed,0}
+  log_diagnostics: false

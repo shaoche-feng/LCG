@@ -267,7 +267,8 @@ class PMPORunDiagnostic:
         beta_actor = "alpha_max" in row
         if beta_actor and max(row["alpha_max"], row["beta_max"]) > 1e4:
             reason = "Beta concentration exceeded 10000"
-        if row["kl_prior"] > 10:
+        # PMPO only: the DreamerV3-style controller has no reference policy and logs no kl_prior.
+        if "kl_prior" in row and row["kl_prior"] > 10:
             reason = "Policy KL exceeded 10 nats"
         if max(row["value_abs_max"], row["return_abs_max"]) > 1e6:
             reason = "Value or lambda-return magnitude exceeded 1e6"

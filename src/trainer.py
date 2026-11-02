@@ -145,7 +145,8 @@ class Trainer(StateDictMixin):
 
         def build_opt(name: str):
             if name == "actor_critic":
-                return PMPOOptimizers(self.agent.actor_critic, cfg.actor_critic.training.lr_warmup_steps)
+                optimizers = getattr(self.agent.actor_critic, "optimizers_class", PMPOOptimizers)
+                return optimizers(self.agent.actor_critic, cfg.actor_critic.training.lr_warmup_steps)
             return configure_opt(getattr(self.agent, name), **getattr(cfg, name).optimizer)
 
         def build_lr_sched(name: str):
