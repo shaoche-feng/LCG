@@ -59,6 +59,14 @@ class PMPOBetaConfig:
     max_grad_norm: float = 10.0
     seed: int = 0
     log_diagnostics: bool = False
+    # Experiment (stage3-gaussian-h10-emacritic): slow EMA critic regularization adapted to the scalar
+    # critic. With slow_critic_coef > 0 an EMA copy of the critic (outside the optimizer, no gradients)
+    # is kept, value_loss += slow_critic_coef * MSE(V(s), sg(V_slow(s))) on the same states and mean
+    # reduction, and after every critic optimizer step slow = (1 - rate) * slow + rate * online.
+    # The ONLINE critic still provides lambda-return bootstraps and advantages. 0.0 (default) creates
+    # no EMA critic and leaves the learning path, state_dict and checkpoints unchanged.
+    slow_critic_coef: float = 0.0
+    slow_critic_rate: float = 0.02
 
 
 GAUSSIAN_STD_MIN, GAUSSIAN_STD_SPAN = 0.1, 0.9
@@ -145,6 +153,8 @@ class PMPOBeta(nn.Module):
             raise ValueError("Invalid discount, lambda, or PMPO mixing coefficient")
         if min(cfg.concentration_min, cfg.actor_lr, cfg.value_lr, cfg.max_grad_norm) <= 0:
             raise ValueError("Concentration floor, learning rates and gradient clip must be positive")
+        if cfg.slow_critic_coef < 0 or not 0 < cfg.slow_critic_rate <= 1:
+            raise ValueError("Invalid slow critic coefficient or EMA rate")
         if cfg.beta_kl < 0 or cfg.entropy_coef < 0 or cfg.prior_refresh_interval < 1 or cfg.imagination_horizon < 1:
             raise ValueError("Invalid KL/entropy coefficient or rollout/block length")
         if cfg.actor_distribution not in ("beta", "tanh_gaussian"):
@@ -167,6 +177,9 @@ class PMPOBeta(nn.Module):
         # can distinguish local (per-block) trust-region movement from total cumulative
         # drift over the whole run. Never read by the loss.
         self.initial_actor = deepcopy(self.actor).requires_grad_(False).eval()
+        if cfg.slow_critic_coef > 0:
+            # Exact copy of the freshly initialized online critic; never optimized (no gradients).
+            self.slow_value = deepcopy(self.value).requires_grad_(False)
         self.intrinsic_reward_fn = None
         self.rl_env = None
         self._fixed_obs = None
@@ -276,6 +289,14 @@ class PMPOBeta(nn.Module):
         require_finite(log_probability=logp, entropy=entropy)
         return logp, entropy
 
+    @torch.no_grad()
+    def update_slow_critic(self):
+        """slow = (1 - rate) * slow + rate * online, over every floating-point tensor of the critic."""
+        rate = self.cfg.slow_critic_rate
+        for slow, online in zip(self.slow_value.state_dict().values(), self.value.state_dict().values()):
+            if slow.is_floating_point():
+                slow.mul_(1 - rate).add_(online, alpha=rate)
+
     def predict_act_value(self, obs):
         if obs.ndim != 4 or obs.shape[1] != self.cfg.img_channels * self.frame_stack:
             raise ValueError("PMPO requires the exact channel-concatenated four-frame state")
@@ -331,18 +352,30 @@ class PMPOBeta(nn.Module):
         entropy_loss = -c.entropy_coef * entropy.mean()
         actor_loss = pmpo_raw_loss + kl_loss + entropy_loss
         value_loss = F.mse_loss(values, targets.flatten())
+        slow_metrics = {}
+        if c.slow_critic_coef > 0:
+            with torch.no_grad():
+                slow_values = self.slow_value(flat_obs).squeeze(-1)
+            slowreg_loss = F.mse_loss(values, slow_values)  # same states, same mean reduction
+            slow_metrics = dict(loss_value_target=value_loss.detach(), loss_slowreg=slowreg_loss.detach(),
+                                slow_value_mean=slow_values.mean(), slow_value_gap=(values.detach() - slow_values).abs().mean())
+            value_loss = value_loss + c.slow_critic_coef * slowreg_loss
         require_finite(targets=targets, values=values, kl=kl, actor_loss=actor_loss, value_loss=value_loss)
         metrics = self.diagnostics(raw.detach(), act.flatten(0, 1), logp.detach(), entropy.detach())
         metrics.update(loss_actor=actor_loss.detach(), loss_value=value_loss.detach(), kl_prior=kl.mean().detach(),
                        kl_initial=kl_initial.mean().detach(),
                        loss_pmpo_raw=pmpo_raw_loss.detach(), loss_entropy=entropy_loss.detach(),
                        loss_actor_total=actor_loss.detach(),
+                       **slow_metrics,
                        value_mean=values.mean().detach(), value_std=values.std(unbiased=False).detach(),
                        return_mean=targets.mean(), return_std=targets.std(unbiased=False),
                        positive_fraction=(advantage >= 0).float().mean(), negative_fraction=(advantage < 0).float().mean(),
                        rollout_length=float(obs.shape[1]), all_finite=1.0)
         with torch.no_grad():
             metrics.update(summary_statistics(advantage, "advantage"))
+            # Diagnostic (component swap): distributions of the imagined lambda-returns and critic values; monitoring only.
+            metrics.update(summary_statistics(targets, "lambda_return_dist"))
+            metrics.update(summary_statistics(values.detach(), "value_dist"))
             pos = advantage.flatten() >= 0
             pos_logp = logp.detach().masked_fill(~pos, 0).sum() / pos.sum().clamp_min(1)
             neg_logp = logp.detach().masked_fill(pos, 0).sum() / (~pos).sum().clamp_min(1)
@@ -457,6 +490,8 @@ class PMPOOptimizers:
             metrics[f"{name}_grad_norm"] = norm.detach()
         self.actor.step()
         self.value.step()
+        if getattr(self.model, "slow_value", None) is not None:
+            self.model.update_slow_critic()  # after the critic optimizer step
         for name in ("actor", "value"):
             require_finite(**{f"{name}.{key}": p for key, p in getattr(self.model, name).named_parameters()})
         self.model.updates.add_(1)
