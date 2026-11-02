@@ -38,3 +38,11 @@ actor_critic:
   max_grad_norm: 10.0
   seed: ${oc.select:common.seed,0}
   log_diagnostics: false
+  # Experiment (stage3-gaussian-h10-emacritic): slow EMA critic regularization; 0.0 = disabled
+  # (no EMA critic, original learning path). See PMPOBetaConfig.
+  slow_critic_coef: 0.0
+  slow_critic_rate: 0.02
+  # Experiment (stage3-gaussian-h10-twohot-emacritic): critic output, "scalar" (default, original MSE
+  # critic) or "twohot" (DreamerV3-style 255-bin distributional critic). See PMPOBetaConfig.
+  value_head: scalar
+  value_bins: 255

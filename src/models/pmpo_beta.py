@@ -13,6 +13,7 @@ from torch.distributions import Beta, Normal, kl_divergence
 from torch.nn import functional as F
 
 from .actor_critic import ActorCriticEncoder, ActorCriticOutput, compute_lambda_returns
+from .twohot import symexp_bins, twohot_loss, twohot_mean
 from coroutines.env_loop import make_env_loop
 from envs import WorldModelEnv
 
@@ -59,6 +60,23 @@ class PMPOBetaConfig:
     max_grad_norm: float = 10.0
     seed: int = 0
     log_diagnostics: bool = False
+    # Experiment (stage3-gaussian-h10-emacritic): slow EMA critic regularization adapted to the scalar
+    # critic. With slow_critic_coef > 0 an EMA copy of the critic (outside the optimizer, no gradients)
+    # is kept, value_loss += slow_critic_coef * MSE(V(s), sg(V_slow(s))) on the same states and mean
+    # reduction, and after every critic optimizer step slow = (1 - rate) * slow + rate * online.
+    # The ONLINE critic still provides lambda-return bootstraps and advantages. 0.0 (default) creates
+    # no EMA critic and leaves the learning path, state_dict and checkpoints unchanged.
+    slow_critic_coef: float = 0.0
+    slow_critic_rate: float = 0.02
+    # Experiment (stage3-gaussian-h10-twohot-emacritic): critic output. "scalar" (default) is the original
+    # one-output MSE critic, unchanged. "twohot" is a DreamerV3-style distributional critic over value_bins
+    # symexp-spaced bins (models/twohot.py): trained by two-hot cross-entropy on the detached lambda-return
+    # targets, decoded to its expected scalar value for lambda-returns, bootstraps and advantages. With
+    # slow_critic_coef > 0 the EMA regularizer follows the reviewed Dreamer rule: + coef * CE(logits,
+    # twohot(sg(decoded slow-critic value))) on the same states, mean over states. The two-hot output layer starts
+    # at zero (uniform bins, decoded value exactly 0); encoder and hidden layers match the scalar critic's init.
+    value_head: str = "scalar"
+    value_bins: int = 255
 
 
 GAUSSIAN_STD_MIN, GAUSSIAN_STD_SPAN = 0.1, 0.9
@@ -145,6 +163,10 @@ class PMPOBeta(nn.Module):
             raise ValueError("Invalid discount, lambda, or PMPO mixing coefficient")
         if min(cfg.concentration_min, cfg.actor_lr, cfg.value_lr, cfg.max_grad_norm) <= 0:
             raise ValueError("Concentration floor, learning rates and gradient clip must be positive")
+        if cfg.slow_critic_coef < 0 or not 0 < cfg.slow_critic_rate <= 1:
+            raise ValueError("Invalid slow critic coefficient or EMA rate")
+        if cfg.value_head not in ("scalar", "twohot") or cfg.value_bins < 3:
+            raise ValueError("Invalid critic head or value bins")
         if cfg.beta_kl < 0 or cfg.entropy_coef < 0 or cfg.prior_refresh_interval < 1 or cfg.imagination_horizon < 1:
             raise ValueError("Invalid KL/entropy coefficient or rollout/block length")
         if cfg.actor_distribution not in ("beta", "tanh_gaussian"):
@@ -160,13 +182,33 @@ class PMPOBeta(nn.Module):
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
         stacked_cfg = replace(cfg, img_channels=cfg.img_channels * cfg.frame_stack)
         self.actor = VisualHead(stacked_cfg, cfg.actor_hidden_dims, 2 * cfg.continuous_action_dim)
-        self.value = VisualHead(stacked_cfg, cfg.value_hidden_dims, 1)
+        if cfg.value_head == "twohot":
+            # Same construction with value_bins outputs. The encoder and hidden layers draw exactly what the scalar
+            # head would (identical trunk initialization), and the global RNG is left exactly where the scalar head
+            # would leave it, so nothing built or sampled afterwards changes for the same seed.
+            start = torch.random.get_rng_state()
+            VisualHead(stacked_cfg, cfg.value_hidden_dims, 1)
+            after = torch.random.get_rng_state()
+            torch.random.set_rng_state(start)
+            self.value = VisualHead(stacked_cfg, cfg.value_hidden_dims, cfg.value_bins)
+            torch.random.set_rng_state(after)
+            # Output layer only: zero weight and bias (reviewed Dreamer rule, heads.py value outscale 0.0), so the
+            # bins start uniform and the decoded value is exactly 0. VisualHead's small-normal output convention
+            # (std 0.01) decodes to ~1e4-1e5 here because the symexp bins reach +-4.85e8.
+            nn.init.zeros_(self.value.head[-1].weight)
+            nn.init.zeros_(self.value.head[-1].bias)
+            self.register_buffer("value_bin_locations", symexp_bins(cfg.value_bins), persistent=False)
+        else:
+            self.value = VisualHead(stacked_cfg, cfg.value_hidden_dims, 1)
         self.prior_actor = deepcopy(self.actor).requires_grad_(False).eval()
         # Diagnostic only (see pmpo_diagnostic.py): a SEPARATE frozen snapshot from
         # prior_actor, taken once here and never refreshed, so KL(current || initial)
         # can distinguish local (per-block) trust-region movement from total cumulative
         # drift over the whole run. Never read by the loss.
         self.initial_actor = deepcopy(self.actor).requires_grad_(False).eval()
+        if cfg.slow_critic_coef > 0:
+            # Exact copy of the freshly initialized online critic; never optimized (no gradients).
+            self.slow_value = deepcopy(self.value).requires_grad_(False)
         self.intrinsic_reward_fn = None
         self.rl_env = None
         self._fixed_obs = None
@@ -276,10 +318,24 @@ class PMPOBeta(nn.Module):
         require_finite(log_probability=logp, entropy=entropy)
         return logp, entropy
 
+    @torch.no_grad()
+    def update_slow_critic(self):
+        """slow = (1 - rate) * slow + rate * online, over every floating-point tensor of the critic."""
+        rate = self.cfg.slow_critic_rate
+        for slow, online in zip(self.slow_value.state_dict().values(), self.value.state_dict().values()):
+            if slow.is_floating_point():
+                slow.mul_(1 - rate).add_(online, alpha=rate)
+
+    def value_from_output(self, out):
+        """Scalar value from the critic's output: the scalar head itself, or the two-hot expectation."""
+        if self.cfg.value_head == "twohot":
+            return twohot_mean(out, self.value_bin_locations)
+        return out.squeeze(-1)
+
     def predict_act_value(self, obs):
         if obs.ndim != 4 or obs.shape[1] != self.cfg.img_channels * self.frame_stack:
             raise ValueError("PMPO requires the exact channel-concatenated four-frame state")
-        return ActorCriticOutput(self.actor(obs), self.value(obs).squeeze(-1))
+        return ActorCriticOutput(self.actor(obs), self.value_from_output(self.value(obs)))
 
     def setup_training(self, rl_env):
         if not isinstance(rl_env, WorldModelEnv):
@@ -317,7 +373,8 @@ class PMPOBeta(nn.Module):
         advantage = targets - old_values
         flat_obs = obs.flatten(0, 1).detach()
         raw = self.actor(flat_obs)
-        values = self.value(flat_obs).squeeze(-1)
+        value_out = self.value(flat_obs)
+        values = self.value_from_output(value_out)
         logp, entropy = self.log_prob_and_entropy(raw, act.flatten(0, 1))
         dist = self.distribution(raw)
         with torch.no_grad():
@@ -330,13 +387,38 @@ class PMPOBeta(nn.Module):
         kl_loss = c.beta_kl * kl.mean()
         entropy_loss = -c.entropy_coef * entropy.mean()
         actor_loss = pmpo_raw_loss + kl_loss + entropy_loss
-        value_loss = F.mse_loss(values, targets.flatten())
+        twohot = c.value_head == "twohot"
+        if twohot:  # cross-entropy against the two-hot encoding of the detached lambda-return
+            value_loss = twohot_loss(value_out, targets.flatten().detach(), self.value_bin_locations).mean()
+        else:
+            value_loss = F.mse_loss(values, targets.flatten())
+        slow_metrics = {}
+        if c.slow_critic_coef > 0:
+            with torch.no_grad():
+                slow_values = self.value_from_output(self.slow_value(flat_obs))
+            if twohot:  # reviewed Dreamer rule: CE against twohot(sg(slow-critic expected value))
+                slowreg_loss = twohot_loss(value_out, slow_values, self.value_bin_locations).mean()
+            else:
+                slowreg_loss = F.mse_loss(values, slow_values)  # same states, same mean reduction
+            slow_metrics = dict(loss_value_target=value_loss.detach(), loss_slowreg=slowreg_loss.detach(),
+                                slow_value_mean=slow_values.mean(), slow_value_gap=(values.detach() - slow_values).abs().mean())
+            value_loss = value_loss + c.slow_critic_coef * slowreg_loss
         require_finite(targets=targets, values=values, kl=kl, actor_loss=actor_loss, value_loss=value_loss)
+        twohot_metrics = {}
+        if twohot:
+            with torch.no_grad():
+                lo, hi = self.value_bin_locations[0], self.value_bin_locations[-1]
+                err = values.detach() - targets.flatten()  # original return units
+                twohot_metrics = dict(value_target_abs_error=err.abs().mean(), value_target_rmse=err.square().mean().sqrt(),
+                                      target_clip_fraction=((targets < lo) | (targets > hi)).float().mean())
+                if c.slow_critic_coef > 0:
+                    twohot_metrics["slow_target_clip_fraction"] = ((slow_values < lo) | (slow_values > hi)).float().mean()
         metrics = self.diagnostics(raw.detach(), act.flatten(0, 1), logp.detach(), entropy.detach())
         metrics.update(loss_actor=actor_loss.detach(), loss_value=value_loss.detach(), kl_prior=kl.mean().detach(),
                        kl_initial=kl_initial.mean().detach(),
                        loss_pmpo_raw=pmpo_raw_loss.detach(), loss_entropy=entropy_loss.detach(),
                        loss_actor_total=actor_loss.detach(),
+                       **slow_metrics, **twohot_metrics,
                        value_mean=values.mean().detach(), value_std=values.std(unbiased=False).detach(),
                        return_mean=targets.mean(), return_std=targets.std(unbiased=False),
                        positive_fraction=(advantage >= 0).float().mean(), negative_fraction=(advantage < 0).float().mean(),
@@ -457,6 +539,8 @@ class PMPOOptimizers:
             metrics[f"{name}_grad_norm"] = norm.detach()
         self.actor.step()
         self.value.step()
+        if getattr(self.model, "slow_value", None) is not None:
+            self.model.update_slow_critic()  # after the critic optimizer step
         for name in ("actor", "value"):
             require_finite(**{f"{name}.{key}": p for key, p in getattr(self.model, name).named_parameters()})
         self.model.updates.add_(1)
