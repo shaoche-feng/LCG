@@ -16,7 +16,7 @@ pygame==2.5.2
 torch==2.7.1
 torcheval==0.0.7
 tqdm==4.66.4
-wandb==0.17.0
+wandb==0.30.0
 
 # DM Control Suite support (see README's "DM Control Suite support" section).
 # mujoco is pulled in automatically by dm_control but pinned here for reproducibility.
