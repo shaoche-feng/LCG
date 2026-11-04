@@ -10,7 +10,7 @@ experiments
 checkpoints
 saved_runs
 dataset
-docs
+docs/changes
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
