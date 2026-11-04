@@ -1,5 +1,5 @@
-"""Step 6 LCG preset: resolved settings, shared schedules with the uniform preset, fixed
-reward scaling in the trainer, and resume refusing a switched scaling."""
+"""LCG preset: selected reference scaling and policy schedule, shared environment/model
+settings, fixed and reference reward integration, and resume compatibility."""
 import pytest
 import torch
 from hydra.utils import instantiate
@@ -25,9 +25,10 @@ def test_walker_lcg_100k_preset_resolves_the_agreed_settings():
     assert (lcg.theta_s.expected_num_tensors, lcg.theta_s.expected_dim) == (10, 217_664)
     assert (lcg.candidate_num_mc, lcg.candidate_chunk_size) == (5, 32)
     assert (lcg.precision_reference_size, lcg.precision_num_mc, lcg.damping, lcg.beta) == (320, 3, 1e-4, 1.0)
-    assert lcg.reward_scaling_settings() == dict(mode="fixed", fixed_divisor=100.0)
-    # Everything but the method matches the uniform preset: budget, schedules, milestones,
-    # diagnostics, models.
+    assert lcg.reward_scaling_settings() == dict(mode="reference", reference_num_prompts=32)
+    assert (cfg.actor_critic.training.steps_first_epoch, cfg.actor_critic.training.steps_per_epoch) == (200, 200)
+    # The environment, replay budget, denoiser schedule, milestones and models match uniform.
+    # LCG's selected policy schedule and objective are explicit differences.
     uniform = compose(["+experiment=walker_uniform_100k"])
     OmegaConf.resolve(uniform)
     for key in SHARED:
@@ -37,6 +38,9 @@ def test_walker_lcg_100k_preset_resolves_the_agreed_settings():
         if key == "agent":  # uniform trains no policy; LCG's exploration objective is advantage-weighted
             assert a["actor_critic"].pop("actor_objective") == "advantage_weighted"
             b["actor_critic"].pop("actor_objective")
+        if key == "actor_critic":
+            assert (a["training"].pop("steps_first_epoch"), a["training"].pop("steps_per_epoch")) == (200, 200)
+            assert (b["training"].pop("steps_first_epoch"), b["training"].pop("steps_per_epoch")) == (5000, 400)
         assert a == b, key
     assert (uniform.collection.train.mode, cfg.common.seed) == ("uniform", uniform.common.seed)
     # The Gaussian H10 EMA-critic controller of the reference H10 runs.
@@ -115,3 +119,82 @@ def test_resume_refuses_switched_reward_scaling(tmp_path, monkeypatch):
     resumed, _ = start(tmp_path / "run", monkeypatch, [], resume=True)  # unchanged settings resume
     resumed._run()
     assert resumed.epoch == 2 and resumed.agent.actor_critic.updates.item() == 3
+
+
+REFERENCE = ["intrinsic_reward.reward_scaling=reference", "intrinsic_reward.fixed_divisor=null",
+             "intrinsic_reward.reference_num_prompts=3", "intrinsic_reward.rms_enabled=false"]
+
+
+def test_reference_is_calibrated_once_before_policy_updates_and_frozen_for_evaluation(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from intrinsic_reward.lcg import LCGLifecycle
+    from test_test_diagnostics import same
+    from utils import rng_state
+
+    calibrations, updates = {}, []
+    calibrate, scale = LCGLifecycle.calibrate, LCGLifecycle.scale
+
+    def calibrated(self, scores):
+        assert self.needs_reference and self.round_id not in calibrations
+        assert scores.numel() == 3 * 2  # prompts times the configured world-model horizon
+        calibrate(self, scores)
+        calibrations[self.round_id] = float(scores.double().mean())
+        assert self.reward_divisor == calibrations[self.round_id]
+
+    def scaled(self, raw):
+        assert self.reward_divisor == calibrations[self.round_id]
+        result = scale(self, raw)
+        torch.testing.assert_close(result, raw / calibrations[self.round_id], rtol=0, atol=0)
+        updates.append(self.round_id)
+        return result
+
+    monkeypatch.setattr(LCGLifecycle, "calibrate", calibrated)
+    monkeypatch.setattr(LCGLifecycle, "scale", scaled)
+    trainer, logs = run_trainer(tmp_path, monkeypatch, [*COLLECT, *REFERENCE])
+    assert sorted(calibrations) == [1, 2] and updates == [1, 1, 2]
+    lifecycle = trainer._lcg_lifecycle
+    assert lifecycle.rms is None
+    state, random = deepcopy(lifecycle.state_dict()), rng_state()
+    monitoring = lifecycle.last_raw, lifecycle.last_scaled, lifecycle.scoring_seconds
+    episode = trainer.train_dataset.load_episode(0)
+    raw, reward = trainer._intrinsic.score_episode(episode)
+    torch.testing.assert_close(reward, raw / lifecycle.reward_divisor, rtol=0, atol=0)
+    assert same(state, lifecycle.state_dict()) and same(random, rng_state())
+    assert same(monitoring, (lifecycle.last_raw, lifecycle.last_scaled, lifecycle.scoring_seconds))
+    assert sorted(calibrations) == [1, 2]  # evaluation never calibrates or refreshes
+    assert {r["lcg/reward_divisor"] for r in logs if "lcg/reward_divisor" in r} == set(calibrations.values())
+
+
+def test_reference_resume_restores_frozen_divisor_and_refuses_changed_settings(tmp_path, monkeypatch):
+    from exploration_trainer import ExplorationTrainer
+    from intrinsic_reward.lcg import LCGLifecycle
+    from test_test_diagnostics import same
+    original = ExplorationTrainer.train_agent
+
+    def crash(self):
+        if self.epoch == 2:
+            raise Crash()
+        return original(self)
+
+    monkeypatch.setattr(ExplorationTrainer, "train_agent", crash)
+    trainer, _ = start(tmp_path / "run", monkeypatch, BASE + REFERENCE + ["evaluation.should=false"])
+    with pytest.raises(Crash):
+        trainer._run()
+    expected = trainer._lcg_lifecycle.state_dict()
+    monkeypatch.undo()
+    for overrides in (["intrinsic_reward.reference_num_prompts=4"],
+                      ["intrinsic_reward.reward_scaling=fixed", "intrinsic_reward.fixed_divisor=100",
+                       "intrinsic_reward.reference_num_prompts=null"]):
+        with pytest.raises(ValueError, match="a resume must not switch it"):
+            start(tmp_path / "run", monkeypatch, overrides, resume=True)
+    with pytest.raises(ValueError, match="controller"):
+        start(tmp_path / "run", monkeypatch,
+              ["world_model_env.horizon=3", "agent.actor_critic.imagination_horizon=3"], resume=True)
+    monkeypatch.setattr(LCGLifecycle, "refresh", lambda *a, **kw: pytest.fail("resume refreshed the scorer"))
+    monkeypatch.setattr(LCGLifecycle, "calibrate", lambda *a, **kw: pytest.fail("resume recalibrated the divisor"))
+    monkeypatch.setattr(ExplorationTrainer, "lcg_reference_scores", lambda *a: pytest.fail("resume imagined new references"))
+    restored, _ = start(tmp_path / "run", monkeypatch, [], resume=True)
+    assert same(expected, restored._lcg_lifecycle.state_dict())
+    raw = torch.tensor([1., 2.])
+    torch.testing.assert_close(restored._lcg_lifecycle.scale_frozen(raw), raw / expected["reward_divisor"], rtol=0, atol=0)
+    assert not restored._lcg_lifecycle.needs_reference

@@ -214,6 +214,25 @@ class WorldModelEnv:
         return self.obs_buffer[:, -1], rew, end, trunc, info
 
     @torch.no_grad()
+    def imagine_candidates(self, obs: Tensor, act: Tensor, actions: Tensor) -> List[ImaginedCandidate]:
+        """Open-loop imagination from given prompts, outside the env's own rollout: obs
+        (b, t, C, H, W) and act (b, t, A) prompt windows, actions (horizon, b, A), one per step.
+        Each step's candidate is what step() reports with return_imagined_candidate=True: the
+        window the sampler was conditioned on (with the step's action) and its prediction.
+        Single-denoiser sampler and the global RNG; the env's buffers and prompt stream are
+        untouched (used for LCG's reference rollouts, not by PMPO)."""
+        obs_buffer, act_buffer = obs.clone(), act.clone()
+        candidates = []
+        for step_act in actions:
+            act_buffer[:, -1] = step_act
+            next_obs = self.sampler.sample(obs_buffer, act_buffer)[0]
+            candidates.append(ImaginedCandidate(obs_buffer.clone(), act_buffer.clone(), next_obs.clone()))
+            obs_buffer = obs_buffer.roll(-1, dims=1)
+            act_buffer = act_buffer.roll(-1, dims=1)
+            obs_buffer[:, -1] = next_obs
+        return candidates
+
+    @torch.no_grad()
     def predict_next_obs(self) -> Tuple[Tensor, List[Tensor]]:
         if self.ensemble_samplers is None and self.member_predictor is None:
             return self.sampler.sample(self.obs_buffer, self.act_buffer)

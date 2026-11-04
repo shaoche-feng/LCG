@@ -30,13 +30,23 @@ class LCGConfig:
     rms_ema_decay: float = 0.99
     rms_eps: float = 1e-8
     # Policy reward from the raw LCG score: "rms" (RunningRMS), "fixed" (raw / fixed_divisor,
-    # nothing else) or "none" (raw). None: the meaning before this field existed, i.e. "rms"
-    # if rms_enabled else "none". An explicit mode must agree with rms_enabled.
+    # nothing else), "none" (raw), or one of two per-round divisors that keep the reward's scale
+    # steady as h_D grows with the replay (frozen for the round, like h_D):
+    #   "data_scaled": raw / fixed_divisor * N / data_reference_steps, N the replay size at the
+    #     refresh (h_D grows about linearly in N; at N = data_reference_steps this is "fixed");
+    #   "reference": raw / (mean raw score of reference_num_prompts imagined uniform-action
+    #     rollouts of this round's denoiser, scored by this round's scorer; see calibrate()).
+    # None: the meaning before this field existed, i.e. "rms" if rms_enabled else "none". An
+    # explicit mode must agree with rms_enabled.
     reward_scaling: Optional[str] = None
     fixed_divisor: Optional[float] = None
+    data_reference_steps: Optional[int] = None
+    reference_num_prompts: Optional[int] = None
     theta_s: ThetaSConfig = field(kw_only=True)  # which parameters belong to theta_S -- see config/intrinsic_reward/lcg.yaml
 
     def __post_init__(self) -> None:
+        if not isinstance(self.rms_enabled, bool):
+            raise ValueError(f"rms_enabled must be a boolean, got {self.rms_enabled!r}")
         legacy = "rms" if self.rms_enabled else "none"
         if self.reward_scaling is None:
             self.reward_scaling = legacy
@@ -45,12 +55,20 @@ class LCGConfig:
         if (self.reward_scaling == "rms") != bool(self.rms_enabled):
             raise ValueError(f"reward_scaling={self.reward_scaling} conflicts with rms_enabled={self.rms_enabled}; "
                              f"set rms_enabled={self.reward_scaling == 'rms'}")
-        if self.reward_scaling == "fixed":
+        if self.reward_scaling in ("fixed", "data_scaled"):
             d = self.fixed_divisor
-            if isinstance(d, bool) or not isinstance(d, (int, float)) or not math.isfinite(d) or d <= 0:
+            if not _positive_finite_number(d):
                 raise ValueError(f"fixed_divisor must be a finite positive number, got {d!r}")
         elif self.fixed_divisor is not None:
-            raise ValueError(f"fixed_divisor is used only with reward_scaling=fixed, got {self.fixed_divisor!r}")
+            raise ValueError(f"fixed_divisor is used only with reward_scaling=fixed or data_scaled, "
+                             f"got {self.fixed_divisor!r}")
+        for name, mode in (("data_reference_steps", "data_scaled"), ("reference_num_prompts", "reference")):
+            value = getattr(self, name)
+            if self.reward_scaling == mode:
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer with reward_scaling={mode}, got {value!r}")
+            elif value is not None:
+                raise ValueError(f"{name} is used only with reward_scaling={mode}, got {value!r}")
         assert self.precision_reference_size > 0, (
             f"precision_reference_size must be > 0, got {self.precision_reference_size}"
         )
@@ -62,21 +80,27 @@ class LCGConfig:
         assert self.candidate_chunk_size > 0, f"candidate_chunk_size must be > 0, got {self.candidate_chunk_size}"
         assert self.damping > 0, f"damping must be > 0, got {self.damping}"
         if self.rms_enabled:
-            assert self.rms_alpha > 0, f"rms_alpha must be > 0, got {self.rms_alpha}"
-            assert 0.0 <= self.rms_ema_decay < 1.0, f"rms_ema_decay must be in [0, 1), got {self.rms_ema_decay}"
-            assert self.rms_eps > 0, f"rms_eps must be > 0, got {self.rms_eps}"
+            assert _positive_finite_number(self.rms_alpha), f"rms_alpha must be finite and > 0, got {self.rms_alpha!r}"
+            assert (not isinstance(self.rms_ema_decay, bool) and isinstance(self.rms_ema_decay, (int, float))
+                    and math.isfinite(self.rms_ema_decay) and 0 <= self.rms_ema_decay < 1), (
+                f"rms_ema_decay must be finite and in [0, 1), got {self.rms_ema_decay!r}")
+            assert _positive_finite_number(self.rms_eps), f"rms_eps must be finite and > 0, got {self.rms_eps!r}"
 
     def reward_scaling_settings(self) -> Dict:
         """What turns raw LCG scores into policy reward; a resume must not change it."""
         settings = dict(mode=self.reward_scaling)
-        if self.reward_scaling == "fixed":
+        if self.reward_scaling in ("fixed", "data_scaled"):
             settings["fixed_divisor"] = float(self.fixed_divisor)
+        if self.reward_scaling == "data_scaled":
+            settings["data_reference_steps"] = int(self.data_reference_steps)
+        if self.reward_scaling == "reference":
+            settings["reference_num_prompts"] = int(self.reference_num_prompts)
         if self.reward_scaling == "rms":
             settings.update(alpha=self.rms_alpha, ema_decay=self.rms_ema_decay, eps=self.rms_eps)
         return settings
 
 
-REWARD_SCALINGS = ("rms", "fixed", "none")
+REWARD_SCALINGS = ("rms", "fixed", "none", "data_scaled", "reference")
 
 
 class LCGLifecycle:
@@ -110,6 +134,10 @@ class LCGLifecycle:
         self.h_D_inv_sqrt: Optional[Tensor] = None
         self.bank = None
         self.rms: Optional[RunningRMS] = None
+        # data_scaled / reference: this round's divisor (frozen for the round, checkpointed); the
+        # reference mode's mean raw reference score is kept for monitoring.
+        self.reward_divisor: Optional[float] = None
+        self.reference_raw_mean: Optional[float] = None
         self.intrinsic_reward_fn = None
         # Monitoring only: the last scored batch (raw and policy reward) and timings.
         self.last_raw: Optional[Tensor] = None
@@ -139,6 +167,13 @@ class LCGLifecycle:
             num_samples=self.cfg.candidate_num_mc, seed=seed + 1_000_000,
         )
         self.rms = self._new_rms()
+        self.reward_divisor = self.reference_raw_mean = None
+        if self.cfg.reward_scaling == "data_scaled":
+            self.reward_divisor = self.cfg.fixed_divisor * (self.cfg.data_reference_steps / dataset.num_steps)
+            if not _positive_finite_number(self.reward_divisor):
+                raise ValueError(f"data_scaled produced an invalid reward divisor: {self.reward_divisor!r}")
+        # reference: the caller imagines this round's reference rollouts and passes their scores
+        # to calibrate() before PMPO; the hook refuses to score until then.
 
         if self.verbose:
             print(
@@ -197,6 +232,28 @@ class LCGLifecycle:
 
         return hook
 
+    @property
+    def needs_reference(self) -> bool:
+        """reference mode after a refresh: this round's divisor awaits calibrate()."""
+        return self.cfg.reward_scaling == "reference" and self.ready and self.reward_divisor is None
+
+    def calibrate(self, reference_raw: Tensor) -> None:
+        """reference mode: this round's divisor is the mean raw score of its reference rollouts
+        (imagined uniform-action transitions of this round's denoiser, scored by this round's
+        precision and bank). Called once per refresh, before PMPO; frozen for the round."""
+        if self.cfg.reward_scaling != "reference":
+            raise RuntimeError(f"calibrate() is for reward_scaling=reference, not {self.cfg.reward_scaling}")
+        if not self.ready:
+            raise RuntimeError("Reference calibration requires a refreshed scorer")
+        if self.reward_divisor is not None:
+            raise RuntimeError("This reference round is already calibrated; its divisor is frozen until refresh()")
+        if reference_raw.numel() == 0 or not torch.isfinite(reference_raw).all() or (reference_raw < 0).any():
+            raise ValueError("Reference scores must be non-empty, finite and non-negative with a finite positive mean")
+        mean = float(reference_raw.detach().double().mean().item())
+        if not _positive_finite_number(mean):
+            raise ValueError(f"Reference scores must be non-empty with a finite positive mean, got {mean!r}")
+        self.reference_raw_mean = self.reward_divisor = mean
+
     def settings(self) -> Dict:
         """What a saved round's scores depend on besides the denoiser; a restore must match."""
         c = self.cfg
@@ -214,7 +271,8 @@ class LCGLifecycle:
         bank = {name: [t.cpu() for t in getattr(self.bank, name)] for name in ("sigmas", "epsilons", "epsilons_offset", "etas")}
         return dict(settings=self.settings(), round_id=self.round_id, theta_s_names=list(self._theta_s_named),
                     theta_s_dim=self._theta_s_dim, h_D=self.h_D.cpu(), bank=bank,
-                    rms_s2=None if self.rms is None or self.rms.s2 is None else self.rms.s2.cpu())
+                    rms_s2=None if self.rms is None or self.rms.s2 is None else self.rms.s2.cpu(),
+                    reward_divisor=self.reward_divisor, reference_raw_mean=self.reference_raw_mean)
 
     def load_state_dict(self, state: Dict, denoiser: Denoiser) -> None:
         """Restore a saved round on this denoiser (its weights already loaded): nothing is
@@ -222,6 +280,20 @@ class LCGLifecycle:
         if state["settings"] != self.settings():
             raise ValueError(f"Checkpoint's LCG scorer was built with {state['settings']}, the config gives "
                              f"{self.settings()}; a resume must not change them")
+        divisor, reference_mean = state.get("reward_divisor"), state.get("reference_raw_mean")
+        if self.cfg.reward_scaling in ("data_scaled", "reference"):
+            if divisor is None:
+                raise ValueError(f"Checkpoint's LCG scorer has no reward divisor for reward_scaling={self.cfg.reward_scaling}")
+            if not _positive_finite_number(divisor):
+                raise ValueError(f"Checkpoint's LCG scorer has an invalid reward divisor: {divisor!r}")
+        if self.cfg.reward_scaling == "reference" and (
+                not _positive_finite_number(reference_mean) or reference_mean != divisor):
+            raise ValueError("Checkpoint's reference raw mean must be finite, positive and equal to its reward divisor")
+        rms_s2 = state.get("rms_s2")
+        if self.cfg.reward_scaling == "rms" and rms_s2 is not None and (
+                not torch.is_tensor(rms_s2) or rms_s2.numel() != 1 or not torch.isfinite(rms_s2).all()
+                or (rms_s2 < 0).any()):
+            raise ValueError("Checkpoint's RMS mean square must be a finite non-negative scalar")
         self._select_theta_s(denoiser)
         if list(self._theta_s_named) != state["theta_s_names"] or self._theta_s_dim != state["theta_s_dim"]:
             raise ValueError("Checkpoint's LCG theta_S selection differs from this denoiser's")
@@ -233,6 +305,8 @@ class LCGLifecycle:
         self.rms = self._new_rms()
         if self.rms is not None and state["rms_s2"] is not None:
             self.rms.s2 = state["rms_s2"].to(self.device)
+        # Checkpoints from before the per-round divisors have none (their modes do not use one).
+        self.reward_divisor, self.reference_raw_mean = divisor, reference_mean
         self.intrinsic_reward_fn = self._make_hook(denoiser)
 
     @property
@@ -257,9 +331,15 @@ class LCGLifecycle:
 
     def scale(self, raw: Tensor) -> Tensor:
         """Policy reward from raw LCG scores. fixed: raw / fixed_divisor only -- no running
-        statistics, centering or clipping; the same divisor for every batch and epoch."""
+        statistics, centering or clipping; the same divisor for every batch and epoch.
+        data_scaled / reference: raw / this round's divisor (the same for every batch of the round)."""
         if self.cfg.reward_scaling == "fixed":
             return raw / self.cfg.fixed_divisor
+        if self.cfg.reward_scaling in ("data_scaled", "reference"):
+            if self.reward_divisor is None:
+                raise RuntimeError(f"reward_scaling={self.cfg.reward_scaling}: this round has no divisor yet "
+                                   "(reference mode needs calibrate() after refresh)")
+            return raw / self.reward_divisor
         if self.cfg.reward_scaling == "rms":
             return self.rms(raw)
         return raw
@@ -277,6 +357,10 @@ def lcg_historical_precision(denoiser: Denoiser, params, dataset: Dataset, sigma
         B=cfg.precision_reference_size, N=dataset.num_steps, num_mc=cfg.precision_num_mc,
         beta=cfg.beta, damping=cfg.damping, seed=round_identifier,
     )
+
+
+def _positive_finite_number(value) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
 
 
 def _synchronized_time(device: torch.device) -> float:

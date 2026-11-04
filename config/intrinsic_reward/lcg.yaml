@@ -41,10 +41,14 @@ damping: 1e-4
 beta: 1.0
 
 # Policy reward from raw LCG scores: rms (RunningRMS below), fixed (raw / fixed_divisor, no
-# running statistics, centering or clipping) or none. Must agree with rms_enabled (true only
+# running statistics, centering or clipping), none, data_scaled (replay-size correction), or
+# reference (a frozen mean raw score of uniform-action imagination per refresh; see docs/REWARD_SCALING.md).
+# Must agree with rms_enabled (true only
 # for rms); a config without reward_scaling means rms if rms_enabled else none.
 reward_scaling: rms
 fixed_divisor: null
+data_reference_steps: null
+reference_num_prompts: null
 
 rms_enabled: True
 rms_alpha: 1.0

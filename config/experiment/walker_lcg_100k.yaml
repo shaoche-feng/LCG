@@ -55,10 +55,17 @@ intrinsic_reward:
   precision_num_mc: 3  # historical MC probes
   damping: 1e-4
   beta: 1.0
-  # Policy reward = raw LCG score / 100: no running statistics, centering or clipping.
-  reward_scaling: fixed
-  fixed_divisor: 100.0
+  # Policy reward = raw / this refresh's mean raw score from 32 uniform-action imagined
+  # rollouts. Frozen throughout PMPO and intrinsic evaluation; no running statistics.
+  reward_scaling: reference
+  fixed_divisor: null
+  reference_num_prompts: 32
   rms_enabled: false
+
+actor_critic:
+  training:
+    steps_first_epoch: 200
+    steps_per_epoch: 200
 
 common:
   seed: 0

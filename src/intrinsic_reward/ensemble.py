@@ -56,7 +56,10 @@ class EnsembleDisagreementConfig:
             d = self.fixed_divisor
             if isinstance(d, bool) or not isinstance(d, (int, float)) or not math.isfinite(d) or d <= 0:
                 raise ValueError(f"fixed_divisor must be a finite positive number, got {d!r}")
-        if self.reward_scaling == "rms" and not (self.rms_alpha > 0 and 0 <= self.rms_ema_decay < 1 and self.rms_eps > 0):
+        if self.reward_scaling == "rms" and not (
+                all(not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+                    for v in (self.rms_alpha, self.rms_ema_decay, self.rms_eps))
+                and self.rms_alpha > 0 and 0 <= self.rms_ema_decay < 1 and self.rms_eps > 0):
             raise ValueError("Invalid rms_alpha / rms_ema_decay / rms_eps")
 
     def reward_scaling_settings(self) -> Dict:
@@ -217,6 +220,10 @@ class EnsembleScorer:
         if state["settings"] != self.cfg.reward_scaling_settings():
             raise ValueError(f"Checkpoint's {self.metric_prefix} scorer was built with {state['settings']}, the config "
                              f"gives {self.cfg.reward_scaling_settings()}; a resume must not change them")
+        s2 = state["rms_s2"]
+        if self.cfg.reward_scaling == "rms" and s2 is not None and (
+                not torch.is_tensor(s2) or s2.numel() != 1 or not torch.isfinite(s2).all() or (s2 < 0).any()):
+            raise ValueError("Checkpoint's RMS mean square must be a finite non-negative scalar")
         self.reset()
         if self.rms is not None and state["rms_s2"] is not None:
             self.rms.s2 = state["rms_s2"].to(device)

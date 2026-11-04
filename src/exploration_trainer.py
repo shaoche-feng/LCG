@@ -22,7 +22,8 @@ from data.milestone import OUTPUT_LABELS, method_label, milestone_name, publish_
 from utils import device_lines, physical_gpu_index
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from intrinsic_reward.ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
-from intrinsic_reward.lcg import LCGLifecycle, selected_named_parameters
+from intrinsic_reward.lcg import (imagined_candidates_from_batch, LCGLifecycle, sample_uniform_historical_transitions,
+                                  selected_named_parameters)
 from models.pmpo_beta import (PMPOOptimizers, check_controller_state, controller_settings, metric_path,
                               reward_statistics)
 from intrinsic_reward.plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
@@ -611,8 +612,10 @@ class ExplorationTrainer(StateDictMixin):
                     if self._lcg_lifecycle is not None:
                         # Refresh the intrinsic scorer on this epoch's denoiser, then rewire the
                         # PMPO hook. The round seed is the checkpointed epoch, so a resumed run
-                        # continues the seed sequence (the lifecycle itself is not checkpointed).
+                        # continues the seed sequence. A restored round stays frozen until this next refresh.
                         self._lcg_lifecycle.refresh(self.agent.denoiser, self.train_dataset, round_identifier=self.epoch)
+                        if self._lcg_lifecycle.needs_reference:  # reward_scaling=reference: this round's divisor
+                            self._lcg_lifecycle.calibrate(self.lcg_reference_scores())
                         self.agent.actor_critic.set_intrinsic_reward_fn(self._lcg_lifecycle.intrinsic_reward_fn)
                     elif self.plan2explore is not None:
                         # Encode the replay with this epoch's (frozen) denoiser, fit fresh heads, then
@@ -685,6 +688,33 @@ class ExplorationTrainer(StateDictMixin):
         if self._use_cuda:
             torch.cuda.synchronize(self._device)
         return time.time()
+
+    def lcg_reference_scores(self) -> torch.Tensor:
+        """LCG reward_scaling=reference: raw scores of this round's reference rollouts. The
+        rollouts start from intrinsic_reward.reference_num_prompts replay prompts drawn
+        uniformly (seeded by the round). Each is imagined open-loop for the world-model horizon
+        under uniform random actions within the env's bounds, by this epoch's denoiser, then
+        scored by the just-refreshed scorer. The global RNG is seeded for this and restored
+        afterwards, so PMPO's random stream and prompt stream are unchanged."""
+        lcg, env = self._lcg_lifecycle, self._rl_env
+        n = self._cfg.agent.denoiser.inner_model.num_steps_conditioning
+        seed = self.epoch + 2_000_000  # own namespace beside the precision (epoch) and bank (+1,000,000) seeds
+        saved = rng_state()
+        try:
+            torch.manual_seed(seed)
+            segments = sample_uniform_historical_transitions(self.train_dataset, lcg.cfg.reference_num_prompts, n - 1,
+                                                             seed=seed)
+            prompts = [self.train_dataset[segment_id] for segment_id in segments]
+            obs = torch.stack([p.obs for p in prompts]).to(self._device)
+            act = torch.stack([p.act for p in prompts]).to(self._device)
+            low = torch.as_tensor(self._train_env.action_low, device=self._device)
+            high = torch.as_tensor(self._train_env.action_high, device=self._device)
+            actions = low + torch.rand(env.horizon, len(prompts), low.numel(), device=self._device) * (high - low)
+            steps = env.imagine_candidates(obs, act, actions)
+            candidates = [c for s in steps for c in imagined_candidates_from_batch(s.x_obs, s.x_act, s.y_star)]
+            return lcg.score_candidates(candidates)
+        finally:
+            set_rng_state(saved)
 
     def intrinsic_reward_metrics(self) -> Dict[str, Any]:
         """Per imagined step of the last PMPO update: the scorer's raw intrinsic reward and the
@@ -848,6 +878,11 @@ class ExplorationTrainer(StateDictMixin):
         if self._use_cuda:
             self.note_gpu_peak()
             row["timing/epoch_gpu_peak_allocated_gb"] = self._gpu_peak
+        lcg = self._lcg_lifecycle
+        if lcg is not None and lcg.reward_divisor is not None:  # data_scaled / reference: this round's divisor
+            row["lcg/reward_divisor"] = lcg.reward_divisor
+            if lcg.reference_raw_mean is not None:
+                row["lcg/reference_raw_mean"] = lcg.reference_raw_mean
         return row
 
     def scorer_summary(self) -> None:
