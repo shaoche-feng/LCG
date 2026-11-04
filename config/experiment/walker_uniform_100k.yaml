@@ -9,9 +9,9 @@
 # Training-data budget: 100,000 environment steps (policy actions), i.e. 200,000 simulator
 # control steps at action_repeat=2: 5,000 uniform initial steps, then 190 epochs of 500
 # uniform steps. Test collection (evaluation.*, collection.test.*) is extra and counted
-# separately (test/total_new_env_steps): 24 x 4 + 100 episodes = 98,000 environment steps.
-# Denoiser schedule and milestones keep the repository defaults; they must be identical
-# across exploration methods once agreed.
+# separately (test/total_new_env_steps): 19 x 4 + 100 episodes = 88,000 environment steps.
+# Denoiser schedule, milestones and training-only epochs (none) keep the repository defaults,
+# shared by all exploration methods.
 
 env:
   train:

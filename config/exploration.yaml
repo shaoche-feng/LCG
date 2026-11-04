@@ -81,7 +81,7 @@ static_dataset:
 
 training:
   should: True
-  num_final_epochs: 50
+  num_final_epochs: 0  # training-only epochs after collection ends (none in the selected 100k experiment)
   cache_in_ram: True
   num_workers_data_loaders: 0
   compile_wm: True
@@ -168,8 +168,10 @@ actor_critic:
     batch_size: 32
     grad_acc_steps: 1
     start_after_epochs: 0
-    steps_first_epoch: 5000
-    steps_per_epoch: 400
+    # PMPO updates per epoch, shared by the learned exploration methods (uniform builds no
+    # policy optimizer and performs none).
+    steps_first_epoch: 200
+    steps_per_epoch: 200
     lr_warmup_steps: 100
     max_grad_norm: 100.0
 

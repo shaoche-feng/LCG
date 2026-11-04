@@ -1,11 +1,61 @@
-"""Step 6: the uniform-random exploration preset and the collection-budget check."""
+"""Step 6: the uniform-random exploration preset, the collection-budget check, and the selected
+100k schedule shared by all five Walker presets."""
+from types import SimpleNamespace
+
 import pytest
 import torch
 from omegaconf import OmegaConf
 
-from exploration_trainer import check_collection_budget
+from exploration_trainer import check_collection_budget, ExplorationTrainer
 from models.pmpo_beta import PMPOBeta
 from test_exploration_trainer import COLLECT, compose, run_trainer, TASKS
+
+PRESETS = {"uniform": 1, "lcg": 1, "ensemble": 5, "plan2explore": 1, "laplace": 1}  # denoisers trained
+
+
+@pytest.mark.parametrize("method", PRESETS)
+def test_walker_100k_presets_resolve_the_selected_schedule(method):
+    """Each preset as launched (no schedule overrides), stepped through the trainer's epoch
+    arithmetic: initial collection to first_epoch.min before epoch 1 (collect_initial_dataset),
+    steps_per_epoch more in each collection epoch, then num_final_epochs training-only epochs;
+    the trainer's own mark_due_milestone at every epoch boundary."""
+    cfg = compose([f"+experiment=walker_{method}_100k"])
+    c, m = cfg.collection.train, cfg.milestones
+    assert (c.first_epoch.min, c.steps_per_epoch, c.num_steps_total) == (5000, 500, 100000)
+    assert (list(m.at_steps), m.every_steps, m.keep_last) == ([], 10000, None)
+    assert cfg.training.num_final_epochs == 0
+    d, ac = cfg.denoiser.training, cfg.actor_critic.training
+    assert (d.start_after_epochs, d.steps_first_epoch, d.steps_per_epoch) == (0, 10000, 400)
+    assert (ac.start_after_epochs, ac.steps_first_epoch, ac.steps_per_epoch) == (0, 200, 200)
+    learned = c.mode == "policy"  # ExplorationTrainer._learned_exploration: uniform builds no PMPO optimizer
+    assert learned == (method != "uniform") and cfg.intrinsic_reward.enabled == learned
+    members = cfg.intrinsic_reward.num_members if method == "ensemble" else 1
+    assert members == PRESETS[method]
+
+    check_collection_budget(c)
+    epochs_collect = (c.num_steps_total - c.first_epoch.min) // c.steps_per_epoch  # collect_initial_dataset
+    num_epochs = epochs_collect + cfg.training.num_final_epochs
+    assert epochs_collect == num_epochs == 190
+    stub = SimpleNamespace(_cfg=cfg, milestones=[], milestone_targets_done=[], epoch=0,
+                           train_dataset=SimpleNamespace(num_steps=c.first_epoch.min))
+    denoiser_updates = pmpo_updates = 0
+    steps_at = {}
+    for epoch in range(1, num_epochs + 1):
+        stub.epoch = epoch
+        if epoch <= epochs_collect:
+            stub.train_dataset.num_steps += c.steps_per_epoch
+        steps_at[epoch] = stub.train_dataset.num_steps
+        denoiser_updates += members * (d.steps_first_epoch if epoch == 1 else d.steps_per_epoch)
+        if learned:
+            pmpo_updates += ac.steps_first_epoch if epoch == 1 else ac.steps_per_epoch
+        ExplorationTrainer.mark_due_milestone(stub)
+    assert (steps_at[1], steps_at[10], steps_at[190]) == (5500, 10000, 100000)
+    targets = list(range(10000, 100001, 10000))
+    assert stub.milestone_targets_done == targets
+    assert [x["name"] for x in stub.milestones] == [f"steps_{t:06d}" for t in targets]
+    assert [x["epoch"] for x in stub.milestones] == list(range(10, 191, 20))
+    assert not any(x["retired"] for x in stub.milestones)
+    assert denoiser_updates == members * 85_600 and pmpo_updates == (38_000 if learned else 0)
 
 
 def test_walker_uniform_100k_preset_resolves_the_intended_budget():

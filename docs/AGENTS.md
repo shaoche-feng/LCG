@@ -2,7 +2,7 @@
 
 Instructions for Codex, Claude Code and other coding agents working on this reward-free experiment repository.
 
-Updated: 2026-11-04, branch `lcg-reward-scaling`: reward scaling (`e5b1e61`), the collection-budget extension, and the selected milestone schedule are committed. This identifies the snapshot the guide was checked against; inspect the actual checkout before claiming its current commit or status.
+Updated: 2026-11-04, branch `lcg-reward-scaling`: reward scaling (`e5b1e61`), the collection-budget extension, and the selected 100k schedule and milestones are committed. This identifies the snapshot the guide was checked against; inspect the actual checkout before claiming its current commit or status.
 
 ## Project and authority
 
@@ -12,7 +12,7 @@ This project studies task-agnostic exploration with DIAMOND-style diffusion worl
 - Inspect the actual checkout, resolved configuration and current code before making changes. Do not assume an old server path or worktree is the active repository.
 - Treat saved configurations and executable code as the description of existing behavior. Design documents describe intent; the notes record implementation changes and limitations. Report contradictions instead of silently choosing a historical description.
 - Historical Stage 3 Beta/H15 experiments are context, not this repository’s current controller specification. Do not copy their settings or results into the reward-free experiment as defaults.
-- Current software implementation and bounded validation are complete. Selected so far: LCG reference reward scaling with 200 PMPO updates per epoch (`walker_lcg_100k`), and ten milestones at 10k, 20k, …, 100k training environment steps (`milestones.every_steps: 10000`). Other budgets, schedules and the seed design are still pending; the remaining numerical defaults are executable placeholders, not an approved final protocol.
+- Current software implementation and bounded validation are complete. Selected so far: the 100k schedule under "Environment and schedules" (190 epochs, no training-only epochs, 200 PMPO updates per epoch for every learned method, ten milestones at 10k, 20k, …, 100k), and LCG reference reward scaling with 32 prompts (`walker_lcg_100k`). Other budgets, schedules and the seed design are still pending; the remaining numerical defaults are executable placeholders, not an approved final protocol.
 
 ## Working rules
 
@@ -105,7 +105,7 @@ The shared agent config’s actor objective remains sign-only; the learned explo
 | Output label | Preset | Current distinguishing settings |
 | --- | --- | --- |
 | `uniform` | `walker_uniform_100k` | Uniform actions throughout; denoiser only; no intrinsic reward or PMPO training |
-| `lcg` | `walker_lcg_100k` | R1 selector, candidate MC 5, chunk 32, historical reference 320 with MC 3, damping 1e-4, beta 1; reference reward scaling (32 prompts; see `docs/REWARD_SCALING.md`); 200 PMPO updates per epoch |
+| `lcg` | `walker_lcg_100k` | R1 selector, candidate MC 5, chunk 32, historical reference 320 with MC 3, damping 1e-4, beta 1; reference reward scaling (32 prompts; see `docs/REWARD_SCALING.md`) |
 | `full-ensemble` | `walker_ensemble_100k` | 5 independently initialized denoisers; episode bootstrap enabled; shared diffusion noise; pixel disagreement |
 | `plan2explore` | `walker_plan2explore_100k` | One denoiser; 5 independent lightweight MLP predictors; replay-feature cache; bootstrap enabled; feature disagreement |
 | `laplace-ensemble` | `walker_laplace_100k` | One denoiser; 5 sampled R1 parameter sets; shared LCG historical precision; temperature 1; pixel disagreement |
@@ -136,11 +136,22 @@ One `DownstreamTrainer` handles exactly one milestone, task, adaptation seed and
 - Downstream resume is at completed updates, with optimizer/scheduler/counters/RNG and source replay identity checked.
 - Evaluate-only uses completed output files and must work after the source milestone/replay are moved away.
 
-## Environment and provisional schedules
+## Environment and schedules
 
 Current Walker configuration: RGB 64x64, camera 0, action repeat 2, four conditioning frames, `time_limit: null` (the existing environment default). Do not claim compatibility for additional task groups without the compatibility evidence.
 
-The current 100k presets use 5,000 initial steps and 190 collection epochs of 500 steps, followed by 50 training-only epochs. Denoiser updates are 10,000 in epoch 1 and 400 thereafter. PMPO updates are 200 in every epoch for LCG (48,000 in total) and 5,000 then 400 for the other learned methods (100,600). This gives 240 epochs and 105,600 updates per denoiser. Apart from the selections listed under "Project and authority", these are current defaults, not a finalized experimental schedule. Milestones are published every 10,000 replay steps (`config/exploration.yaml`, `milestones.every_steps: 10000`, `at_steps: []`, `keep_last: null`): ten per 100k run, at 10k, 20k, …, 100k, all on epoch boundaries of this schedule, and all retained.
+The selected 100k schedule, resolved by all five Walker presets without overrides (`config/exploration.yaml`; pinned by `tests/exploration/test_uniform_preset.py`):
+
+| Setting | Value |
+| --- | --- |
+| Training environment steps | 100,000: 5,000 initial uniform steps (collected before epoch 1), then 190 epochs of 500 |
+| Epochs | 190, all collecting; `training.num_final_epochs: 0` (no training-only tail) |
+| Replay steps after epoch k | 5,000 + 500k: 5,500 at epoch 1, 10,000 at epoch 10, 100,000 at epoch 190 |
+| Denoiser updates | 10,000 in epoch 1, then 400: 85,600 per denoiser (428,000 over the full ensemble's 5 members) |
+| PMPO updates | 200 per epoch, first epoch included: 38,000 for each learned method; 0 for uniform |
+| Milestones | `every_steps: 10000`, `at_steps: []`, `keep_last: null`: 10k, 20k, …, 100k, at epochs 10, 30, …, 190, all retained |
+
+Periodic test diagnostics (every 10 epochs) and the final diagnostic are extra interaction: 19 × 4 + 100 episodes. Apart from the selections listed under "Project and authority", the remaining numerical settings are current defaults, not a finalized experimental protocol. Earlier runs and notes used 50 training-only epochs (240 epochs) and 5,000-then-400 PMPO updates; those records are historical.
 
 Downstream currently defaults to 1,000 reward-model + 1,000 policy updates, batches of 32 and reward-model sequence length 19. Its evaluation defaults are deterministic actions, seeds 3001–3030 and at most 500 environment steps per episode. Budgets and the final seed protocol remain open decisions.
 

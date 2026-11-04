@@ -27,8 +27,8 @@ def test_walker_lcg_100k_preset_resolves_the_agreed_settings():
     assert (lcg.precision_reference_size, lcg.precision_num_mc, lcg.damping, lcg.beta) == (320, 3, 1e-4, 1.0)
     assert lcg.reward_scaling_settings() == dict(mode="reference", reference_num_prompts=32)
     assert (cfg.actor_critic.training.steps_first_epoch, cfg.actor_critic.training.steps_per_epoch) == (200, 200)
-    # The environment, replay budget, denoiser schedule, milestones and models match uniform.
-    # LCG's selected policy schedule and objective are explicit differences.
+    # The environment, replay budget, denoiser and PMPO schedules, milestones and models match
+    # uniform (which never uses its PMPO schedule). LCG's exploration objective is the explicit difference.
     uniform = compose(["+experiment=walker_uniform_100k"])
     OmegaConf.resolve(uniform)
     for key in SHARED:
@@ -38,9 +38,6 @@ def test_walker_lcg_100k_preset_resolves_the_agreed_settings():
         if key == "agent":  # uniform trains no policy; LCG's exploration objective is advantage-weighted
             assert a["actor_critic"].pop("actor_objective") == "advantage_weighted"
             b["actor_critic"].pop("actor_objective")
-        if key == "actor_critic":
-            assert (a["training"].pop("steps_first_epoch"), a["training"].pop("steps_per_epoch")) == (200, 200)
-            assert (b["training"].pop("steps_first_epoch"), b["training"].pop("steps_per_epoch")) == (5000, 400)
         assert a == b, key
     assert (uniform.collection.train.mode, cfg.common.seed) == ("uniform", uniform.common.seed)
     # The Gaussian H10 EMA-critic controller of the reference H10 runs.

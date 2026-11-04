@@ -27,7 +27,7 @@ Keys are under `intrinsic_reward.` (`LCGConfig`, `src/intrinsic_reward/lcg/lifec
 - **`LCGConfig`:** `reward_scaling=None`, `fixed_divisor=None`, `data_reference_steps=None`, `reference_num_prompts=None`, `rms_enabled=True`, `rms_alpha=1.0`, `rms_ema_decay=0.99`, `rms_eps=1e-8`.
   - `reward_scaling=None` resolves to `rms` if `rms_enabled` is true and to `none` otherwise. Saved configs from before the field existed keep that meaning.
 - **`config/intrinsic_reward/lcg.yaml`:** `reward_scaling: rms`, `fixed_divisor: null`, `data_reference_steps: null`, `reference_num_prompts: null`, `rms_enabled: True`. These keys use ordinary launch overrides, without `+`.
-- **Preset `config/experiment/walker_lcg_100k.yaml`:** `reward_scaling: reference`, `reference_num_prompts: 32`, `fixed_divisor: null`, `rms_enabled: false`, with 200 PMPO updates in the first and every later active epoch.
+- **Preset `config/experiment/walker_lcg_100k.yaml`:** `reward_scaling: reference`, `reference_num_prompts: 32`, `fixed_divisor: null`, `rms_enabled: false`. The 200 PMPO updates in the first and every later epoch come from `config/exploration.yaml`, shared by all learned methods.
 - **Scope:** `data_scaled` and `reference` exist for LCG only. The ensemble accepts `fixed`, `rms` and `none`; Laplace and Plan2Explore accept `fixed` and `none`.
 
 ### Data-scaled
@@ -76,7 +76,7 @@ Hydra composition now selects this setting for new LCG runs:
 
 | Configuration | `reward_scaling` settings | PMPO updates, first epoch / later epochs |
 | --- | --- | --- |
-| `exploration.yaml` alone | `rms` (α 1.0, ρ 0.99, ε 1e-8) | 5,000 / 400 |
+| `exploration.yaml` alone | `rms` (α 1.0, ρ 0.99, ε 1e-8) | 200 / 200 (5,000 / 400 before the shared 100k schedule) |
 | `+experiment=walker_lcg_100k` (maintained preset) | `reference`, 32 prompts | 200 / 200 |
 | historical scaling test / continuation (explicit launch overrides) | `reference`, 32 prompts | 200 / 200 |
 
@@ -84,7 +84,7 @@ Hydra composition now selects this setting for new LCG runs:
 python src/exploration_main.py +experiment=walker_lcg_100k
 ```
 
-The base group remains RMS for compatibility. The LCG preset changes only its scaling selection and policy-update count; its controller, denoiser, collection budget and other settings remain those of the preset. The earlier historical commands used `+intrinsic_reward.reference_num_prompts=32` because that key was then absent from the base YAML; current commands use the preset or an ordinary override.
+The base group remains RMS for compatibility. The LCG preset changes only its scaling selection; the policy-update count is the shared repository schedule (see `docs/AGENTS.md`, "Environment and schedules"). Its controller, denoiser, collection budget and other settings remain those of the preset. The earlier historical commands used `+intrinsic_reward.reference_num_prompts=32` because that key was then absent from the base YAML; current commands use the preset or an ordinary override.
 
 **Existing runs retain their saved selection:** the new preset does not rewrite their saved config. Valid saved round state restores its exact divisor without recalibration, and resume refuses changed scaling settings. The numerical/configuration guards above reject invalid state that older code accepted. Continuing with different code versions is not a claim of bit-identical future training; a run's own copied source remains its historical implementation.
 

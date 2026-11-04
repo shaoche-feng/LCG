@@ -11,7 +11,8 @@
 # steps collected by the exploration policy = 100,000 environment steps (200,000 simulator
 # control steps at action_repeat=2). Test collection is extra and counted separately.
 # PMPO trains on the LCG score of imagined transitions only (no task reward), with the
-# scorer refreshed once per epoch on that epoch's denoiser and replay.
+# scorer refreshed once per epoch on that epoch's denoiser and replay. The PMPO schedule
+# (200 updates per epoch) is the repository default shared by the learned methods.
 
 env:
   train:
@@ -61,11 +62,6 @@ intrinsic_reward:
   fixed_divisor: null
   reference_num_prompts: 32
   rms_enabled: false
-
-actor_critic:
-  training:
-    steps_first_epoch: 200
-    steps_per_epoch: 200
 
 common:
   seed: 0

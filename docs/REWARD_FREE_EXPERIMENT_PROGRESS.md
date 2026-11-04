@@ -29,9 +29,11 @@ Task rewards are recorded separately during exploration and used only for downst
   (see above). The main experiment covers verified groups only; the earlier 16-task
   reference list is not required.
 - [ ] Choose budgets, saved milestones, training schedules, and evaluation seeds.
-  Selected (2026-11-04): ten saved milestones per 100k run, at 10k, 20k, ..., 100k training environment steps
-  (`milestones.every_steps: 10000`, all kept); for LCG, reference reward scaling with 200 PMPO updates per epoch
-  (`walker_lcg_100k`, `e5b1e61`). Other budgets, schedules and evaluation seeds remain open.
+  Selected (2026-11-04): the 100k exploration schedule for all five presets: 5,000 initial + 190 epochs x 500 steps,
+  no training-only epochs, denoiser 10,000 then 400 updates (85,600), 200 PMPO updates per epoch for every learned
+  method (38,000), and ten saved milestones at 10k, 20k, ..., 100k (epochs 10, 30, ..., 190; all kept). For LCG,
+  reference reward scaling with 32 prompts (`e5b1e61`). Downstream budgets and evaluation seeds remain open.
+  Notes: "Selected 100k exploration schedule".
   Downstream throughput measured on the RTX 5090 (2026-11-02, measurement only; one uniform milestone, Walker walk):
   reward predictor 0.093 s/update, policy 0.380 s/update, evaluation 45 s. Working plan 5,000 + 10,000 updates:
   projected 72 min per adaptation, 362 GPU-hours for 5 methods x 3 seeds x 20 milestones x 1 task. Budgets remain
