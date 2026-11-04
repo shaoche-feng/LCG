@@ -421,6 +421,7 @@ class ExplorationTrainer(StateDictMixin):
         self.milestones = []  # dict(name, epoch, retired); retired ones are deleted by retention
         self.test_episode_seeds = []  # reset seed of each current test episode (None: drawn at random)
         self.resume_count = 0  # resumes of this run folder (logging only)
+        self.budget_extensions = []  # collection-budget extensions on resume (extend_collection_budget)
         self.wandb_steps = 0  # logical W&B rows; replayed rows keep their original step
         self.wandb_history_bytes = 0  # wandb_history.jsonl length at this checkpoint: its committed records
         self._committed_history_bytes = None  # on resume: the loaded checkpoint's value (backfill reads only these)
@@ -433,9 +434,12 @@ class ExplorationTrainer(StateDictMixin):
         if cfg.common.resume:
             self.load_state_checkpoint()
             self.resume_count += 1
+            extension = self.extend_collection_budget()
             if self._rank == 0 and self._local_history:
                 self.repair_wandb_history()
             self._resume_event = {"from_epoch": self.epoch, "count": self.resume_count}
+            if extension is not None:
+                self._resume_event["budget_extension"] = extension
         if self._should_test and not self._collect_test:
             self.check_reusable_test_dataset()
         if not cfg.common.resume:
@@ -538,6 +542,43 @@ class ExplorationTrainer(StateDictMixin):
             self.log_rows(self.test_diagnostics(final=True))
             self.final_test_done = True
             self.save_checkpoint()
+
+    def extend_collection_budget(self) -> Optional[Dict[str, int]]:
+        """On resume: a raised collection.train.num_steps_total is a deliberate budget extension.
+        A finished run's .run_is_over sentinel is renamed first; see scripts/resume.sh.
+        - The saved plan ends at the replay's steps + (num_epochs_collect - epoch) x steps_per_epoch.
+        - A higher budget adds collection epochs of the same size to the same run. Models,
+          optimizers, schedules, counters, replay, collector, scorer and RNG all continue as saved.
+        - Refused: a lower budget, one not on an epoch boundary, or any change once training-only
+          epochs have begun.
+        Returns the extension, or None if the budget is unchanged. It is recorded in the checkpoint
+        (budget_extensions) and the W&B resume summary."""
+        if self._is_static_dataset or self.num_epochs_collect is None:
+            return None
+        c = self._cfg.collection.train
+        planned = int(self.train_dataset.num_steps) + max(self.num_epochs_collect - self.epoch, 0) * c.steps_per_epoch
+        if c.num_steps_total == planned:
+            return None
+        if c.num_steps_total < planned:
+            raise ValueError(f"collection.train.num_steps_total={c.num_steps_total} is below this run's planned "
+                             f"budget of {planned} training env steps; a resume must not shrink it")
+        if self.epoch > self.num_epochs_collect:
+            raise ValueError("Training-only epochs have begun; the collection budget can no longer be extended")
+        added, remainder = divmod(c.num_steps_total - planned, c.steps_per_epoch)
+        if remainder:
+            raise ValueError(f"collection.train.num_steps_total={c.num_steps_total} does not extend the planned "
+                             f"{planned} steps by whole epochs of {c.steps_per_epoch}")
+        extension = dict(at_epoch=int(self.epoch), from_steps=int(planned), to_steps=int(c.num_steps_total),
+                         added_epochs=int(added))
+        self.num_epochs_collect += added
+        # The final test diagnostics belong to the run's end, which has moved: they run again there.
+        # Diagnostics already logged stay as they were. They use their own RNG stream, so training
+        # is unaffected.
+        self.final_test_done = False
+        self.budget_extensions.append(extension)
+        say(f"Collection budget extended: {planned} -> {c.num_steps_total} training env steps "
+            f"({added} more epochs of {c.steps_per_epoch}, from epoch {self.epoch})")
+        return extension
 
     def collect_initial_dataset(self) -> int:
         c = self._cfg.collection.train
@@ -1215,6 +1256,7 @@ class ExplorationTrainer(StateDictMixin):
         diagnostic_state = state_dict.pop("pmpo_diagnostic", None)
         state_dict.setdefault("test_episode_seeds", None)  # before seed labels: unknown (never relabeled)
         state_dict.setdefault("resume_count", 0)
+        state_dict.setdefault("budget_extensions", [])  # before budget extensions: none
         state_dict.setdefault("wandb_steps", None)  # before the mirror: no backfill
         state_dict.setdefault("wandb_history_bytes", None)  # before committed offsets: all complete records count
         state_dict.setdefault("ensemble", None)  # checkpoints from before ensembles: single denoiser

@@ -59,8 +59,9 @@ def compose(overrides):
         return hydra_compose(config_name="exploration", overrides=list(overrides))
 
 
-def start(run_dir, monkeypatch, overrides, resume=False):
-    """An ExplorationTrainer on CPU in run_dir; logs are captured as (epoch, row)."""
+def start(run_dir, monkeypatch, overrides, resume=False, resume_changes=None):
+    """An ExplorationTrainer on CPU in run_dir; logs are captured as (epoch, row). A resume uses
+    the run's saved config with resume_changes ({key: value}) applied, as resume.sh overrides do."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     for method in ("init", "save"):
         monkeypatch.setattr(trainer_module.wandb, method, lambda *args, **kwargs: None)
@@ -71,6 +72,8 @@ def start(run_dir, monkeypatch, overrides, resume=False):
     if resume:
         cfg = OmegaConf.load(run_dir / "config/exploration.yaml")
         cfg.common.resume = True
+        for key, value in (resume_changes or {}).items():
+            OmegaConf.update(cfg, key, value)
     else:
         keys = {o.split("=")[0] for o in overrides}  # a test's own value replaces REAL's
         cfg = compose([o for o in REAL if o.split("=")[0] not in keys] + list(overrides))
@@ -207,6 +210,55 @@ def test_learned_resume_matches_uninterrupted_run(tmp_path, monkeypatch):
     for path in (tmp_path / "full/milestones").glob("steps_*"):
         referenced.update(referenced_files(path))
     assert on_disk == referenced and any(p.name == "1_8.pt" for p in on_disk)
+
+
+def test_extended_budget_continues_exactly_like_a_longer_planned_run(tmp_path, monkeypatch):
+    """A finished 30-step run, resumed with collection.train.num_steps_total=42, runs two more
+    collection epochs and ends bit-identical to a run planned for 42 steps from the start. The
+    milestone added for the extension (36) is published; earlier ones are untouched."""
+    milestones = ["milestones.at_steps=[12,24,36]"]
+    full, logs_full = run_uninterrupted(tmp_path / "full", monkeypatch, ["collection.train.num_steps_total=42", *milestones])
+    assert full.epoch == full.num_epochs_collect == 5 and full.train_dataset.num_steps == 42
+
+    short, _ = run_uninterrupted(tmp_path / "split", monkeypatch, milestones)
+    assert short.epoch == short.num_epochs_collect == 3 and short.train_dataset.num_steps == 30
+    before = file_hashes(sorted((tmp_path / "split/milestones").rglob("*.json")))
+    extended, logs_extended = start(tmp_path / "split", monkeypatch, [], resume=True,
+                                    resume_changes={"collection.train.num_steps_total": 42})
+    extension = dict(at_epoch=3, from_steps=30, to_steps=42, added_epochs=2)
+    assert extended.num_epochs_collect == 5 and extended.budget_extensions == [extension]
+    assert extended._resume_event == {"from_epoch": 3, "count": 1, "budget_extension": extension}
+    assert not extended.final_test_done  # the short run's final diagnostics ran at its old end (epoch 3)
+    finish(extended)
+    extended._final_rng = rng_state()
+    assert extended.agent.actor_critic.updates.item() == 5 * 2 and extended.num_batch_train.denoiser == 5 * 2
+    assert extended.final_test_done
+    # Training is identical. Test diagnostics differ only because they draw on their own RNG stream and
+    # test replay, which the short run's extra final diagnostics at epoch 3 advanced; the test-step
+    # counter includes those extra episodes.
+    assert extended.num_test_steps == full.num_test_steps + 10  # one more final test episode of 10 steps
+    def training_rows(logs):
+        return [(e, {k: v for k, v in row.items() if "test" not in k}) for e, row in logs]
+    assert_same_run(full, extended, training_rows(logs_full), training_rows(logs_extended), after_epoch=3)
+    assert file_hashes(sorted((tmp_path / "split/milestones").rglob("*.json"))).items() >= before.items()
+    for name in ("steps_000024", "steps_000036"):
+        a = load_milestone(tmp_path / "full/milestones" / name, "walk")
+        b = load_milestone(tmp_path / "split/milestones" / name, "walk")
+        assert a.manifest["identity"] == b.manifest["identity"]
+    # The extension is checkpointed: a later resume at the new budget changes nothing more.
+    again, _ = start(tmp_path / "split", monkeypatch, [], resume=True,
+                     resume_changes={"collection.train.num_steps_total": 42})
+    assert again.num_epochs_collect == 5 and again.budget_extensions == [extension]
+    assert again._resume_event == {"from_epoch": 5, "count": 2}
+    again._train_env.close()
+    again._test_collector.close()
+
+
+@pytest.mark.parametrize("total,match", [(24, "must not shrink"), (33, "must be a multiple of steps_per_epoch")])
+def test_budget_changes_that_are_not_whole_extensions_are_refused(tmp_path, monkeypatch, total, match):
+    run_uninterrupted(tmp_path / "run", monkeypatch, [])
+    with pytest.raises(ValueError, match=match):
+        start(tmp_path / "run", monkeypatch, [], resume=True, resume_changes={"collection.train.num_steps_total": total})
 
 
 def test_milestones_are_immutable_movable_and_validated(tmp_path, monkeypatch):

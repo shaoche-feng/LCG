@@ -28,7 +28,11 @@
 # A finished run has a .run_is_over sentinel (written whenever the entry point returns
 # normally, including at a pmpo_diagnostic.max_epochs cap) and is refused. To extend it
 # deliberately, rename the sentinel (mv .run_is_over .run_is_over.<date>) and pass the
-# override that raises the bound.
+# override that raises the bound: pmpo_diagnostic.max_epochs, or collection.train.num_steps_total
+# (more collection epochs of the same size continue the same run; recorded in the checkpoint's
+# budget_extensions and the W&B resume summary; a lower or partial-epoch budget is refused).
+# Add the new steps to milestones.at_steps to publish a milestone at the new end. The run
+# folder's own copied source is used, so an extension needs a run created by code that has it.
 set -euo pipefail
 
 die() { echo "resume.sh: error: $*" >&2; exit 1; }
