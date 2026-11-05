@@ -36,7 +36,7 @@ GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/run_lcg_10
 
 - **Order:** a launcher first explores all seven task groups (walker, hopper, acrobot, cartpole-balance, cartpole-swingup, humanoid, humanoid_CMU) with its `<method>_100k` preset. It then adapts every task of every group, one task at a time, on the ten selected milestones (`downstream_10_milestones`).
 - **Seeds and budgets:** exploration seed 0 and adaptation seed 0. Training and evaluation budgets come from the YAML.
-- **Settings at the top of each script:** the GPU, the Python interpreter, the seeds, the exploration W&B project (`EXPLORATION_PROJECT`, default `reward-free-exploration`) and the downstream project prefix (`DOWNSTREAM_PROJECT_PREFIX`, default `reward-free-downstream`).
+- **Settings at the top of each script:** the GPU, the Python interpreter, the seeds, the exploration W&B project prefix (`EXPLORATION_PROJECT`, default `reward-free-exploration`) and the downstream project prefix (`DOWNSTREAM_PROJECT_PREFIX`, default `reward-free-downstream`).
 - **GPU and output:** the script binds CUDA and EGL rendering to `GPU` and logs to W&B online.
 - **Exploration outputs:** `outputs/<method>/<group>/seed_0/`, where `<method>` is `lcg`, `uniform`, `full-ensemble`, `laplace-ensemble` or `plan2explore`. The two Cartpole groups get separate folders (`cartpole-balance`, `cartpole-swingup`), but both run the `cartpole` domain.
 - **Downstream outputs:** inside each run folder, under `downstream/`.
@@ -44,7 +44,7 @@ GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/run_lcg_10
 - **Existing output:** a launcher refuses to start if any of its seven run folders exists. Resume an interrupted exploration with `scripts/resume.sh <run folder>`.
 - **Failures:** any failure stops the script with a nonzero exit status.
 - **W&B identities:**
-  - exploration: project `EXPLORATION_PROJECT`; run and group `<method>-<group>--exploration-es0`;
+  - exploration: one project per method, `<EXPLORATION_PROJECT>-<method>` (e.g. `reward-free-exploration-full-ensemble`); run and group `<method>-<group>--exploration-es0`;
   - downstream: one project per task group and task, shared by methods and seeds, `<DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>` (e.g. `reward-free-downstream-walker-walk`); one run per method, task group, task and seed, shared by its ten milestones, with run name and group both `<method>-<group>--downstream-<task>-es0-ds0` (e.g. `lcg-walker--downstream-walk-es0-ds0`).
 - **Terminal log names:** `<group>--exploration-es0.log` and `<group>--downstream-<task>-es0-ds0.log` (stdout), each with its `.stderr.log`. `es`/`ds` are the exploration and adaptation seeds; `--` separates the group label, which may itself contain `-`.
 

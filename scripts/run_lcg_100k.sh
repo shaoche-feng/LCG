@@ -73,7 +73,7 @@ run_exploration() {
         "common.seed=$EXPLORATION_SEED" \
         "common.devices=$GPU" \
         wandb.mode=online \
-        "wandb.project=$EXPLORATION_PROJECT" \
+        "wandb.project=$EXPLORATION_PROJECT-${LABEL}" \
         "wandb.group=${LABEL}-${log_name}" \
         "wandb.name=${LABEL}-${log_name}" \
         "hydra.run.dir=$run_dir" \

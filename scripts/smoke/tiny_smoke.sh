@@ -92,7 +92,7 @@ run_exploration() {
         collection.test.num_final_episodes=1 \
         'evaluation.final_reset_seeds=[3001]' \
         wandb.mode=online \
-        "wandb.project=$EXPLORATION_PROJECT" \
+        "wandb.project=$EXPLORATION_PROJECT-${LABEL}" \
         "wandb.group=${LABEL}-${log_name}" \
         "wandb.name=${LABEL}-${log_name}" \
         "hydra.run.dir=$run_dir" \
