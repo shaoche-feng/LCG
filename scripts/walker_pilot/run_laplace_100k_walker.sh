@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
+# Laplace-ensemble Walker pilot, exploration seed 0 and adaptation seed 0, on one GPU, in the foreground (run it
+# inside tmux):
+#   GPU=1 PYTHON=/path/to/python bash scripts/walker_pilot/run_laplace_100k_walker.sh
+# Phase 1 explores Walker only (+experiment=laplace_100k, production budgets, all 20 milestones saved);
+# phase 2 adapts stand, walk and run on the 100k milestone only (+experiment=downstream_10_milestones,
+# production budgets), into the '-pilot' downstream projects.
+# After all three adaptations succeed, the run's downstream/ folder is archived as downstream_pilot_<attempt>,
+# freeing the standard path for scripts/walker_pilot_adapt/adapt_laplace_100k_walker.sh. A failure stops
+# the launcher before archiving, so the recovery files stay in downstream/.
+# Resume an interrupted exploration run with scripts/resume.sh <run folder>.
 
 # Run from the repository root.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -17,8 +26,8 @@ GPU="${GPU:-0}"
 PYTHON="${PYTHON:-python}"
 
 EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-reward-free-exploration}"
-# One downstream W&B project per task group and task, shared by methods and seeds:
-# <DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>.
+# One pilot downstream W&B project per task group and task, shared by methods and seeds:
+# <DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>-pilot.
 DOWNSTREAM_PROJECT_PREFIX="${DOWNSTREAM_PROJECT_PREFIX:-reward-free-downstream}"
 
 PRESET=laplace_100k
@@ -35,8 +44,6 @@ export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
 # Group label | actual dm_control domain | available tasks
-#
-# Separate Cartpole labels prevent the two groups sharing an output.
 TASK_GROUPS=(
     'walker|walker|stand,walk,run'
 )
@@ -102,7 +109,7 @@ run_downstream() {
         downstream.mode=train \
         "common.devices=$GPU" \
         wandb.mode=online \
-        "wandb.project=${DOWNSTREAM_PROJECT_PREFIX}-${group}-${task}" \
+        "wandb.project=${DOWNSTREAM_PROJECT_PREFIX}-${group}-${task}-pilot" \
         "wandb.group=${LABEL}-${log_name}" \
         "wandb.name=${LABEL}-${log_name}" \
         > >(tee "$log_file") \
@@ -138,7 +145,7 @@ ERROR_LOG="$ATTEMPT_DIR/launcher.stderr.log"
 exec > >(tee -a "$LAUNCH_LOG") \
      2> >(tee -a "$ERROR_LOG" >&2)
 
-printf 'Laplace-ensemble Walker experiment | GPU %s | exploration seed %s | adaptation seed %s\n' \
+printf 'Laplace-ensemble Walker pilot | GPU %s | exploration seed %s | adaptation seed %s\n' \
     "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
 printf 'Outputs: %s\nTerminal logs: %s\n' "$OUTPUT_ROOT" "$ATTEMPT_DIR"
 
@@ -163,5 +170,18 @@ for entry in "${TASK_GROUPS[@]}"; do
     done
 done
 
-printf '\nAll Laplace-ensemble Walker exploration and downstream runs completed.\n'
+# Reached only after all three adaptations succeeded (set -e stops on any failure).
+# Preserve pilot outputs and W&B records; free the standard downstream path.
+WALKER_RUN="$OUTPUT_ROOT/walker/seed_$EXPLORATION_SEED"
+PILOT_ARCHIVE="$WALKER_RUN/downstream_pilot_$(basename "$ATTEMPT_DIR")"
+
+if [[ -e "$PILOT_ARCHIVE" ]]; then
+    printf 'Pilot archive already exists: %s\n' "$PILOT_ARCHIVE" >&2
+    exit 1
+fi
+
+mv -- "$WALKER_RUN/downstream" "$PILOT_ARCHIVE"
+printf 'Pilot outputs archived: %s\n' "$PILOT_ARCHIVE"
+
+printf '\nAll Laplace-ensemble Walker pilot exploration and downstream runs completed.\n'
 printf 'Terminal logs: %s\n' "$ATTEMPT_DIR"
