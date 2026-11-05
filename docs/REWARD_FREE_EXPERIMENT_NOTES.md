@@ -4081,6 +4081,116 @@ Uncommitted, pending independent review. Starting point `073774c`, clean working
 - **Terminal logs:** about 2 MB per smoke exploration (progress bars, time-throttled), so they grow with runtime.
 - **Replay, milestones, checkpoints and downstream models:** the same per run in production as in the smoke.
 
+## Shared downstream W&B run, task-specific projects, Cartpole comparison and adaptation smoke (2026-11-05)
+
+Starting point `e70eb09`. Changed: `src/downstream_trainer.py`, `src/downstream_main.py`, `src/downstream_analysis.py`, `src/data/milestone.py` (`shared_run_path`), the downstream tests, the five launchers, `scripts/smoke.sh`, and the new `scripts/smoke_adaptation.sh`. No YAML changed.
+
+**One W&B run per exploration run × task × adaptation seed × denoiser member,** shared by every milestone selected (`milestone_steps: null`, a `milestone_steps` list, or one `milestone_path`). Later commands for the same selection join it.
+- **Record:** `<run>/downstream/wandb_<task>_seed_<s>[_member_<k>].json` (JSON) holds:
+  - the identity (a new random id, project, entity, name, group, URL);
+  - the selection;
+  - the next free W&B step and the cumulative update totals;
+  - each registered milestone's block (`first_step`, `evaluation_step`, update budgets, cumulative offsets, attempt);
+  - every evaluation's step, kind and published flag.
+
+  It is written atomically before anything is logged.
+- **Logging owner:** the folder launcher prepares the record (no `wandb.init`). Each milestone's process (child, single, resume, evaluate-only) attaches to the run by id (`resume="allow"`), so no milestone creates a run of its own. Explicitly set `wandb.project`, `wandb.name` or `wandb.group` must equal the record's; otherwise the command is refused before training.
+- **Independence:** each milestone is still a fresh adaptation, with its own child process, outputs, `metrics.jsonl`, evaluation files and checkpoints; local counters are unchanged. A test compares two milestones adapted into one run with W&B off: identical weights, metrics and evaluations.
+- **Steps:** each milestone's block is its updates (reward model, then PMPO) followed by its after-training evaluation. Evaluate-only adds a point at the next free step.
+- **Resume:** reconciliation uses the server's next step relative to the block (the earlier backfill and replay logic, offset). An evaluation whose publication was interrupted (before its step was recorded, after recording, or after logging) is completed exactly once by the next process that attaches. Rows reach the server in order, so a recorded step below the server's next step is on the server.
+- **Limitation:** if another process logged to the shared run after a milestone crashed, that milestone's remaining training rows cannot be logged (W&B steps only increase). They stay in `metrics.jsonl`, with a warning and a summary note; its evaluation is still logged.
+- **Charts:**
+  - training metrics against `reward_model/train/core/cumulative_updates` and `actor_critic/train/core/cumulative_updates`; the own counters (`.../num_updates`, `.../num_batch_train_actor_critic`) restart at every milestone and are plotted too;
+  - every training row carries `exploration/train_env_steps` (manifest `collected_steps`), identifying its milestone;
+  - evaluations as `eval/protocol-<id>/return_{max,median,mean,min,std}` and `eval/protocol-<id>/seed_<s>/return` against `exploration/train_env_steps`, one point per milestone and protocol, with different protocols as separate series; (superseded the same day: the primary protocol now publishes directly under `eval/`; see the next section).
+  - the summary maps `evaluation_protocols/protocol-<id>` to its seeds and step limit, and `milestones/<name>` to each milestone's identity, member, block and output.
+- **Config:** the run config omits the per-milestone `initialization.milestone_path` and milestone provenance, which go into the per-milestone summary instead.
+- **Compatibility:** work folders from before this change, whose `wandb_run.json` has no `shared_run`, resume their own run as before. Outputs without a record keep the earlier evaluate-only behaviour, with an explicit `wandb.name` used exactly.
+- **Not changed:** `config/downstream.yaml` still describes the earlier per-milestone W&B naming in its comments (`wandb.name` as a prefix, one run per milestone). It was left because this task forbids YAML edits, and needs a comment update.
+
+**Projects and names (launchers):**
+- **Project:** downstream `wandb.project=${DOWNSTREAM_PROJECT_PREFIX}-${group}-${task}` (default prefix `reward-free-downstream`, e.g. `reward-free-downstream-walker-walk`), one per task group and task, shared across methods and seeds.
+- **Run:** `wandb.name` and `wandb.group` are both `${LABEL}-${log_name}`, e.g. `lcg-walker--downstream-walk-es0-ds0`, used exactly. Terminal logs and exploration settings are unchanged.
+
+**Comparison (`downstream_analysis.py`):** compare selects each method's run of the domain and exploration seed whose saved `env.train.task_names` holds the requested task, so domain `cartpole` with task `balance` uses `cartpole-balance` and `swingup` uses `cartpole-swingup`. Comparisons stay per task (`comparisons/cartpole/exploration_seed_<N>/<task>/...`). Provenance and compatibility checks, recomputed statistics and plot gaps are unchanged. Two runs of one method holding the task are still refused.
+
+**Tests:**
+- Downstream tests: 112 passed after the update. Before the test changes, 12 failed on the old per-milestone run expectations; a later attempt had 4 failures (a constant name clash in the test file and wrong expected steps in a new test), which were fixed.
+- Added or rewritten:
+  - all, subset and single selections sharing one run, with cumulative axes and local counters;
+  - exact names and groups, a refused different name, and a later command joining;
+  - shared logging versus W&B off (identical training);
+  - resume in a shared run against an uninterrupted reference;
+  - interrupted evaluation publication (3 cases);
+  - resume after later steps (blocked);
+  - evaluate-only with a second protocol;
+  - both Cartpole task groups.
+- The test W&B fake can model one server across processes and refuses non-increasing steps.
+
+**Adaptation smoke** (`scripts/smoke_adaptation.sh`; kingplus0 GPU 1, 22:00–22:05, exit 0, about 5.4 min):
+- **Inputs:** copies of the Plan2Explore smoke run folders, without `downstream/`, `wandb/` and `checkpoints/`, in `~/scfeng/LCG-adaptation-smoke-20261105`. The copies were byte-identical to the sources (263 files each).
+- **Adaptations:** Walker walk and Hopper stand, ten milestones each, with 1 + 1 updates, warmup 0, and one evaluation episode with seed 3001.
+- **W&B:** projects `reward-free-downstream-smoke-walker-walk-20261105a` (run `b76f9b3e`) and `reward-free-downstream-smoke-hopper-stand-20261105a` (run `566ec9fd`). Each project holds exactly one run, finished, named and grouped `plan2explore-<group>--downstream-<task>-es0-ds0`. Each milestone process resumed that run; no milestone runs were created.
+- **Verification** (`outputs/step35-shared-wandb/server/verify_adaptation_smoke.py`, 0 failures):
+  - each run's synced history has 30 rows, equal row by row to what the local `metrics.jsonl` and evaluation files imply, at the recorded steps (blocks 0, 3, …, 27);
+  - 10 evaluation points per run at 10k–100k training env steps;
+  - 20 independent local adaptations (1 + 1 updates each, own outputs, the shared run id in each `wandb_run.json`);
+  - the copied milestones and replay, and the original smoke fixtures, are unchanged (hashes before and after).
+
+## Evaluation-publication recovery and launcher stream logs (2026-11-05)
+
+**Problem (review of the shared-run change):** `publish_evaluation` saved `published: true` right after `wandb.log`, which only queues a row. If the process died before upload, the next attachment skipped the point forever. It also treated any recorded step below the server's next step as received, which another process's later rows can make true without the point ever arriving.
+
+**Fix** (`src/downstream_trainer.py`):
+- **States:** each evaluation in the shared-run record has `status`:
+  - `assigned`: its step is recorded before logging;
+  - `logged`: `wandb.log` returned;
+  - `confirmed`: found in the server's history.
+
+  Records from before this change (`published: true/false`) read as `logged` or `assigned`.
+- **Reconciliation:** `reconcile_evaluations` runs whenever a process attaches (training, resume, evaluate-only). It reads the run's history through the W&B API (`scan_history` over the unconfirmed steps; `server_history`):
+  - a row at the recorded step holding the evaluation's protocol mean return and training env steps (`evaluation_matches`) means confirmed, never logged again;
+  - missing means logged again (`publish_evaluation(step=...)`), at the recorded step if the server has not passed it, else at the next free step, recording `recovered_from_step`;
+  - an evaluation file with no record entry was never logged (the step is recorded first) and is logged at the next free step;
+  - neither the local `logged` state nor later server rows count as proof.
+- **After a successful finish:** the run's process confirms what the server shows (`recover=False`: nothing is logged after `wandb.finish`).
+- **Offline or unavailable history:** evaluations stay unconfirmed and are not logged again (no duplicates). The summary `evaluation_publication` gives the counts (confirmed, recovered, unverified) and the reason, and a warning is printed. A later online attachment completes them.
+- **Unchanged:** the shared-run identity, milestone blocks and axes, protocol separation, independent adaptations and training. Update rows keep the in-order reconciliation within one process.
+
+**`config/downstream.yaml`:** comments only (the W&B block and the `name`/`group`/`project` comments); the parsed values are identical to `e70eb09`.
+
+**Tests** (`tests/downstream/test_downstream_eval_resume.py`; the test fake now models the server's readable history, lost rows and an unavailable API):
+- interrupted publication before the step is recorded, after recording, and after logging (3 cases);
+- regression 1: logged and saved as `logged`, but the row never reached the server, so it is recovered once;
+- regression 2: the point is already on the server and confirmation was unavailable, so it is confirmed without a duplicate;
+- regression 3: repeated recovery changes nothing;
+- regression 4: missing behind later rows of another milestone, so it is logged at the next free step (22, `recovered_from_step` 10), once;
+- offline: never claimed confirmed and not logged again.
+
+**Launchers (the user's edits, preserved):**
+- **What changed:** the default `EXPLORATION_PROJECT` is now `reward-free-exploration`, and stdout and stderr go to separate files through process substitution: `> >(tee "$log_file") 2> >(tee "${log_file%.log}.stderr.log" >&2)`.
+- **Stub check** (`outputs/step36-publication-recovery/scripts/check_stream_logs.{sh,py}`, all five launchers, `smoke.sh` and `smoke_adaptation.sh`, plus four failure cases):
+  - `bash -n` passes;
+  - every exploration call uses `reward-free-exploration`, and every downstream call `<prefix>-<group>-<task>`;
+  - `<name>.log` holds only stdout and `<name>.stderr.log` only stderr;
+  - both streams reach the terminal's stdout and stderr respectively;
+  - a Python failure stops the launcher with its exit code (3).
+- **One fix made:** `run_ensemble_100k.sh` still had `2>&1 | tee "$log_file"` in its downstream call (stderr merged into the stdout log) and a lost indentation. It now matches the other launchers; its functions are identical to `run_lcg_100k.sh` again.
+- **Note:** `tee` in a process substitution is not waited for. Its last lines can reach the terminal or file just after the next command starts, or after the launcher exits; the exit status is Python's own.
+
+**Evaluation metric names (follow-up, same day):**
+- **Primary protocol:** it publishes directly under `eval/` (`eval/return_mean`, `eval/seed_3001/return`, …) instead of `eval/protocol-<id>/…`.
+- **Where it is recorded:** the shared-run record's `primary_protocol` (`id`, `seeds`, `max_steps`). It is set from the configured evaluation when the record is created with `evaluation.after_training` on; otherwise the first after-training evaluation sets it, which also covers records from before this change.
+- **Other protocols:** they publish under `eval_protocols/protocol-<id>/…`, with their own axis definition (`eval_protocols/*` on `exploration/train_env_steps`), and never join the primary curves.
+- **Identifier and settings:** the protocol identifier (`data.milestone.protocol_id`, also used in evaluation file names), seeds and step limit are in:
+  - the W&B config (`provenance.evaluation.protocol`);
+  - the summary (`evaluation_protocols/primary`, `evaluation_protocols/protocol-<id>` with its namespace);
+  - each new local evaluation report (`protocol_id`).
+- **Runs of their own** (from before shared runs): the output's first evaluation file is primary.
+- **Recovery:** confirmation compares the server row in the evaluation's own namespace.
+- **Tests:** the downstream logging tests were updated (32 passed); all downstream tests ran (result in `outputs/step36-publication-recovery/logs/pytest_downstream_final.txt`).
+
+
 ## Downstream W&B recovery after independent review (2026-11-06)
 
 Worked from the current uncommitted tree on `e70eb09`, preserving the user's `.gitignore`, all production,

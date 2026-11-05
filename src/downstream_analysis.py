@@ -316,20 +316,26 @@ def read_csv(path: Path) -> List[Dict[str, Any]]:
 
 def compare_methods(output_root: Path, domain: str, exploration_seed: int, task_name: str, seed: int,
                     member_index: int = 0, protocol: Optional[str] = None) -> Path:
-    """Every method's run outputs/<method>/<domain>/seed_<exploration seed> with a result.csv for the task,
-    adaptation seed and member: comparison.csv, analysis.json, task_return.{png,pdf} and
-    fraction_over_thresholds.{png,pdf}. Methods come from each run's saved configuration. Rows of different
+    """Every method's exploration run of the domain and exploration seed whose task group holds the task:
+    outputs/<method>/<group>/seed_<exploration seed>, where <group> is the domain or a task-group label (two
+    groups of one domain, e.g. cartpole-balance and cartpole-swingup, both domain cartpole). Runs are
+    selected by their saved configuration (domain, task group, seed), never by folder names. From each run's
+    result.csv for the task, adaptation seed and member: comparison.csv, analysis.json, task_return.{png,pdf}
+    and fraction_over_thresholds.{png,pdf}. Methods come from each run's saved configuration. Rows of different
     evaluation protocols or downstream settings are not compared; missing milestones are recorded, never
     interpolated."""
     output_root = Path(output_root)
     comparison_dir = output_root / "comparisons" / domain / f"exploration_seed_{exploration_seed}" / task_name / \
         f"adaptation_seed_{seed}"
     runs, missing, inputs, rows = {}, [], [], []
-    for run_dir in sorted(output_root.glob(f"*/{domain}/seed_{exploration_seed}")):
+    for run_dir in sorted(output_root.glob(f"*/*/seed_{exploration_seed}")):
         if not (run_dir / "config" / "exploration.yaml").is_file():
             continue
         identity = exploration_identity(run_dir)
-        if (identity["domain"], identity["exploration_seed"]) != (domain, exploration_seed):
+        tasks = OmegaConf.select(OmegaConf.load(run_dir / "config" / "exploration.yaml"), "env.train.task_names")
+        if identity["domain"] != domain or task_name not in list(tasks or []):
+            continue  # another domain, or the other task group of this domain
+        if identity["exploration_seed"] != exploration_seed:
             raise ValueError(f"{run_dir}: its configuration records {identity['domain']}, seed "
                              f"{identity['exploration_seed']}; not {domain}, seed {exploration_seed}")
         if identity["method"] in runs:
@@ -378,7 +384,7 @@ def compare_methods(output_root: Path, domain: str, exploration_seed: int, task_
                                                                                 for p in evaluations}))
         rows += method_rows
     if not rows:
-        raise ValueError(f"No result.csv under {output_root}/*/{domain}/seed_{exploration_seed} for {task_name}, "
+        raise ValueError(f"No result.csv under {output_root}/<method>/<group>/seed_{exploration_seed} ({domain}) for {task_name}, "
                          f"adaptation seed {seed}, member {member_index}; missing: {missing}")
     protocols = sorted({r["protocol"] for r in rows})
     if protocol is not None:

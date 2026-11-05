@@ -36,19 +36,19 @@ GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/run_lcg_10
 
 - **Order:** a launcher first explores all seven task groups (walker, hopper, acrobot, cartpole-balance, cartpole-swingup, humanoid, humanoid_CMU) with its `<method>_100k` preset. It then adapts every task of every group, one task at a time, on the ten selected milestones (`downstream_10_milestones`).
 - **Seeds and budgets:** exploration seed 0 and adaptation seed 0. Training and evaluation budgets come from the YAML.
-- **Settings at the top of each script:** the GPU, the Python interpreter, the seeds and the W&B projects (`EXPLORATION_PROJECT`, `DOWNSTREAM_PROJECT`).
+- **Settings at the top of each script:** the GPU, the Python interpreter, the seeds, the exploration W&B project (`EXPLORATION_PROJECT`, default `reward-free-exploration`) and the downstream project prefix (`DOWNSTREAM_PROJECT_PREFIX`, default `reward-free-downstream`).
 - **GPU and output:** the script binds CUDA and EGL rendering to `GPU` and logs to W&B online.
 - **Exploration outputs:** `outputs/<method>/<group>/seed_0/`, where `<method>` is `lcg`, `uniform`, `full-ensemble`, `laplace-ensemble` or `plan2explore`. The two Cartpole groups get separate folders (`cartpole-balance`, `cartpole-swingup`), but both run the `cartpole` domain.
 - **Downstream outputs:** inside each run folder, under `downstream/`.
-- **Terminal logs:** one per run, in a new folder `logs/<method>/<date>-<id>/`.
+- **Terminal logs:** two per run, in a new folder `logs/<method>/<date>-<id>/`: `<name>.log` holds stdout and `<name>.stderr.log` holds stderr, while both streams stay on the terminal (each through its own `tee`). A failed Python process still stops the launcher with its exit status.
 - **Existing output:** a launcher refuses to start if any of its seven run folders exists. Resume an interrupted exploration with `scripts/resume.sh <run folder>`.
 - **Failures:** any failure stops the script with a nonzero exit status.
 - **W&B identities:**
-  - exploration run and group: `<method>-<group>--exploration-es0`;
-  - downstream runs: `<method>-<group>--downstream-es0-steps_NNNNNN-<task>-adaptation-seed0`, one per milestone (the launcher sets the prefix `<method>-<group>--downstream-es0`; the downstream code appends the rest), grouped by `<method>-<group>--downstream-<task>-es0-ds0`.
-- **Terminal log names:** `<group>--exploration-es0.log` and `<group>--downstream-<task>-es0-ds0.log`. `es`/`ds` are the exploration and adaptation seeds; `--` separates the group label, which may itself contain `-`.
+  - exploration: project `EXPLORATION_PROJECT`; run and group `<method>-<group>--exploration-es0`;
+  - downstream: one project per task group and task, shared by methods and seeds, `<DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>` (e.g. `reward-free-downstream-walker-walk`); one run per method, task group, task and seed, shared by its ten milestones, with run name and group both `<method>-<group>--downstream-<task>-es0-ds0` (e.g. `lcg-walker--downstream-walk-es0-ds0`).
+- **Terminal log names:** `<group>--exploration-es0.log` and `<group>--downstream-<task>-es0-ds0.log` (stdout), each with its `.stderr.log`. `es`/`ds` are the exploration and adaptation seeds; `--` separates the group label, which may itself contain `-`.
 
-`scripts/smoke.sh` is a storage and integration smoke built on `run_plan2explore_100k.sh`.
+`scripts/smoke/smoke.sh` is a storage and integration smoke built on `run_plan2explore_100k.sh`.
 - **Scope:** it keeps that launcher's structure, paths, logs and W&B identities. Only its task groups and inline training/evaluation overrides differ.
 - **Groups:** Walker `[walk]`, then Hopper `[stand]`, each with the full 100k training steps.
 - **Training:**
@@ -62,9 +62,14 @@ GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/run_lcg_10
 
 ```bash
 GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python \
-    EXPLORATION_PROJECT=lcg-reward-free-exploration-smoke DOWNSTREAM_PROJECT=lcg-reward-free-downstream-smoke \
-    bash scripts/smoke.sh
+    EXPLORATION_PROJECT=<exploration smoke project> DOWNSTREAM_PROJECT_PREFIX=<downstream smoke prefix> \
+    bash scripts/smoke/smoke.sh
 ```
+
+`scripts/smoke/smoke_adaptation.sh` is the downstream part of `smoke.sh` alone, on existing smoke milestones.
+- **Inputs:** `outputs/plan2explore/{walker,hopper}/seed_0` with their milestones and replay, for example copies of the `smoke.sh` run folders without `downstream/`. It refuses a missing milestones folder, existing outputs of its tasks, and an existing shared W&B run record, before starting anything. The milestones and replay are only read.
+- **Adaptation:** Walker walk, then Hopper stand, on the ten selected milestones each, with one reward-model and one policy update (warmup 0) and one evaluation episode (seed 3001).
+- **W&B:** online, in new projects `<DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>-<PROJECT_SUFFIX>`; the prefix defaults to `reward-free-downstream-smoke` and the suffix to the launch time.
 
 ### Downstream W&B logging
 
@@ -110,7 +115,7 @@ For tests without training:
 OMP_NUM_THREADS=1 MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 /home/bigking/anaconda3/envs/lcg/bin/python -m pytest -q tests
 ```
 
-Runs save the effective Hydra configuration (`config/exploration.yaml`), source/scripts, datasets, agent versions, milestones and full resume state under their output directory. By default an exploration run's folder is `outputs/<method>/<domain>/seed_<exploration seed>/` (method: `uniform`, `lcg`, `full-ensemble`, `laplace-ensemble` or `plan2explore`; a fixed `common.seed` is required), and a new run refuses a folder that already holds run outputs; resume it instead. Downstream outputs go to `<run>/downstream/steps_<N>/<task>/seed_<s>/`; `python src/downstream_analysis.py downstream.mode=collect` writes `<run>/result/<task>/seed_<s>/result.csv` and `downstream.mode=compare` writes `outputs/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<s>/` (CSV, analysis.json and plots; matplotlib needed). Custom output roots are pending. `static_dataset.path` retains training from an existing dataset. `intrinsic_reward.enabled` switches the intrinsic scorer; the uniform preset disables it.
+Runs save the effective Hydra configuration (`config/exploration.yaml`), source/scripts, datasets, agent versions, milestones and full resume state under their output directory. By default an exploration run's folder is `outputs/<method>/<domain>/seed_<exploration seed>/` (method: `uniform`, `lcg`, `full-ensemble`, `laplace-ensemble` or `plan2explore`; a fixed `common.seed` is required), and a new run refuses a folder that already holds run outputs; resume it instead. Downstream outputs go to `<run>/downstream/steps_<N>/<task>/seed_<s>/`; `python src/downstream_analysis.py downstream.mode=collect` writes `<run>/result/<task>/seed_<s>/result.csv` and `downstream.mode=compare` writes `outputs/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<s>/` (CSV, analysis.json and plots; matplotlib needed). Compare selects each method's run of the domain and exploration seed whose saved task group holds the task, so `analysis.domain=cartpole downstream.task_name=balance` uses the `cartpole-balance` folders and `swingup` uses `cartpole-swingup`. Custom output roots are pending. `static_dataset.path` retains training from an existing dataset. `intrinsic_reward.enabled` switches the intrinsic scorer; the uniform preset disables it.
 
 To resume a run, pass its folder to the resume script, from the repository or anywhere else:
 

@@ -1470,12 +1470,12 @@ def synthetic_returns(steps, n):
 
 
 def synthetic_output(run, steps, returns, seeds=EVAL_SEEDS, max_steps=500, task="walk", seed=0, member=0,
-                     settings_steps=5, action_repeat=2):
+                     settings_steps=5, action_repeat=2, domain="walker", task_names=("stand", "walk", "run")):
     """One milestone of a synthetic exploration run and its completed downstream output (JSON metadata,
     saved config and one evaluation report), as the trainers write them."""
     milestone = run / f"milestones/steps_{steps:06d}"
     milestone.mkdir(parents=True, exist_ok=True)
-    env = dict(domain_name="walker", task_names=["stand", "walk", "run"], size=64, camera_id=0, action_repeat=action_repeat,
+    env = dict(domain_name=domain, task_names=list(task_names), size=64, camera_id=0, action_repeat=action_repeat,
                time_limit=None)
     denoiser = dict(architecture="synthetic")
     identity = dict(denoiser_sha256=f"denoiser-{steps}", dataset_sha256=f"index-{steps}", collected_steps=steps)
@@ -1484,7 +1484,7 @@ def synthetic_output(run, steps, returns, seeds=EVAL_SEEDS, max_steps=500, task=
     if not (milestone / "manifest.json").exists():
         method = METHOD_KEYS[run.parents[1].name]
         write_json(milestone / "manifest.json", dict(schema_version=1, collected_steps=steps, identity=identity,
-                   domain="walker", task_names=env["task_names"], model=dict(env=env, denoiser=denoiser),
+                   domain=domain, task_names=env["task_names"], model=dict(env=env, denoiser=denoiser),
                    exploration=dict(intrinsic_reward_enabled=method is not None, method=method or "lcg")))
     elif member:  # this fixture can add a selected member's result to an existing synthetic milestone
         manifest = read_manifest(milestone)
@@ -1504,7 +1504,7 @@ def synthetic_output(run, steps, returns, seeds=EVAL_SEEDS, max_steps=500, task=
                                          actor_critic=dict(training=dict(steps=5)), checkpointing=dict(every=100))),
                    output / "config.yaml")
     values = np.array(returns, dtype=float)
-    result = dict(task_name=task, domain_name="walker", seeds=list(seeds), max_steps=max_steps,
+    result = dict(task_name=task, domain_name=domain, seeds=list(seeds), max_steps=max_steps,
                   action_repeat=action_repeat, policy="deterministic (Beta mean)",
                   return_convention=downstream_module.RETURN_CONVENTION,
                   episodes=[dict(seed=s, episode_return=float(r), length=max_steps) for s, r in zip(seeds, values)],
@@ -1519,11 +1519,14 @@ def synthetic_output(run, steps, returns, seeds=EVAL_SEEDS, max_steps=500, task=
     return output, path
 
 
-def synthetic_run(root, method, steps=(300, 400, 500), exploration_seed=0, **kwargs):
-    run = root / "outputs" / method / "walker" / f"seed_{exploration_seed}"
+def synthetic_run(root, method, steps=(300, 400, 500), exploration_seed=0, group=None, **kwargs):
+    """A synthetic exploration run outputs/<method>/<group>/seed_<N> (group: the domain unless given, e.g.
+    cartpole-balance) of the domain and task group kwargs name (default walker, stand/walk/run)."""
+    domain = kwargs.get("domain", "walker")
+    run = root / "outputs" / method / (group or domain) / f"seed_{exploration_seed}"
     (run / "config").mkdir(parents=True, exist_ok=True)
-    env = dict(domain_name="walker", task_names=["stand", "walk", "run"], size=64, camera_id=0,
-               action_repeat=kwargs.get("action_repeat", 2), time_limit=None)
+    env = dict(domain_name=domain, task_names=list(kwargs.get("task_names", ("stand", "walk", "run"))), size=64,
+               camera_id=0, action_repeat=kwargs.get("action_repeat", 2), time_limit=None)
     OmegaConf.save(OmegaConf.create(dict(common=dict(seed=exploration_seed), env=dict(train=env),
                                          agent=dict(denoiser=dict(architecture="synthetic")),
                                          intrinsic_reward=dict(enabled=METHOD_KEYS[method] is not None,
@@ -1685,6 +1688,41 @@ def test_method_comparison_files_inputs_and_checks(tmp_path):
         next((p2e / "downstream/steps_000600/walk/seed_0/evaluations").iterdir())))
     with pytest.raises(ValueError, match="different evaluation protocols"):
         analysis_module.compare_methods(root, "walker", 0, "walk", 0)
+
+
+def test_comparison_finds_the_task_group_of_the_requested_task(tmp_path, monkeypatch):
+    """Two task groups of one domain (cartpole-balance, cartpole-swingup; both domain cartpole) per method:
+    the comparison of a task uses each method's run whose task group holds it, and the groups stay separate."""
+    monkeypatch.setattr(analysis_module, "plot_comparison", lambda spec: None)
+    root = tmp_path / "outputs"
+    groups = dict(balance=("cartpole-balance", ("balance", "balance_sparse"), (300, 400)),
+                  swingup=("cartpole-swingup", ("swingup", "swingup_sparse"), (300, 500)))
+    for task, (group, tasks, steps) in groups.items():
+        for method in ("uniform", "plan2explore"):
+            run = synthetic_run(tmp_path, method, steps=steps, group=group, domain="cartpole", task_names=tasks, task=task)
+            assert analysis_module.collect_results(run, task, 0)[0] is not None
+    synthetic_run(tmp_path, "uniform", steps=(300,))  # another domain: never selected
+    before = tree_hashes(root)
+    for task, (group, tasks, steps) in groups.items():
+        out = analysis_module.compare_methods(root, "cartpole", 0, task, 0)
+        assert out == root / f"comparisons/cartpole/exploration_seed_0/{task}/adaptation_seed_0"
+        analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+        assert analysis["methods"] == ["uniform", "plan2explore"] and analysis["plot_grid"] == list(steps)
+        assert {Path(i["run"]).parent.name for i in analysis["inputs"]} == {group}  # only this task's group
+        table = analysis_module.read_csv(out / "comparison.csv")
+        assert {(r["domain"], r["task"]) for r in table} == {("cartpole", task)}
+        assert [(r["method"], r["train_env_steps"]) for r in table] == [(m, s) for m in ("uniform", "plan2explore") for s in steps]
+        assert all(r["source_evaluation_file"].startswith(f"downstream/steps_") and f"/{task}/" in r["source_evaluation_file"]
+                   for r in table)
+    changed = {k for k, v in tree_hashes(root).items() if before.get(k) != v}
+    assert all("comparisons" in Path(k).parts for k in changed)  # analysis only reads its inputs
+    # A task of a group with no collected results for it: nothing to compare (the other group is not used).
+    with pytest.raises(ValueError, match="No result.csv under .*cartpole.* for balance_sparse"):
+        analysis_module.compare_methods(root, "cartpole", 0, "balance_sparse", 0)
+    # Two runs of one method holding the task (e.g. the default cartpole folder as well) are ambiguous.
+    shutil.copytree(root / "uniform/cartpole-balance/seed_0", root / "uniform/cartpole/seed_0")
+    with pytest.raises(ValueError, match="Two runs record method uniform"):
+        analysis_module.compare_methods(root, "cartpole", 0, "balance", 0)
 
 
 def test_comparison_needs_the_same_effective_environment_evaluation_and_training_settings(tmp_path, monkeypatch):

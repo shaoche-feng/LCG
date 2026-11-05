@@ -21,8 +21,10 @@ ADAPTATION_SEED=0
 GPU="${GPU:-0}"
 PYTHON="${PYTHON:-python}"
 
-EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-lcg-reward-free}"
-DOWNSTREAM_PROJECT="${DOWNSTREAM_PROJECT:-lcg-reward-free-downstream}"
+EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-reward-free-exploration}"
+# One downstream W&B project per task group and task, shared by methods and seeds:
+# <DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>.
+DOWNSTREAM_PROJECT_PREFIX="${DOWNSTREAM_PROJECT_PREFIX:-reward-free-downstream}"
 
 PRESET=ensemble_100k
 LABEL=full-ensemble  # output label of the method (data/milestone.py OUTPUT_LABELS)
@@ -41,7 +43,6 @@ export PYTHONUNBUFFERED=1
 #
 # Separate Cartpole labels prevent the two groups sharing an output.
 TASK_GROUPS=(
-    'walker|walker|stand,walk,run'
     'hopper|hopper|stand,hop'
     'acrobot|acrobot|swingup,swingup_sparse'
     'cartpole-balance|cartpole|balance,balance_sparse'
@@ -76,7 +77,8 @@ run_exploration() {
         "wandb.group=${LABEL}-${log_name}" \
         "wandb.name=${LABEL}-${log_name}" \
         "hydra.run.dir=$run_dir" \
-        2>&1 | tee "$log_file"
+        > >(tee "$log_file") \
+        2> >(tee "${log_file%.log}.stderr.log" >&2)
 }
 
 # -------------------------------------------------------------------
@@ -100,8 +102,8 @@ run_downstream() {
     printf '\n=== Downstream: %s / %s ===\n' "$group" "$task"
     printf 'Milestones: %s\nLog: %s\n' "$milestones_dir" "$log_file"
 
-    # One W&B run per milestone: wandb.name is a prefix, to which downstream appends
-    # -<milestone>-<task>-adaptation-seed<s>; wandb.group collects the milestones of one task.
+    # One W&B run, named and grouped ${LABEL}-${log_name}, shared by the ten milestones; each milestone
+    # is still adapted independently, in its own child process and output folder.
     "$PYTHON" -u src/downstream_main.py \
         +experiment=downstream_10_milestones \
         "initialization.milestones_dir=$milestones_dir" \
@@ -110,10 +112,11 @@ run_downstream() {
         downstream.mode=train \
         "common.devices=$GPU" \
         wandb.mode=online \
-        "wandb.project=$DOWNSTREAM_PROJECT" \
+        "wandb.project=${DOWNSTREAM_PROJECT_PREFIX}-${group}-${task}" \
         "wandb.group=${LABEL}-${log_name}" \
-        "wandb.name=${LABEL}-${group}--downstream-es${EXPLORATION_SEED}" \
-        2>&1 | tee "$log_file"
+        "wandb.name=${LABEL}-${log_name}" \
+        > >(tee "$log_file") \
+        2> >(tee "${log_file%.log}.stderr.log" >&2)
 }
 
 # -------------------------------------------------------------------
@@ -136,6 +139,14 @@ mkdir -p "$LOG_ROOT"
 # Unique directory for this invocation's terminal logs.
 ATTEMPT_DIR="$(mktemp -d \
     "$LOG_ROOT/$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+
+# Combined launcher logs: every message and every phase's output, stdout and stderr kept apart (both
+# still on the terminal); the per-phase logs below are kept as well.
+LAUNCH_LOG="$ATTEMPT_DIR/launcher.stdout.log"
+ERROR_LOG="$ATTEMPT_DIR/launcher.stderr.log"
+
+exec > >(tee -a "$LAUNCH_LOG") \
+     2> >(tee -a "$ERROR_LOG" >&2)
 
 printf 'Full-ensemble experiment | GPU %s | exploration seed %s | adaptation seed %s\n' \
     "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"

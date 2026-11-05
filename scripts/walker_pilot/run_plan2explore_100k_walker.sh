@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Storage/integration smoke using the production Plan2Explore launch structure.
-#   GPU=1 bash scripts/smoke.sh
-# Only TASK_GROUPS and training/evaluation command-line settings differ.
-# Production output paths, logs, W&B identity, preflight and phase loops are retained.
-# WARNING: these smoke runs occupy outputs/plan2explore/{walker,hopper}/seed_0.
-# 100k steps, 20 saved milestones and 10 downstream milestones come from production YAML.
-# Each training phase uses one update; evaluation uses one episode (seed 3001).
-# Plan2Explore predictor fitting also uses one update per predictor per refresh.
-# No YAML files are edited. This run is not a learning-quality experiment.
+
 
 # Run from the repository root.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 # -------------------------------------------------------------------
@@ -24,11 +16,13 @@ ADAPTATION_SEED=0
 GPU="${GPU:-0}"
 PYTHON="${PYTHON:-python}"
 
-EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-lcg-reward-free}"
-DOWNSTREAM_PROJECT="${DOWNSTREAM_PROJECT:-lcg-reward-free-downstream}"
+EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-reward-free-exploration}"
+# One downstream W&B project per task group and task, shared by methods and seeds:
+# <DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>.
+DOWNSTREAM_PROJECT_PREFIX="${DOWNSTREAM_PROJECT_PREFIX:-reward-free-downstream}"
 
 PRESET=plan2explore_100k
-LABEL=plan2explore  # output label of the method (data/milestone.py OUTPUT_LABELS)
+LABEL=plan2explore # output label of the method (data/milestone.py OUTPUT_LABELS)
 
 OUTPUT_ROOT="$REPO_ROOT/outputs/$LABEL"
 LOG_ROOT="$REPO_ROOT/logs/$LABEL"
@@ -44,8 +38,7 @@ export PYTHONUNBUFFERED=1
 #
 # Separate Cartpole labels prevent the two groups sharing an output.
 TASK_GROUPS=(
-    'walker|walker|walk'
-    'hopper|hopper|stand'
+    'walker|walker|stand,walk,run'
 )
 
 # -------------------------------------------------------------------
@@ -69,28 +62,18 @@ run_exploration() {
         "env.train.task_names=[$tasks]" \
         "common.seed=$EXPLORATION_SEED" \
         "common.devices=$GPU" \
-        denoiser.training.steps_first_epoch=1 \
-        denoiser.training.steps_per_epoch=1 \
-        denoiser.training.lr_warmup_steps=0 \
-        actor_critic.training.steps_first_epoch=1 \
-        actor_critic.training.steps_per_epoch=1 \
-        actor_critic.training.lr_warmup_steps=0 \
-        intrinsic_reward.fit_updates=1 \
-        collection.test.num_episodes=1 \
-        'evaluation.reset_seeds=[3001]' \
-        collection.test.num_final_episodes=1 \
-        'evaluation.final_reset_seeds=[3001]' \
         wandb.mode=online \
         "wandb.project=$EXPLORATION_PROJECT" \
         "wandb.group=${LABEL}-${log_name}" \
         "wandb.name=${LABEL}-${log_name}" \
         "hydra.run.dir=$run_dir" \
-        2>&1 | tee "$log_file"
+        > >(tee "$log_file") \
+        2> >(tee "${log_file%.log}.stderr.log" >&2)
 }
 
 # -------------------------------------------------------------------
 # Downstream: one milestones folder and one task
-# The Python launcher processes the ten selected milestones sequentially.
+# The Python launcher adapts the selected milestone (100k only).
 # -------------------------------------------------------------------
 run_downstream() {
     local group="$1"
@@ -109,25 +92,21 @@ run_downstream() {
     printf '\n=== Downstream: %s / %s ===\n' "$group" "$task"
     printf 'Milestones: %s\nLog: %s\n' "$milestones_dir" "$log_file"
 
-    # One W&B run per milestone: wandb.name is a prefix, to which downstream appends
-    # -<milestone>-<task>-adaptation-seed<s>; wandb.group collects the milestones of one task.
+    # One W&B run, named and grouped ${LABEL}-${log_name}, holding the 100k milestone's adaptation.
     "$PYTHON" -u src/downstream_main.py \
         +experiment=downstream_10_milestones \
+        'initialization.milestone_steps=[100000]' \
         "initialization.milestones_dir=$milestones_dir" \
         "downstream.task_name=$task" \
         "downstream.seed=$ADAPTATION_SEED" \
         downstream.mode=train \
         "common.devices=$GPU" \
-        rew_end_model.training.steps=1 \
-        rew_end_model.training.lr_warmup_steps=0 \
-        actor_critic.training.steps=1 \
-        actor_critic.training.lr_warmup_steps=0 \
-        'evaluation.seeds=[3001]' \
         wandb.mode=online \
-        "wandb.project=$DOWNSTREAM_PROJECT" \
+        "wandb.project=${DOWNSTREAM_PROJECT_PREFIX}-${group}-${task}" \
         "wandb.group=${LABEL}-${log_name}" \
-        "wandb.name=${LABEL}-${group}--downstream-es${EXPLORATION_SEED}" \
-        2>&1 | tee "$log_file"
+        "wandb.name=${LABEL}-${log_name}" \
+        > >(tee "$log_file") \
+        2> >(tee "${log_file%.log}.stderr.log" >&2)
 }
 
 # -------------------------------------------------------------------
@@ -151,7 +130,15 @@ mkdir -p "$LOG_ROOT"
 ATTEMPT_DIR="$(mktemp -d \
     "$LOG_ROOT/$(date +%Y%m%d-%H%M%S)-XXXXXX")"
 
-printf 'Plan2Explore experiment | GPU %s | exploration seed %s | adaptation seed %s\n' \
+# Combined launcher logs: every message and every phase's output, stdout and stderr kept apart (both
+# still on the terminal); the per-phase logs below are kept as well.
+LAUNCH_LOG="$ATTEMPT_DIR/launcher.stdout.log"
+ERROR_LOG="$ATTEMPT_DIR/launcher.stderr.log"
+
+exec > >(tee -a "$LAUNCH_LOG") \
+     2> >(tee -a "$ERROR_LOG" >&2)
+
+printf 'Plan2Explore Walker experiment | GPU %s | exploration seed %s | adaptation seed %s\n' \
     "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
 printf 'Outputs: %s\nTerminal logs: %s\n' "$OUTPUT_ROOT" "$ATTEMPT_DIR"
 
@@ -165,7 +152,7 @@ done
 
 # -------------------------------------------------------------------
 # Phase 2: adapt every task, one task at a time.
-# Each task adapts ten milestones before the next task starts.
+# Each task adapts the 100k milestone before the next task starts.
 # -------------------------------------------------------------------
 for entry in "${TASK_GROUPS[@]}"; do
     IFS='|' read -r group domain tasks <<< "$entry"
@@ -176,5 +163,5 @@ for entry in "${TASK_GROUPS[@]}"; do
     done
 done
 
-printf '\nAll Plan2Explore exploration and downstream runs completed.\n'
+printf '\nAll Plan2Explore Walker exploration and downstream runs completed.\n'
 printf 'Terminal logs: %s\n' "$ATTEMPT_DIR"
