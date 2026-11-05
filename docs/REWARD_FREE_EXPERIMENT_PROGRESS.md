@@ -143,6 +143,11 @@ Details and status history: `REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6.
   evaluation returns, with same-run resume and a local mirror; cleanup verified in ten-epoch smokes of all five methods (`2aaec3b`).
 - [ ] Analysis for the exploration phase. Test collection with denoiser test loss and a four-seed intrinsic evaluation
   are in place (`84c119d`); comparing exploration across methods and seeds is not done.
+  Physical-state recording for coverage analysis (2026-11-05, committed before the independent review): each training frame's
+  MuJoCo qpos/qvel (float64, exactly the rendered frame's instant, final and milestone successor states included)
+  in the episode files (`Episode.physical_state`), `collection.train.record_physical_state: true`, evaluation off.
+  Analysis only; recording on/off training is bit-identical; CPU smoke 23/23 checks, +1.2% episode storage.
+  Coverage metrics are not implemented. Notes: "Physical-state recording for exploration coverage analysis".
 - [x] Terminal logging for the downstream phase. One banner and batch plan per command (single milestone or
   folder), then one block per milestone: progress bars for reward-predictor training, task-policy training and
   evaluation, the evaluation summary (max, median, mean, min, std) and the saved paths. Evaluate-only works from

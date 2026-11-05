@@ -69,11 +69,15 @@ collection:
     # uniform = uniform-random baseline (no policy updates; intrinsic_reward.enabled=false).
     mode: policy
     steps_per_epoch: 100
+    # Store each frame's MuJoCo qpos/qvel in the training episodes (Episode.physical_state), for
+    # coverage analysis only: never read by training, scoring or downstream adaptation.
+    record_physical_state: true
   test:
     num_envs: 1
     num_episodes: 4
     epsilon: 0.0
     num_final_episodes: 100
+    record_physical_state: false  # test (evaluation) episodes
 
 static_dataset:
   path: null  # if specified, will disable train/test data collection

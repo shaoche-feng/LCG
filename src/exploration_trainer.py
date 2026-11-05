@@ -18,7 +18,8 @@ from agent import Agent, get_action_space_kwargs
 from utils import normalize_saved_config
 from coroutines.collector import COLLECTION_MODES, CollectorState, make_collector, NumToCollect
 from data import BatchSampler, collate_segments_without_rewards, Dataset, DatasetTraverser
-from data.milestone import OUTPUT_LABELS, method_label, milestone_name, publish_milestone, read_manifest, referenced_files
+from data.milestone import (OUTPUT_LABELS, method_label, milestone_name, physical_state_manifest, publish_milestone,
+                            read_manifest, referenced_files)
 from utils import device_lines, physical_gpu_index
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
 from intrinsic_reward.ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
@@ -230,8 +231,13 @@ class ExplorationTrainer(StateDictMixin):
 
         # Envs
         if self._rank == 0:
-            train_env = make_dm_control_env(num_envs=cfg.collection.train.num_envs, device=self._device, **cfg.env.train)
-            test_env = make_dm_control_env(num_envs=cfg.collection.test.num_envs, device=self._device, **cfg.env.test)
+            # Physical states: analysis-only per-frame metadata; a config saved before the key records none.
+            train_env = make_dm_control_env(
+                num_envs=cfg.collection.train.num_envs, device=self._device, **cfg.env.train,
+                record_physical_state=bool(OmegaConf.select(cfg, "collection.train.record_physical_state", default=False)))
+            test_env = make_dm_control_env(
+                num_envs=cfg.collection.test.num_envs, device=self._device, **cfg.env.test,
+                record_physical_state=bool(OmegaConf.select(cfg, "collection.test.record_physical_state", default=False)))
             action_kwargs = get_action_space_kwargs(test_env)
         else:
             action_kwargs = None
@@ -1419,6 +1425,18 @@ class ExplorationTrainer(StateDictMixin):
                     successors[episode_id] = state.loop.obs[i]
         return successors
 
+    def successor_physical_states(self) -> Dict[int, Dict[str, torch.Tensor]]:
+        """Analysis only: the physical state of each successor observation (the train env's current
+        state; after a resume, read from the restored env), by episode id. Unknown ones are absent."""
+        state = self._train_collector_state
+        current = self._train_env.physical_states() if hasattr(self._train_env, "physical_states") else []
+        successors = {}
+        if state.loop.obs is not None:
+            for i, episode_id in enumerate(state.episode_ids):
+                if episode_id is not None and i < len(current) and current[i] is not None:
+                    successors[episode_id] = {k: v.clone() for k, v in current[i].items()}
+        return successors
+
     def publish_milestone(self, name: str) -> Path:
         cfg = self._cfg
         successors = self.successor_observations()
@@ -1439,6 +1457,8 @@ class ExplorationTrainer(StateDictMixin):
                        env=OmegaConf.to_container(cfg.env.train)),
             run_config="../../config/exploration.yaml",
             source=self.source,
+            physical_state=physical_state_manifest(
+                bool(OmegaConf.select(cfg, "collection.train.record_physical_state", default=False))),
         )
         member_states = None
         if self.ensemble is not None:
@@ -1465,7 +1485,8 @@ class ExplorationTrainer(StateDictMixin):
                 refresh_epoch=lap.refresh_epoch, refreshes=int(lap.refreshes),
                 note="denoiser.pt is the unperturbed base model; sampled members are not part of the milestone")
         path = publish_milestone(self._path_milestones, name, self.agent.denoiser.state_dict(),
-                                 self.train_dataset, successors, manifest, member_states)
+                                 self.train_dataset, successors, manifest, member_states,
+                                 successor_physical_states=self.successor_physical_states())
         say(f"Milestone {name} published: > {Path(path).resolve()}")
         self.milestone_summary(name)
         return path

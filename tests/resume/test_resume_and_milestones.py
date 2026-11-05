@@ -102,12 +102,13 @@ def numeric(rows, after_epoch=0):
     return out
 
 
-def dataset_contents(dataset):
+def dataset_contents(dataset, physical=True):
     contents = []
     for i in range(dataset.num_episodes):
         ep = dataset.load_episode(i)
         contents.append([ep.obs, ep.act, ep.rew, ep.end, ep.trunc, ep.task_rew,
-                         ep.info.get("final_observation", torch.zeros(0))])
+                         ep.info.get("final_observation", torch.zeros(0))]
+                        + ([ep.physical_state or {}] if physical else []))
     return contents
 
 
@@ -129,8 +130,9 @@ def assert_identical(x, y, where="state"):
         assert x == y, where
 
 
-def assert_same_run(a, b, logs_a, logs_b, after_epoch):
-    """Bit-identical: weights, optimizers, counters, RNG, replay, collector, logs."""
+def assert_same_run(a, b, logs_a, logs_b, after_epoch, physical=True):
+    """Bit-identical: weights, optimizers, counters, RNG, replay (with its physical states unless
+    physical=False), collector, logs."""
     assert (a.epoch, a.num_epochs_collect) == (b.epoch, b.num_epochs_collect)
     assert a.num_batch_train.state_dict() == b.num_batch_train.state_dict()
     assert_identical(a.agent.state_dict(), b.agent.state_dict(), "agent")  # incl. PMPO's private RNG
@@ -138,7 +140,8 @@ def assert_same_run(a, b, logs_a, logs_b, after_epoch):
     assert_identical(a.lr_sched.state_dict(), b.lr_sched.state_dict(), "schedulers")
     assert_identical(a._final_rng, b._final_rng, "global RNG")
     assert a.train_dataset.lengths.tolist() == b.train_dataset.lengths.tolist()
-    for x, y in zip(dataset_contents(a.train_dataset), dataset_contents(b.train_dataset)):
+    for x, y in zip(dataset_contents(a.train_dataset, physical), dataset_contents(b.train_dataset, physical)):
+        assert len(x) == len(y)
         for u, v in zip(x, y):
             torch.testing.assert_close(v, u, rtol=0, atol=0)
     sa, sb = a._train_collector_state, b._train_collector_state
@@ -203,6 +206,18 @@ def test_learned_resume_matches_uninterrupted_run(tmp_path, monkeypatch):
     for field in ("obs", "act", "rew", "end", "trunc", "task_rew"):
         torch.testing.assert_close(getattr(cut, field), getattr(final_episode, field)[:8], rtol=0, atol=0)
     torch.testing.assert_close(early.successor_observations[1], final_episode.obs[8], rtol=0, atol=0)
+    # Physical states (recorded by default for training collection) read back from the milestone:
+    # the cut episode's rows, and the successor's state is that of the next stored frame.
+    states = final_episode.physical_state
+    assert states["recorded"].all() and early.manifest["physical_state"]["recording"] is True
+    for key in ("qpos", "qvel", "recorded"):
+        torch.testing.assert_close(cut.physical_state[key], states[key][:8], rtol=0, atol=0)
+    assert "final_qpos" not in cut.physical_state and "final_qpos" in states
+    assert sorted(early.successor_physical_states) == sorted(early.successor_observations) == [1]
+    for key in ("qpos", "qvel"):
+        torch.testing.assert_close(early.successor_physical_states[1][key], states[key][8], rtol=0, atol=0)
+    # Evaluation (test) episodes record none by default.
+    assert all(full.test_dataset.load_episode(i).physical_state is None for i in range(full.test_dataset.num_episodes))
     # Only versions referenced by the checkpoint or a milestone remain on disk.
     monkeypatch.chdir(tmp_path / "full")  # the run's dataset paths are relative to its folder
     on_disk = {p.resolve() for p in (tmp_path / "full/dataset/train").rglob("*.pt") if p.name != "info.pt"}
@@ -210,6 +225,60 @@ def test_learned_resume_matches_uninterrupted_run(tmp_path, monkeypatch):
     for path in (tmp_path / "full/milestones").glob("steps_*"):
         referenced.update(referenced_files(path))
     assert on_disk == referenced and any(p.name == "1_8.pt" for p in on_disk)
+
+
+def test_physical_state_recording_changes_nothing_else_and_mixed_resume_is_explicit(tmp_path, monkeypatch):
+    """Learned exploration with and without recording: identical replay transitions, weights,
+    optimizers, RNG, logs and milestone identities; only the analysis metadata differs. A run
+    collected without recording and resumed with it marks the earlier frames as unrecorded."""
+    OFF = ["collection.train.record_physical_state=false"]
+    on, logs_on = run_uninterrupted(tmp_path / "on", monkeypatch, [])
+    off, logs_off = run_uninterrupted(tmp_path / "off", monkeypatch, OFF)
+    assert_same_run(on, off, logs_on, logs_off, after_epoch=0, physical=False)
+    saved = OmegaConf.load(tmp_path / "on/config/exploration.yaml").collection
+    assert saved.train.record_physical_state is True and saved.test.record_physical_state is False
+    monkeypatch.chdir(tmp_path / "off")  # each run's dataset paths are relative to its folder
+    for i, path in enumerate(off.train_dataset.episode_files()):
+        assert off.train_dataset.load_episode(i).physical_state is None
+        assert "physical_state" not in torch.load(path)  # the pre-recording file format
+    monkeypatch.chdir(tmp_path / "on")
+    assert all(on.train_dataset.load_episode(i).physical_state["recorded"].all()
+               for i in range(on.train_dataset.num_episodes))
+    recorded_episode = on.train_dataset.load_episode(1).physical_state
+    for name in ("steps_000018", "steps_000024"):
+        a, b = (load_milestone(tmp_path / run / "milestones" / name, "walk") for run in ("on", "off"))
+        assert a.manifest["identity"] == b.manifest["identity"]
+        assert (a.manifest["physical_state"]["recording"], b.manifest["physical_state"]["recording"]) == (True, False)
+        assert b.successor_physical_states == {} and sorted(a.successor_physical_states) == sorted(a.successor_observations)
+        assert "successor_physical_states" not in torch.load(b.path / "dataset.pt", weights_only=False)
+
+    # Collected without recording up to the epoch-1 checkpoint (18 steps), resumed with it.
+    original = ExplorationTrainer.train_agent
+
+    def crash_in_epoch_2(self):
+        if self.epoch == 2:
+            raise Crash()
+        return original(self)
+
+    monkeypatch.setattr(ExplorationTrainer, "train_agent", crash_in_epoch_2)
+    crashed, _ = start(tmp_path / "mixed", monkeypatch, OFF)
+    with pytest.raises(Crash):
+        finish(crashed)
+    monkeypatch.setattr(ExplorationTrainer, "train_agent", original)
+    mixed, logs_mixed = start(tmp_path / "mixed", monkeypatch, [], resume=True,
+                              resume_changes={"collection.train.record_physical_state": True})
+    finish(mixed)
+    mixed._final_rng = rng_state()
+    assert_same_run(off, mixed, logs_off, logs_mixed, after_epoch=1, physical=False)
+    assert mixed.train_dataset.load_episode(0).physical_state is None  # finished before recording began
+    continued = mixed.train_dataset.load_episode(1).physical_state  # 8 unrecorded steps, then 2 recorded
+    assert continued["recorded"].tolist() == [False] * 8 + [True] * 2
+    assert continued["qpos"][:8].isnan().all() and not continued["qpos"][8:].isnan().any()
+    # The recorded rows and final state are exactly the always-recorded run's.
+    for key in ("qpos", "qvel"):
+        torch.testing.assert_close(continued[key][8:], recorded_episode[key][8:], rtol=0, atol=0)
+    for key in ("final_qpos", "final_qvel"):
+        torch.testing.assert_close(continued[key], recorded_episode[key], rtol=0, atol=0)
 
 
 def test_extended_budget_continues_exactly_like_a_longer_planned_run(tmp_path, monkeypatch):

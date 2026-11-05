@@ -474,3 +474,221 @@ def test_vector_collection_labels_stay_aligned_across_resets_extension_and_save_
                                            rtol=0, atol=0)
             complete = episode_id < 2
             assert episode.trunc[-1] == int(complete) and ("final_observation" in episode.info) == complete
+            assert episode.physical_state is None  # recording is opt-in
+
+
+# ---------------------------------------------------------------- physical states
+
+def raw_frame(raw):
+    return torch.as_tensor(raw.physics.render(height=8, width=8, camera_id=0).copy()).permute(2, 0, 1)
+
+
+def stored_frame(obs):
+    return obs.add(1).div(2).mul(255).round().byte()  # Episode.save's uint8 levels
+
+
+def assert_state(raw, qpos, qvel):
+    """Exactly the raw environment's simulator state, at its own float64 precision."""
+    assert qpos.dtype == qvel.dtype == torch.float64
+    np.testing.assert_array_equal(qpos.numpy(), raw.physics.data.qpos)
+    np.testing.assert_array_equal(qvel.numpy(), raw.physics.data.qvel)
+
+
+def test_physical_states_align_with_frames_across_resets_termination_extension_and_save_load(tmp_path):
+    """Each stored state is the simulator state of its stored frame: the reset frame, every frame
+    after an action, and the final frame before the vector env's autoreset; a partial episode
+    extended by a later collect stays aligned; all of it survives save/load."""
+    seeding = 5
+    env = make_dm_control_env(num_envs=2, device=torch.device("cpu"), domain_name="walker",
+                              task_names=list(WALKER_TASKS), size=8, camera_id=0, action_repeat=3, time_limit=0.2,
+                              record_physical_state=True)
+    try:
+        dataset = Dataset(tmp_path / "train", cache_in_ram=False)
+        collector = make_collector(env, make_policy(6, [-1.] * 6, [1.] * 6), dataset, epsilon=0., verbose=False)
+        random.seed(seeding)
+        collector.send(NumToCollect(steps=4, mode="uniform"))  # 2 of 3 steps per env: partial
+        partial = [dataset.load_episode(i).physical_state for i in range(2)]
+        collector.send(NumToCollect(steps=6, mode="policy"))  # extend and finish, autoreset, 2 more steps
+        collector.close()
+    finally:
+        env.close()
+    dataset.save_to_default_path()
+    restored = Dataset(tmp_path / "train")
+    restored.load_from_default_path()
+    assert restored.lengths.tolist() == [3, 3, 2, 2]
+
+    first_seed = random.Random(seeding).randint(0, 2**31 - 1)
+    for i, episode_ids in enumerate(([0, 2], [1, 3])):
+        raw = suite.load("walker", "stand", task_kwargs={"random": first_seed + i, "time_limit": 0.2})
+        for episode_id in episode_ids:
+            raw.reset()
+            episode = restored.load_episode(episode_id)
+            state = episode.physical_state
+            nq, nv = raw.physics.model.nq, raw.physics.model.nv
+            assert state["qpos"].shape == (len(episode), nq) and state["qvel"].shape == (len(episode), nv)
+            assert state["recorded"].all()
+            for t in range(len(episode)):
+                assert torch.equal(stored_frame(episode.obs[t]), raw_frame(raw)), (episode_id, t)
+                assert_state(raw, state["qpos"][t], state["qvel"][t])
+                raw_step([raw], episode.act[t].numpy(), 3)
+            complete = episode_id < 2
+            assert ("final_qpos" in state) == complete == ("final_observation" in episode.info)
+            if complete:  # the terminal frame, before the autoreset replaced the env's state
+                assert torch.equal(stored_frame(episode.info["final_observation"]), raw_frame(raw))
+                assert_state(raw, state["final_qpos"], state["final_qvel"])
+        # The extension kept the partial episode's rows unchanged.
+        for key in ("qpos", "qvel", "recorded"):
+            torch.testing.assert_close(restored.load_episode(i).physical_state[key][:2], partial[i][key], rtol=0, atol=0)
+
+
+def test_physical_state_copies_never_alias_the_simulator():
+    env = DMControlEnv("walker", ["walk"], size=8, seed=3, record_physical_state=True)
+    _, reset_info = env.reset()
+    kept = {k: v.copy() for k, v in reset_info.items()}
+    assert reset_info["qpos"].dtype == np.float64 and not np.shares_memory(reset_info["qpos"], env._dm_env.physics.data.qpos)
+    _, _, _, _, info = env.step(env.action_high)
+    for key in ("qpos", "qvel"):  # stepping did not change the earlier copy...
+        np.testing.assert_array_equal(reset_info[key], kept[key])
+        assert not np.array_equal(info[key], kept[key])
+        assert not np.shares_memory(info[key], getattr(env._dm_env.physics.data, key))
+    info["qpos"][:] = 1e6  # ...and writing a copy does not change the simulator
+    assert not (env._dm_env.physics.data.qpos == 1e6).any()
+    # TorchEnv's tensors are copies too (the vector env pickles across processes; a sync one would not).
+    source = np.arange(3, dtype=np.float64)
+    copied = TorchEnv._copy_physical_state(dict(qpos=source, qvel=source))
+    source[:] = -1
+    assert copied["qpos"].tolist() == [0., 1., 2.] and copied["qpos"].dtype == torch.float64
+    env.close()
+
+
+@pytest.mark.parametrize("domain,group", VERIFIED_GROUPS, ids=GROUP_IDS)
+def test_recording_leaves_trajectory_labels_and_random_streams_unchanged(domain, group):
+    """Recording only reads the simulator: frames, rewards, labels, endings and every random
+    stream are those of an unrecorded rollout; states have the domain's own nq/nv."""
+    time_limit = short_time_limit(domain, group[0])
+
+    def rollout(record):
+        state = (random.getstate(), np.random.get_state()[1].copy(), torch.get_rng_state())
+        env = DMControlEnv(domain, list(group), size=16, action_repeat=2, time_limit=time_limit, seed=5,
+                           record_physical_state=record)
+        obs, info = env.reset()
+        frames, steps, states = [obs], [], [info]
+        rng = np.random.default_rng(1)
+        for _ in range(2):
+            for _ in range(4):
+                action = rng.uniform(env.action_low, env.action_high).astype(np.float32)
+                obs, reward, end, trunc, info = env.step(action)
+                frames.append(obs)
+                steps.append((reward, end, trunc, info["task_rewards"].tolist()))
+                states.append(info)
+            obs, info = env.reset()  # unseeded: draws from the collection task's RandomState
+            frames.append(obs)
+            states.append(info)
+        after = (random.getstate(), np.random.get_state()[1], torch.get_rng_state())
+        assert after[0] == state[0] and np.array_equal(after[1], state[1]) and torch.equal(after[2], state[2])
+        model = env._dm_env.physics.model
+        return frames, steps, env._dm_env.task.random.get_state()[1], states, (model.nq, model.nv)
+
+    off, on = rollout(False), rollout(True)
+    np.testing.assert_array_equal(on[2], off[2])
+    for a, b in zip(off[0], on[0]):
+        np.testing.assert_array_equal(a, b)
+    assert on[1] == off[1]
+    nq, nv = on[4]
+    assert all("qpos" not in s for s in off[3])
+    assert all(s["qpos"].shape == (nq,) and s["qvel"].shape == (nv,) and s["qpos"].dtype == np.float64 for s in on[3])
+
+
+def physical(length, nq=2, nv=3, offset=0., final=False):
+    rows = torch.arange(length * (nq + nv), dtype=torch.float64).view(length, nq + nv) + offset
+    state = dict(qpos=rows[:, :nq].contiguous(), qvel=rows[:, nq:].contiguous(), recorded=torch.ones(length, dtype=torch.bool))
+    if final:
+        state.update(final_qpos=torch.full((nq,), -1., dtype=torch.float64), final_qvel=torch.full((nv,), -2., dtype=torch.float64))
+    return state
+
+
+def with_physical(episode, state):
+    return Episode(*[getattr(episode, k) for k in ("obs", "act", "rew", "end", "trunc")], episode.info,
+                   task_rew=episode.task_rew, task_names=episode.task_names, physical_state=state)
+
+
+def test_episode_physical_states_extend_mix_save_load_and_stay_out_of_training_batches(tmp_path):
+    first, second = labeled_episode(3), labeled_episode(2, offset=3., dead=True)
+    recorded = with_physical(first, physical(3)) + with_physical(second, physical(2, offset=100., final=True))
+    state = recorded.physical_state
+    assert state["qpos"].shape == (5, 2) and state["recorded"].all()
+    torch.testing.assert_close(state["qpos"][3:], physical(2, offset=100.)["qpos"], rtol=0, atol=0)
+    assert state["final_qpos"].tolist() == [-1., -1.]
+    # Mixed coverage: an unrecorded part (e.g. historical) becomes explicit NaN rows, never invented values.
+    for joined, missing in ((first + with_physical(second, physical(2, final=True)), slice(0, 3)),
+                            (with_physical(first, physical(3)) + second, slice(3, 5))):
+        s = joined.physical_state
+        assert s["recorded"].tolist() == [i not in range(5)[missing] for i in range(5)]
+        assert s["qpos"][missing].isnan().all() and s["qvel"][missing].isnan().all()
+        assert not s["qpos"][s["recorded"]].isnan().any()
+    assert (first + second).physical_state is None
+    with pytest.raises(ValueError, match="different dimensions"):
+        with_physical(first, physical(3)) + with_physical(second, physical(2, nq=4))
+    for bad, match in [(dict(physical(3), recorded=torch.ones(3)), "bool"),
+                       ({k: v.float() if k != "recorded" else v for k, v in physical(3).items()}, "float64"),
+                       (dict(physical(3), recorded=torch.tensor([True, False, True])), "NaN"),
+                       (physical(2), "one row per step"),
+                       ({k: v for k, v in physical(3, final=True).items() if k != "final_qvel"}, "both of")]:
+        with pytest.raises(ValueError, match=match):
+            with_physical(first, bad)
+    # Save/load: recorded states (float64, NaN rows) round-trip; an unrecorded episode's file is
+    # exactly the pre-recording format (no physical_state entry).
+    dataset = Dataset(tmp_path / "d", cache_in_ram=False)
+    dataset.add_episode(first + with_physical(second, physical(2, final=True)))
+    dataset.add_episode(labeled_episode(2))
+    loaded = dataset.load_episode(0).physical_state
+    assert loaded["qpos"].dtype == torch.float64 and loaded["recorded"].tolist() == [False] * 3 + [True] * 2
+    torch.testing.assert_close(loaded["qvel"], (first + with_physical(second, physical(2, final=True))).physical_state["qvel"],
+                               rtol=0, atol=0, equal_nan=True)
+    assert "physical_state" not in torch.load(dataset._get_episode_path(1))
+    assert dataset.load_episode(1).physical_state is None
+    # Training batches never carry them: segments copy only the transition columns.
+    segment = make_segment(dataset.load_episode(0), SegmentId(0, 0, 5))
+    assert not hasattr(segment, "physical_state") and "physical_state" not in segment.info
+    assert "physical_state" not in collate_segments_to_batch([segment]).__dict__
+
+
+class RecordingFakeEnv(LabeledFakeEnv):
+    """LabeledFakeEnv with TorchEnv's physical-state interface; qpos = [t, episode], qvel = [-t].
+    The first frame's state is unknown, as after a restore without simulator states."""
+    record_physical_state = True
+
+    def reset(self, **kwargs):
+        self.episode, self.known = 0, False
+        return super().reset(**kwargs)
+
+    def state(self):
+        return dict(qpos=torch.tensor([float(self.t), float(self.episode)], dtype=torch.float64),
+                    qvel=torch.tensor([-float(self.t)], dtype=torch.float64))
+
+    def step(self, action):
+        pre = [self.state() if self.known else None]
+        before = self.t + 1
+        obs, rew, end, trunc, info = super().step(action)
+        info["physical_state"] = pre
+        info["final_physical_state"] = []
+        if trunc.item():
+            self.t = before  # the final frame's state, before the reset
+            final = self.state()
+            self.t, self.episode = 0, self.episode + 1
+            info["final_physical_state"] = [final]
+        self.known = True
+        return obs, rew, end, trunc, info
+
+
+def test_collector_marks_unknown_states_and_aligns_final_states(tmp_path):
+    env = RecordingFakeEnv()
+    dataset = Dataset(tmp_path / "d", cache_in_ram=True, save_on_disk=False)
+    collector = make_collector(env, make_policy(), dataset, epsilon=0., verbose=False)
+    collector.send(NumToCollect(steps=7, mode="uniform"))
+    first, second = dataset.load_episode(0).physical_state, dataset.load_episode(1).physical_state
+    assert first["recorded"].tolist() == [False, True, True, True, True]  # the unknown first frame stays unknown
+    assert first["qpos"][0].isnan().all() and first["qpos"][1:, 0].tolist() == [1., 2., 3., 4.]
+    assert first["final_qpos"].tolist() == [5., 0.] and first["final_qvel"].tolist() == [-5.]
+    assert second["recorded"].all() and second["qpos"].tolist() == [[0., 1.], [1., 1.]] and "final_qpos" not in second
+    collector.close()

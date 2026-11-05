@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from . import coroutine
 from data import Episode, Dataset
+from data.episode import stack_physical_states
 from envs import TorchEnv
 from .env_loop import LoopState, make_env_loop
 from utils import Logs, Progress
@@ -59,6 +60,9 @@ def make_collector(
 ) -> Generator[Logs, int, None]:
     num_envs = env.num_envs
     task_names = getattr(env, "task_names", None)  # None: env records no task rewards
+    # Analysis-only simulator states (TorchEnv.record_physical_state), kept beside the transitions:
+    # they never enter the transition columns that training reads.
+    record_physical_state = getattr(env, "record_physical_state", False)
     action_source = ActionSource(env, model)
     # The caller may keep (and restore) this state; a restored one continues its episodes.
     state = CollectorState() if state is None else state
@@ -68,14 +72,15 @@ def make_collector(
         raise ValueError(f"Collector state has {len(state.episode_ids)} envs, the env has {num_envs}")
     episode_ids = state.episode_ids
 
-    env_loop, buffer, dead = (None,) * 3
+    env_loop, buffer, physical_buffer, dead = (None,) * 4
     num_steps, num_episodes, to_log, pbar = (None,) * 4
 
     def setup_new_collect():
-        nonlocal num_steps, num_episodes, buffer, to_log, pbar
+        nonlocal num_steps, num_episodes, buffer, physical_buffer, to_log, pbar
         num_steps = 0
         num_episodes = 0
         buffer = defaultdict(list)
+        physical_buffer = defaultdict(list)  # per env: the state of each buffered transition's obs
         to_log = []
         pbar = Progress(
             total=num_to_collect.total,
@@ -113,6 +118,8 @@ def make_collector(
             if task_names is not None:
                 transition.append(infos["task_rewards"][i : i + 1])
             buffer[i].append(transition)
+            if record_physical_state:
+                physical_buffer[i].append(infos["physical_state"][i])
             dead[i] = (end[i] + trunc[i]).clip(max=1).item()
 
         num_episodes += sum(dead)
@@ -127,7 +134,12 @@ def make_collector(
                 info = {"final_observation": infos["final_observation"][count_dead]} if dead[i] else {}
                 columns = [torch.cat(x, dim=0) for x in zip(*buffer[i])]
                 task_rew = columns[5] if task_names is not None else None
-                ep = Episode(*columns[:5], info, task_rew=task_rew, task_names=task_names).to("cpu")
+                physical_state = None
+                if record_physical_state:
+                    final = infos["final_physical_state"][count_dead] if dead[i] else None
+                    physical_state = stack_physical_states(physical_buffer[i], final)
+                ep = Episode(*columns[:5], info, task_rew=task_rew, task_names=task_names,
+                             physical_state=physical_state).to("cpu")
                 if episode_ids[i] is not None:
                     ep = dataset.load_episode(episode_ids[i]) + ep
                 episode_ids[i] = dataset.add_episode(ep, episode_id=episode_ids[i])
@@ -140,6 +152,7 @@ def make_collector(
                     }
                 )
                 buffer[i] = []
+                physical_buffer[i] = []
                 episode_ids[i] = None
                 pbar.update(1 if num_to_collect.episodes is not None else 0)
 

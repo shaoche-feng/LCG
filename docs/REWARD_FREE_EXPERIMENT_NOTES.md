@@ -3811,3 +3811,67 @@ Configuration only; no training was run.
 - **Totals:** 190 epochs, no training-only tail; 85,600 denoiser updates per denoiser (428,000 over the full ensemble's 5 members); 38,000 PMPO updates for each learned method and 0 for uniform, which builds no PMPO optimizer. Test diagnostics are extra: 19 periodic collections of 4 episodes plus the final 100.
 - **Test:** `tests/exploration/test_uniform_preset.py::test_walker_100k_presets_resolve_the_selected_schedule` composes each preset, steps through the trainer's epoch arithmetic, calls `ExplorationTrainer.mark_due_milestone` at every boundary, and asserts the values above. `test_lcg_preset.py` now expects LCG's PMPO schedule to equal uniform's.
 - **Earlier records:** the pilots, continuation and projections above ran or assumed other schedules, often by override (for example 240 epochs, 5,000-then-400 or 200 PMPO updates). They are historical and were not changed.
+
+## Physical-state recording for exploration coverage analysis (2026-11-05)
+
+Implemented and validated; committed at the user's request before the independent Codex review (the review package was built from the identical uncommitted tree). Starting point: `e4a2371`, clean working tree. Evidence: `outputs/step30-physical-state/`; review package `docs/changes/physical_state_review.zip`. No coverage metric, feature, clustering, plot or W&B record is part of this step.
+
+**Configuration** (`config/exploration.yaml`, saved with each run in `config/exploration.yaml`):
+- `collection.train.record_physical_state: true`: new exploration training collections record states.
+- `collection.test.record_physical_state: false`: evaluation (test) episodes do not.
+- A saved config without the key (runs from before this step) records nothing (`OmegaConf.select(..., default=False)`). The flag reaches `make_dm_control_env(record_physical_state=...)` → `DMControlEnv` and `TorchEnv`. `env.train` is unchanged, so milestone manifests' `model.env`, downstream comparisons and the resume env-config check are unaffected. The W&B config (the full resolved config) gains the key; no W&B metric or summary entry is added.
+
+**Storage:** `Episode.physical_state`, an optional field saved in the existing episode `.pt` file: a dict of CPU tensors.
+
+| Key | Shape, dtype | Meaning |
+| --- | --- | --- |
+| `qpos` | (T, nq) float64 | MuJoCo `qpos` at which `obs[t]` was rendered, i.e. before `act[t]` |
+| `qvel` | (T, nv) float64 | likewise `qvel` |
+| `recorded` | (T,) bool | False where the frame's state is unknown; those `qpos`/`qvel` rows are NaN |
+| `final_qpos`, `final_qvel` | (nq,), (nv,) float64 | state of `info["final_observation"]`: after the last action, before the vector env's autoreset. Ended episodes with a recorded final state only |
+
+- nq and nv come from the simulator (Walker: 9 and 9); nothing assumes Walker.
+- A milestone's `dataset.pt` adds `successor_physical_states` (`{episode_id: {qpos, qvel}}`), the state of each recorded `successor_observations` frame. `load_milestone` returns it as `Milestone.successor_physical_states`, `{}` for older milestones.
+- The milestone manifest (JSON) gains a descriptive `physical_state` entry: the recording setting, keys, alignment, missing-data convention and the analysis-only use. There is no per-state JSON file and no YAML metadata.
+
+**Exact temporal alignment** (`DMControlEnv` → `TorchEnv` → collector):
+- `DMControlEnv.reset` and `step` copy `physics.data.qpos`/`qvel` (`np.array(copy=True)`) after the frame's last physics substep. That is the state the returned frame is rendered from; rendering does not change it.
+- `TorchEnv` keeps each env's current state. It returns it as step `info["physical_state"]`: the state of the observation the action was taken from. A finished env's own step state comes from `final_info` (`info["final_physical_state"]`, in `final_observation` order), because its top-level info is the autoreset's, which supplies the new episode's first state.
+- `set_env_states` (resume) re-reads the restored simulators' states. That is the current observation's state; nothing is stepped, reset or drawn.
+- The collector buffers these states beside the transitions, not in the transition columns. When it writes a partial or finished episode, the rows and final state are added with `stack_physical_states`, and `Episode.__add__` extends them with the continuation (`join_physical_states`).
+
+**Missing and mixed data:**
+- Episodes collected without recording, including every historical file, have `physical_state=None`. Their files are byte-for-byte the previous format: the key is not written.
+- When an episode mixes recorded and unrecorded parts (recording switched on at a resume, or a frame whose state is unknown), the unrecorded rows are NaN with `recorded=False`. No values are made up or carried over.
+- Dimension mismatches and malformed fields (shapes, dtypes, non-NaN unrecorded rows, half a final state) are refused when the Episode is built.
+- A missing successor entry means unknown.
+
+**Analysis only:**
+- Training reads none of it. Segments, batches and `info` never carry it, because `make_segment` copies only the transition columns and `info` holds no physical state.
+- No policy input, world-model or reward-model training, intrinsic scoring, replay weighting or downstream adaptation reads it.
+- Recording adds no random draws, resets or simulation steps. Exact-resume simulator snapshots (`collection_state`) are unchanged.
+
+**Validation:**
+- **Focused tests** (`tests/collection/test_collection_task_labels.py`):
+  - Frames and states align at reset, ordinary steps and termination before autoreset, across a partial-episode extension and save/load. Each stored frame and state equals an independently replayed raw dm_control environment's rendered frame and `qpos`/`qvel` at the same instant.
+  - Copies never alias simulator memory.
+  - Recording on versus off gives identical frames, rewards, labels, endings and random streams for every verified domain group, with the domain's own nq/nv.
+  - Episode extension, mixing, validation and save/load work. Unrecorded files keep the old format. Segments and batches never carry the field.
+  - The collector marks unknown states and aligns final states.
+- **Trainer tests** (`tests/resume/test_resume_and_milestones.py`):
+  - The exact-resume comparison now includes physical states.
+  - Milestone readback covers cut rows and the successor state equal to the next stored row.
+  - Evaluation episodes are not recorded.
+  - Learned exploration with recording on versus off is bit-identical in replay transitions, weights, optimizers, schedulers, RNG, logs and milestone identities; files without recording have no key.
+  - A run collected without recording and resumed with it has explicitly mixed episodes, whose recorded rows equal the always-recorded run's.
+- **Smoke** (CPU, W&B disabled, `outputs/step30-physical-state/scripts/run_smoke.sh`):
+  - The run was a real uniform-random Walker exploration of 750 + 4 × 250 = 1,750 steps (4 episodes), with milestones at 1,250 (cutting episode 2 at 250 steps) and 1,750. Downstream training and evaluation then ran from the 1,250 milestone. All exit codes were 0, about 1¼ minutes in total.
+  - `verify_smoke.py` passed 23/23. All 1,750 stored frames, the 3 final frames and both successor frames equal frames re-rendered from their own recorded states in a fresh simulator. States are float64, finite, all recorded and shaped (T, 9). Each successor state equals the continued episode's next row, and the evaluation episode has no states.
+- **Test runs:**
+  - Focused suites (`tests/collection`, `tests/resume`, `tests/downstream`, `tests/exploration`): 427 passed.
+  - First full suite: 771 passed, 2 failed. `test_pmpo_frames.py` builds a `DMControlEnv` with `__new__` and lacked the new attribute; this was an implementation failure, fixed by a class-level default `record_physical_state = False`.
+  - After the fix, the smoke was rerun (identical results) and the full suite on the final code gave 773 passed, 0 failed.
+- **Storage overhead (smoke):** 147.6 bytes per frame, +1.19% of the episode files (21.99 MB versus 21.74 MB without the field; 64×64 RGB frames). Over 100,000 frames this is about 14.8 MB per run.
+- **Environment note (pre-existing, not changed):**
+  - `common.devices=cpu` sets `CUDA_VISIBLE_DEVICES=""`. On this laptop's torch 2.7.1+cu128, that reports CUDA as available with 0 devices, so the trainer chose `cuda` and failed in its GPU report.
+  - The smoke instead used `CUDA_VISIBLE_DEVICES=-1` with `common.devices=all`, and ran on CPU. The two failed attempts are kept under `logs/failed_attempt_{1,2}/`.

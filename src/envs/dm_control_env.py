@@ -65,9 +65,12 @@ class DMControlEnv(gymnasium.Env):
     """DM Control Suite adapter producing RGB observations.
 
     info["task_rewards"] holds each task's reward for the step, ordered as task_names.
+    With record_physical_state, reset and step infos also hold "qpos" and "qvel": copies of
+    MuJoCo's state at the returned frame (analysis only; no extra simulation or random draws).
     """
 
     metadata: Dict[str, Any] = {"render_modes": []}
+    record_physical_state: bool = False  # off unless enabled (also for instances built without __init__)
 
     def __init__(
         self,
@@ -78,6 +81,7 @@ class DMControlEnv(gymnasium.Env):
         action_repeat: int = 2,
         time_limit: Optional[float] = None,
         seed: Optional[int] = None,
+        record_physical_state: bool = False,
     ) -> None:
         super().__init__()
         assert size > 0
@@ -89,6 +93,7 @@ class DMControlEnv(gymnasium.Env):
         self.camera_id = camera_id
         self.action_repeat = action_repeat
         self._time_limit = time_limit
+        self.record_physical_state = bool(record_physical_state)
 
         self._dm_env = self._make_dm_env(self.task_names[0], seed)
         self._label_tasks = self._load_label_tasks()
@@ -164,6 +169,13 @@ class DMControlEnv(gymnasium.Env):
     def _model_digest(self) -> str:
         return hashlib.sha256(pickle.dumps(self._dm_env.physics.model.ptr)).hexdigest()
 
+    @property
+    def physical_state(self) -> Dict[str, np.ndarray]:
+        """Copies (never views of mjData, which the next step overwrites) of the current qpos and
+        qvel, in MuJoCo's own dtype (float64). Their sizes are the model's nq and nv."""
+        data = self._dm_env.physics.data
+        return dict(qpos=np.array(data.qpos, copy=True), qvel=np.array(data.qvel, copy=True))
+
     def close(self) -> None:
         self._dm_env.close()
 
@@ -179,7 +191,7 @@ class DMControlEnv(gymnasium.Env):
             self._dm_env = self._make_dm_env(self.task_names[0], seed)
         self._dm_env.reset()
         obs = self._render()
-        return obs, {}
+        return obs, (self.physical_state if self.record_physical_state else {})
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         action = np.asarray(action, dtype=np.float32).reshape(self.action_space.shape)
@@ -212,5 +224,7 @@ class DMControlEnv(gymnasium.Env):
         obs = self._render()
         task_rewards = np.array([total_reward, *label_rewards], dtype=np.float64)
         info: Dict[str, Any] = {"discount": discount, "task_rewards": task_rewards}
+        if self.record_physical_state:
+            info.update(self.physical_state)  # the state obs was rendered from (rendering does not change it)
         return obs, total_reward, terminated, truncated, info
 

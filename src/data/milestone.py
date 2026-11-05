@@ -14,7 +14,7 @@ checkpoints and other milestones rather than copied.
 File formats: configuration is YAML, generated metadata (milestone manifests, downstream
 summaries and evaluation reports) is JSON only, append-only training metrics are JSONL.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -146,6 +146,22 @@ def state_sha256(state_dict: Dict[str, torch.Tensor]) -> str:
     return digest.hexdigest()
 
 
+def physical_state_manifest(recording: bool) -> Dict[str, Any]:
+    """Manifest entry describing the analysis-only physical states of the milestone's training
+    episodes (data.episode.PHYSICAL_STATE_KEYS). recording: the run's collection.train setting
+    when the milestone was published; episodes from other settings say so themselves."""
+    return dict(
+        recording=recording,
+        episode_field="physical_state",
+        keys=dict(qpos="(T, nq) float64", qvel="(T, nv) float64", recorded="(T,) bool",
+                  final_qpos="(nq,) float64, ended episodes only", final_qvel="(nv,) float64, ended episodes only"),
+        alignment="row t is the MuJoCo state at which obs[t] was rendered (before act[t]); final_* belong to "
+                  "info['final_observation']; dataset.pt successor_physical_states belong to successor_observations",
+        missing="episode field absent (None): not recorded; recorded=False rows are NaN; no successor entry: unknown",
+        use="analysis only; not read by exploration training, intrinsic scoring or downstream adaptation",
+    )
+
+
 def publish_milestone(
     milestones_dir: Path,
     name: str,
@@ -154,10 +170,12 @@ def publish_milestone(
     successor_observations: Dict[int, torch.Tensor],
     manifest: Dict[str, Any],
     member_states: Optional[List[Dict[str, torch.Tensor]]] = None,
+    successor_physical_states: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
 ) -> Path:
     """Publish a complete milestone folder atomically (written aside, then renamed). An
     existing milestone is kept if it holds the same training state, otherwise rejected.
-    member_states: ensemble members 1..K-1 (member 0 is denoiser_state)."""
+    member_states: ensemble members 1..K-1 (member 0 is denoiser_state).
+    successor_physical_states: analysis only, the physical state of successor observations."""
     milestones_dir = Path(milestones_dir)
     final = milestones_dir / name
     member_states = member_states or []
@@ -184,14 +202,21 @@ def publish_milestone(
     for path, sha256 in zip(dataset.episode_files(), dataset.file_sha256):
         # Checksums were taken when each immutable version was written: no re-hashing here.
         files.append(dict(path=Path(os.path.relpath(path, final)).as_posix(), sha256=sha256))
-    torch.save(dict(
+    saved = dict(
         schema_version=SCHEMA_VERSION,
         directory=Path(os.path.relpath(dataset.directory, final)).as_posix(),
         index=dataset.state_dict(),
         files=files,
         # Observation after the last transition of each unfinished episode at the cut.
         successor_observations={k: v.cpu() for k, v in successor_observations.items()},
-    ), tmp / DATASET_FILE)
+    )
+    if successor_physical_states:  # absent when nothing was recorded: the file is as before
+        unknown = set(successor_physical_states) - set(successor_observations)
+        if unknown:
+            raise ValueError(f"Successor physical states for episodes {sorted(unknown)} without a successor observation")
+        saved["successor_physical_states"] = {k: {n: v.cpu().clone() for n, v in s.items()}
+                                              for k, s in successor_physical_states.items()}
+    torch.save(saved, tmp / DATASET_FILE)
     manifest = dict(
         schema_version=SCHEMA_VERSION,
         **manifest,
@@ -292,6 +317,9 @@ class Milestone:
     task_index: int  # column of Episode.task_rew for task_name
     successor_observations: Dict[int, torch.Tensor]
     member_index: int = 0  # ensemble member loaded as denoiser_state (0 for single-model milestones)
+    # Analysis only: {"qpos", "qvel"} of successor observations whose state was recorded (none in
+    # milestones published before recording existed). Downstream training never reads it.
+    successor_physical_states: Dict[int, Dict[str, torch.Tensor]] = field(default_factory=dict)
 
 
 def milestone_members(manifest: Dict[str, Any]) -> int:
@@ -345,4 +373,4 @@ def load_milestone(milestone_path: Path, task_name: str, map_location: Optional[
     if members > 1 and state_sha256(denoiser_state) != manifest["identity"]["member_sha256"][member_index]:
         raise ValueError(f"Milestone {path}: member {member_index} weights do not match the recorded identity")
     return Milestone(path, manifest, denoiser_state, dataset, task_name, task_names.index(task_name),
-                     saved["successor_observations"], member_index)
+                     saved["successor_observations"], member_index, saved.get("successor_physical_states", {}))
