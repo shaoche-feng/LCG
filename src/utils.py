@@ -402,6 +402,24 @@ def rate_text(fmt: Dict[str, Any], unit: str) -> str:
     return f"{rate:.2f} {unit}/s"
 
 
+def _is_terminal(stream) -> bool:
+    try:
+        return stream.isatty()
+    except (AttributeError, ValueError):  # replaced or closed streams
+        return False
+
+
+def log_columns() -> int:
+    """Progress line width when stdout is not a terminal: the terminal's on stderr if it has one
+    (`... | tee log`), else 80, the narrowest common terminal (`tail -f` on a log file)."""
+    try:
+        if _is_terminal(sys.__stderr__):
+            return max(os.get_terminal_size(sys.__stderr__.fileno()).columns, 40)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return 80
+
+
 class Progress:
     """A tqdm bar: phase, percentage, completed/total, elapsed and remaining time, and rate
     (rate_text). No postfix (losses and diagnostics go to W&B). Written to stdout, so it stays
@@ -412,12 +430,25 @@ class Progress:
                  disable: bool = False, initial: int = 0) -> None:
         import sys
         from tqdm import tqdm
+        from tqdm.utils import disp_len
+
+        # A terminal: tqdm follows its width. A log file or pipe has no width, so tqdm would draw a
+        # 10-cell bar whatever the line's length; a line wider than the window it is watched in (tail -f,
+        # tee) wraps, and every redraw then shows as new lines. A line longer than log_columns() therefore
+        # gets a narrower bar (one cell at least) so it fits; shorter lines keep the default 10-cell bar,
+        # and the text itself is never cut.
+        width = None if _is_terminal(sys.stdout) else log_columns()
 
         class Bar(tqdm):
             @property
             def format_dict(self):
                 fmt = super().format_dict
                 fmt["rate_text"] = rate_text(fmt, unit)
+                if width is not None:
+                    full = disp_len(self.format_meter(**{**fmt, "ncols": None}))  # with tqdm's default 10-cell bar
+                    if full > width:  # too long: narrow the bar only; a line that fits keeps its default bar
+                        text = full - (10 if fmt.get("total") else 0)  # a bar without a total has no bar cells
+                        fmt["ncols"] = max(width, text + 1)
                 return fmt
 
         if total is None and hasattr(iterable, "__len__"):
@@ -426,7 +457,7 @@ class Progress:
         bar_format = ("{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_text}]"
                       if total else "{desc}: {n_fmt} " + unit + " [{elapsed}, {rate_text}]")
         self._bar = Bar(iterable, total=total, desc=desc, unit=unit, bar_format=bar_format, file=sys.stdout,
-                        leave=True, dynamic_ncols=True, disable=disable, initial=initial)  # initial: resumed count
+                        leave=True, dynamic_ncols=width is None, disable=disable, initial=initial)  # initial: resumed count
         if not disable:
             _terminal["blank"] = False
 

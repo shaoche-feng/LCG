@@ -79,3 +79,27 @@ def test_rate_text_has_a_space_and_inverts_below_one_per_second():
     assert rate_text(dict(rate=1 / 2.5, n=1, elapsed=2.5), "ep") == "2.50 s/ep"
     assert rate_text(dict(rate=None, n=0, elapsed=0), "ep") == "? ep/s"
     assert rate_text(dict(rate=None, n=4, elapsed=2.0, initial=0), "steps") == "2.00 steps/s"  # tqdm's fallback
+
+
+def test_progress_lines_written_to_a_log_fit_its_width_without_cutting_text(capsys, monkeypatch):
+    """stdout is not a terminal (captured, as a log file or pipe is): a redraw longer than log_columns()
+    fits it by narrowing only the bar, so a window of that width never wraps it into repeated lines;
+    compact bars keep tqdm's default 10-cell bar; text longer than the width is kept whole (one cell)."""
+    monkeypatch.setattr(utils, "log_columns", lambda: 80)
+    lines = {}
+    long = "Evaluation episodes (seeds 3001-3030) xxxxxx"  # with a 10-cell bar this line would exceed 80
+    for desc, total in ((long, 30), ("Short", 5), ("A" * 70, 3), ("No total", None)):
+        bar = utils.Progress(total=total, desc=desc, unit="ep")
+        for _ in range(total or 4):
+            bar.update(1)
+        bar.close()
+        redraws = [line for line in capsys.readouterr().out.replace("\r", "\n").splitlines() if line.startswith(desc)]
+        assert redraws and all(line.endswith("]") for line in redraws), redraws  # nothing cut
+        lines[desc] = redraws
+    narrowed = lines[long]
+    assert max(map(len, narrowed)) == 80 and 1 <= len(narrowed[-1].split("|")[1]) < 10  # narrowed from 10 cells to fit
+    # Compact: the default 10-cell bar, not widened to the column limit.
+    assert all(len(line) < 80 and len(line.split("|")[1]) == 10 for line in lines["Short"])
+    assert "|" + "█" * 10 + "|" in lines["Short"][-1]
+    assert all("|" + "█" + "|" in line or "|" + " " + "|" in line for line in lines["A" * 70])  # a one-cell bar
+    assert all(len(line) < 80 and "|" not in line for line in lines["No total"])

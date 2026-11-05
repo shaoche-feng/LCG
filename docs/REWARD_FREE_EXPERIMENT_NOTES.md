@@ -3875,3 +3875,47 @@ Implemented and validated; committed at the user's request before the independen
 - **Environment note (pre-existing, not changed):**
   - `common.devices=cpu` sets `CUDA_VISIBLE_DEVICES=""`. On this laptop's torch 2.7.1+cu128, that reports CUDA as available with 0 devices, so the trainer chose `cuda` and failed in its GPU report.
   - The smoke instead used `CUDA_VISIBLE_DEVICES=-1` with `common.devices=all`, and ran on CPU. The two failed attempts are kept under `logs/failed_attempt_{1,2}/`.
+
+## Downstream folder mode: milestone-step selection; progress bars in logs (2026-11-05)
+
+Committed at the user's request; the review package was built from the identical uncommitted tree. Starting point `6cf8a07`, clean working tree. Evidence: `outputs/step31-milestone-selection/`; review package `docs/changes/milestone_selection_review.zip`. No training, controller, W&B or evaluation change; the exploration milestone-saving configuration is unchanged.
+
+**Selection (`config/downstream.yaml`, `initialization.milestone_steps: null`):**
+- `null`: every discovered milestone, as before.
+- A non-empty list of distinct positive integers: only the milestones whose manifest `collected_steps` is listed. Example production selection: `[10000, 20000, ..., 100000]`.
+- Rejected before anything runs: a non-list, an empty list, booleans, non-integers, values below 1, duplicates, and a non-null filter with `initialization.milestone_path` (single-milestone mode). It is never silently ignored.
+- Launcher-only, like `milestones_dir`:
+  - `downstream_main.pop_milestone_source` (formerly `pop_milestones_dir`) validates and removes both keys. It is listed in `LAUNCHER_KEYS`, and every child command and recovery command carries `++initialization.milestone_steps=null`, so a filter set in YAML is cleared too.
+  - `DownstreamTrainer` drops the key and refuses a non-null value.
+  - Each trainer still handles one milestone × one task × one adaptation seed. Trainer configs, saved configs and resume checks are unchanged.
+
+**Launcher (`run_milestones` → `preflight`):**
+- Milestones are discovered and validated by the existing `discover_milestones`. Selection uses manifest step counts, never folder names, and keeps ascending step order whatever the order of the list.
+- Every requested step that no milestone records is reported in one error, together with the selected milestones' file, label and output problems, before any child starts.
+- Output-conflict and task-label checks apply to the selected milestones only. An unselected milestone's completed or incomplete outputs, or broken files, neither block the batch nor are touched.
+- The plan lists only the selected milestones, numbered 1..N. Its heading says `Downstream batch: N milestones (selected by initialization.milestone_steps from M milestones in the folder)`.
+- Single-milestone train, resume and evaluate, and the printed recovery commands, behave as before; recovery commands gain the clearing override.
+
+**Progress bars written to a log or pipe (`utils.Progress`):**
+- Reported symptom: the downstream 30-seed evaluation bar showed as many repeated lines.
+- Cause: with stdout not a terminal (`nohup ... > out`, watched with `tail -f`, or `| tee`), tqdm cannot know the window width and draws a 10-cell bar regardless of the line's length. The pilot's server logs show the evaluation line at 86 characters, the longest bar (reward predictor 84, policy 82). In a narrower window it wraps, and each `\r` redraw then appears as a new line.
+- Fix:
+  - When stdout is not a terminal, a line that would exceed `log_columns()` with tqdm's default 10-cell bar gets a narrower bar, one cell at least, so it fits. Lines that already fit keep the default 10-cell bar and are never widened. `log_columns()` is stderr's terminal width if stderr is a terminal (`| tee`), else 80.
+  - The text is never cut, and labels are unchanged.
+  - On a terminal, tqdm's dynamic width applies as before.
+  - The real 30-seed evaluation bar (`evidence/eval_bar_probe_30_seeds_compact.out`): the first redraw (`? ep/s`, 79 characters) keeps 10 cells; once the rate appears, the bar narrows to 4–5 cells. All 32 redraws are 78–80 characters, with nothing cut.
+- `tests/exploration/test_device_report.py` pins it.
+- The downstream evaluation bar's label is now `Evaluation` (was `Evaluation episodes (seeds 3001-3030)`), at the user's request. The seeds remain in the banner (`Evaluation: 30 seeds (3001–3030)`) and the saved evaluation report. The 30-seed bar is 51–59 characters with the full 10-cell bar (`evidence/eval_bar_probe_30_seeds_label_evaluation.out`); focused formatting tests: 87 passed. The exploration test-collection bar keeps its `Evaluation episodes (seeds ...)` label.
+- Not changed: a window narrower than 80 columns (or than a long label) can still wrap. On this Windows laptop, a redirected stdout is encoded in the locale code page (cp950), which is separate and does not affect the server.
+
+**Tests:**
+- `tests/downstream/test_downstream_trainer.py`:
+  - validation of the setting, including single-mode rejection;
+  - manifest-based selection in ascending order despite misleading folder names;
+  - all missing steps and the selected milestones' problems reported before any child;
+  - completed, incomplete and broken unselected milestones neither blocking nor touched;
+  - the plan listing only selected milestones, numbered 1..N;
+  - a real command-line folder run adapting only the selected milestone with its inputs unchanged;
+  - a real YAML-defined selection reaching the children cleared;
+  - the existing folder-mode tests, updated for the second clearing override.
+- `tests/downstream`: 102 passed (before the progress change). Terminal-output tests after the progress change: 61 passed. Full suite: 778 passed, 0 failed, before the compact-bar refinement; after it, the focused formatting tests (device report, exploration logging, downstream screen and plan) gave 75 passed.

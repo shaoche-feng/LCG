@@ -31,6 +31,10 @@ initialization:
   # Launcher-level (exactly one of the two): every milestone in this folder. Removed before a trainer
   # sees the configuration, so each run's saved config names only its own milestone_path.
   milestones_dir: null
+  # Launcher-level, folder mode only: adapt just the milestones whose manifest collected_steps is listed
+  # (distinct positive integers, run in ascending step order; every one must exist). null: all of them.
+  # Removed before a trainer sees the configuration, like milestones_dir.
+  milestone_steps: null
   # Ensemble milestones hold several denoisers; this one (fixed in advance, never chosen by
   # evaluation results) is loaded as the frozen denoiser. Single-model milestones: only 0.
   member_index: 0

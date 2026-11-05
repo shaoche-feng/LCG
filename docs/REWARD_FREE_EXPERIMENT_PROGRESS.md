@@ -162,6 +162,9 @@ Details and status history: `REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6.
   uniform and Plan2Explore; review fixes (environment-aware compatibility, ambiguous-policy refusal, plot gaps,
   W&B names identifying the exploration run) tested. Not yet: several exploration/adaptation seeds, and fixed
   analysis candidates.
+  Folder mode can adapt only selected milestones (2026-11-05):
+  `initialization.milestone_steps` matches manifest `collected_steps` (null: all), so extra exploration
+  milestones can be kept while ten are adapted. Notes: "Downstream folder mode: milestone-step selection".
   Analysis moved to its own entry point, `src/downstream_analysis.py` (2026-11-02, `7c1a383`): the commands above now
   use it, `downstream_main.py` rejects `collect`/`compare`, and old and new results match on tiny uniform and
   Plan2Explore fixtures. Notes: "Standalone downstream analysis entry point".

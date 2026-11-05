@@ -99,8 +99,9 @@ class DownstreamTrainer:
         # The milestone's own env and denoiser configuration define the models.
         cfg = deepcopy(cfg)
         with open_dict(cfg):
-            if cfg.initialization.pop("milestones_dir", None) is not None:  # launcher-level (downstream_main)
-                raise ValueError("A downstream trainer takes one milestone; initialization.milestones_dir is for downstream_main.py")
+            for key in ("milestones_dir", "milestone_steps"):  # launcher-level (downstream_main)
+                if cfg.initialization.pop(key, None) is not None:
+                    raise ValueError(f"A downstream trainer takes one milestone; initialization.{key} is for downstream_main.py")
             cfg.env.train = manifest["model"]["env"]
             cfg.agent.denoiser = manifest["model"]["denoiser"]
         OmegaConf.resolve(cfg)
@@ -723,7 +724,7 @@ def evaluate_policy(model: PMPOBeta, env_cfg: DictConfig, task_name: str, seeds:
     modes = {name: module.training for name, module in model.named_modules()}  # mixed (e.g. frozen prior)
     model.eval()
     episodes = []
-    pbar = Progress(total=len(seeds), desc=f"Evaluation episodes (seeds {seed_span(seeds, '-')})", unit="ep")
+    pbar = Progress(total=len(seeds), desc="Evaluation", unit="ep")  # the seeds are in the banner and the report
     try:
         for seed in seeds:
             env = DMControlEnv(env_cfg.domain_name, [task_name], size=env_cfg.size, camera_id=env_cfg.camera_id,
