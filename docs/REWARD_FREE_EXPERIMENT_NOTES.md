@@ -4000,7 +4000,11 @@ Uncommitted, pending independent review. Starting point `073774c`, clean working
 - **Changes from the reference:**
   - preset and output label per method;
   - CUDA bound explicitly;
-  - downstream `wandb.name` = `<label>-<group>-exploration-seed0`, so the two Cartpole groups have distinct run names;
+  - names (the user's scheme, 2026-11-05; `es`/`ds` = exploration/adaptation seed, `--` after the group label):
+    - terminal logs `<group>--exploration-es0.log` and `<group>--downstream-<task>-es0-ds0.log`;
+    - exploration W&B run and group `<label>-<group>--exploration-es0`;
+    - downstream W&B group `<label>-<group>--downstream-<task>-es0-ds0`, and run-name prefix `<label>-<group>--downstream-es0`. The downstream code appends `-<milestone>-<task>-adaptation-seed<s>`, so a run is named e.g. `lcg-cartpole-balance--downstream-es0-steps_010000-balance-adaptation-seed0`. That suffix still says `adaptation-seed0` rather than `ds0` (code, unchanged here).
+    - The two Cartpole groups get distinct logs, runs and groups;
   - the log folder is created only after the existing-output check;
   - the reference's stray last line (`previouse generate one is wrong?`) is dropped; it would have exited 127 after all runs. The user later removed `reference.sh`; `run_lcg_100k.sh` replaces it.
 - **Downstream W&B files:** the downstream entry point sets no W&B directory, so with online W&B these local files go to the launch checkout's `wandb/`.

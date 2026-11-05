@@ -57,8 +57,8 @@ run_exploration() {
     local tasks="$3"
 
     local run_dir="$OUTPUT_ROOT/$group/seed_$EXPLORATION_SEED"
-    local run_name="${LABEL}-${group}-exploration-seed${EXPLORATION_SEED}"
-    local log_file="$ATTEMPT_DIR/${run_name}.log"
+    local log_name="${group}--exploration-es${EXPLORATION_SEED}"
+    local log_file="$ATTEMPT_DIR/${log_name}.log"
 
     printf '\n=== Exploration: %s ===\n' "$group"
     printf 'Output: %s\nLog: %s\n' "$run_dir" "$log_file"
@@ -82,8 +82,8 @@ run_exploration() {
         'evaluation.final_reset_seeds=[3001]' \
         wandb.mode=online \
         "wandb.project=$EXPLORATION_PROJECT" \
-        "wandb.group=${LABEL}-${group}-exploration" \
-        "wandb.name=$run_name" \
+        "wandb.group=${LABEL}-${log_name}" \
+        "wandb.name=${LABEL}-${log_name}" \
         "hydra.run.dir=$run_dir" \
         2>&1 | tee "$log_file"
 }
@@ -98,8 +98,8 @@ run_downstream() {
 
     local run_dir="$OUTPUT_ROOT/$group/seed_$EXPLORATION_SEED"
     local milestones_dir="$run_dir/milestones"
-    local log_name="${group}-${task}-adaptation-seed${ADAPTATION_SEED}"
-    local log_file="$ATTEMPT_DIR/downstream-${log_name}.log"
+    local log_name="${group}--downstream-${task}-es${EXPLORATION_SEED}-ds${ADAPTATION_SEED}"
+    local log_file="$ATTEMPT_DIR/${log_name}.log"
 
     if [[ ! -d "$milestones_dir" ]]; then
         printf 'Missing milestones folder: %s\n' "$milestones_dir" >&2
@@ -109,7 +109,8 @@ run_downstream() {
     printf '\n=== Downstream: %s / %s ===\n' "$group" "$task"
     printf 'Milestones: %s\nLog: %s\n' "$milestones_dir" "$log_file"
 
-    # W&B run <name>-<milestone>-<task>-adaptation-seed<s>, one per milestone.
+    # One W&B run per milestone: wandb.name is a prefix, to which downstream appends
+    # -<milestone>-<task>-adaptation-seed<s>; wandb.group collects the milestones of one task.
     "$PYTHON" -u src/downstream_main.py \
         +experiment=downstream_10_milestones \
         "initialization.milestones_dir=$milestones_dir" \
@@ -124,8 +125,8 @@ run_downstream() {
         'evaluation.seeds=[3001]' \
         wandb.mode=online \
         "wandb.project=$DOWNSTREAM_PROJECT" \
-        "wandb.group=${LABEL}-${group}-exploration-seed${EXPLORATION_SEED}-${task}-adaptation-seed${ADAPTATION_SEED}" \
-        "wandb.name=${LABEL}-${group}-exploration-seed${EXPLORATION_SEED}" \
+        "wandb.group=${LABEL}-${log_name}" \
+        "wandb.name=${LABEL}-${group}--downstream-es${EXPLORATION_SEED}" \
         2>&1 | tee "$log_file"
 }
 

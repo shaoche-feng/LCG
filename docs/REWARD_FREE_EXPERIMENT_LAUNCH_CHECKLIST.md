@@ -43,7 +43,7 @@ After freezing, change only blocking bugs with a documented fix. Dataset-diversi
 | Adaptation seed / debug / logging | Seed 0; debug off; W&B online |
 
 - [x] Put these settings into maintained configurations and check resolved values. Each downstream launch takes one task and processes selected milestones sequentially. (`downstream.yaml`: 5,000 + 10,000 updates; `+experiment=downstream_10_milestones initialization.milestones_dir=<run>/milestones`; `0874335`)
-- [x] Select the first task group/task and execution order; set W&B projects, groups and run names for both phases. (Launchers: all seven groups explored first, then every task adapted in group order. Projects `lcg-reward-free` / `lcg-reward-free-downstream`; exploration runs `<method>-<group>-exploration-seed0` in group `<method>-<group>-exploration`; downstream runs `<method>-<group>-exploration-seed0-steps_N-<task>-adaptation-seed0` in group `<method>-<group>-exploration-seed0-<task>-adaptation-seed0`.)
+- [x] Select the first task group/task and execution order; set W&B projects, groups and run names for both phases. (Launchers: all seven groups explored first, then every task adapted in group order. Projects `lcg-reward-free` / `lcg-reward-free-downstream`; exploration run and group `<method>-<group>--exploration-es0`; downstream runs `<method>-<group>--downstream-es0-steps_N-<task>-adaptation-seed0` in group `<method>-<group>--downstream-<task>-es0-ds0`; logs `<group>--exploration-es0.log`, `<group>--downstream-<task>-es0-ds0.log`.)
 
 ## 3. Configuration for each method
 

@@ -44,8 +44,9 @@ GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/run_lcg_10
 - **Existing output:** a launcher refuses to start if any of its seven run folders exists. Resume an interrupted exploration with `scripts/resume.sh <run folder>`.
 - **Failures:** any failure stops the script with a nonzero exit status.
 - **W&B identities:**
-  - exploration runs: `<method>-<group>-exploration-seed0`, grouped by `<method>-<group>-exploration`;
-  - downstream runs: `<method>-<group>-exploration-seed0-steps_NNNNNN-<task>-adaptation-seed0`, one per milestone, grouped by `<method>-<group>-exploration-seed0-<task>-adaptation-seed0`.
+  - exploration run and group: `<method>-<group>--exploration-es0`;
+  - downstream runs: `<method>-<group>--downstream-es0-steps_NNNNNN-<task>-adaptation-seed0`, one per milestone (the launcher sets the prefix `<method>-<group>--downstream-es0`; the downstream code appends the rest), grouped by `<method>-<group>--downstream-<task>-es0-ds0`.
+- **Terminal log names:** `<group>--exploration-es0.log` and `<group>--downstream-<task>-es0-ds0.log`. `es`/`ds` are the exploration and adaptation seeds; `--` separates the group label, which may itself contain `-`.
 
 `scripts/smoke.sh` is a storage and integration smoke built on `run_plan2explore_100k.sh`.
 - **Scope:** it keeps that launcher's structure, paths, logs and W&B identities. Only its task groups and inline training/evaluation overrides differ.
