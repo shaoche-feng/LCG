@@ -84,7 +84,7 @@ collection:
     num_envs: 1
     num_episodes: 4  # per periodic diagnostic (evaluation.every)
     epsilon: 0.0
-    num_final_episodes: 4  # the separate final diagnostic
+    num_final_episodes: 30  # the separate final diagnostic
     record_physical_state: false  # test (evaluation) episodes
 
 static_dataset:
@@ -110,7 +110,9 @@ evaluation:
   # earlier behaviour). reset_seeds needs collection.test.num_episodes equal to its length,
   # final_reset_seeds likewise num_final_episodes; both need collection.test.num_envs=1.
   reset_seeds: [3001, 3002, 3003, 3004]
-  final_reset_seeds: [3001, 3002, 3003, 3004]
+  final_reset_seeds: [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010,
+                      3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019, 3020,
+                      3021, 3022, 3023, 3024, 3025, 3026, 3027, 3028, 3029, 3030]
   # Score the test episodes with the current frozen intrinsic scorer (learned methods; results in
   # evaluation/*.json and W&B). Intrinsic returns are in method-specific units.
   intrinsic: True

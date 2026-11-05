@@ -41,6 +41,8 @@ TINY = [
     # is smaller than the 32 reference prompts, so these tests keep RMS scaling (the earlier group default).
     "intrinsic_reward.theta_s.expected_num_tensors=null", "intrinsic_reward.theta_s.expected_dim=null",
     "intrinsic_reward.reward_scaling=rms", "intrinsic_reward.rms_enabled=true", "intrinsic_reward.reference_num_prompts=null",
+    # Tests set their own episode counts: random reset seeds (null), not the production seed lists.
+    "evaluation.reset_seeds=null", "evaluation.final_reset_seeds=null",
 ]
 # Real collection with the fake env: 12 uniform steps, then two epochs of 6.
 COLLECT = [

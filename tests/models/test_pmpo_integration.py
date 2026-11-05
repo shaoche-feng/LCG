@@ -182,21 +182,6 @@ def test_migration_resolves_references_before_removing_obsolete_fields():
     assert normalize_saved_config(cfg.agent).actor_critic.gamma == .93
 
 
-def test_historical_initialization_fingerprints_ignore_tensor_storage_identity(monkeypatch):
-    from pathlib import Path
-    import runpy
-    import sys
-    root = Path(__file__).resolve().parents[2]
-    # The historical script adds its import paths; isolate that side effect.
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    fingerprint = runpy.run_path(str(root / "scripts/lcg_diagnostic/pretrained_collectors/create_theta0.py"))["fingerprint"]
-    state = make_controller().state_dict()
-    copied = deepcopy(state)
-    assert fingerprint(state) == fingerprint(copied)
-    copied["_extra_state"]["rng"]["cpu"][0] ^= 1
-    assert fingerprint(state) != fingerprint(copied)
-
-
 @pytest.mark.parametrize("diagnostic", [False, True])
 def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatch, diagnostic):
     """One real optimization step per component, without real-env collection."""
@@ -240,6 +225,8 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
         "intrinsic_reward.theta_s.expected_num_tensors=null", "intrinsic_reward.theta_s.expected_dim=null",
         "intrinsic_reward.reward_scaling=rms", "intrinsic_reward.rms_enabled=true",
         "intrinsic_reward.reference_num_prompts=null",
+        # Its own episode counts: random reset seeds (null), not the production seed lists.
+        "evaluation.reset_seeds=null", "evaluation.final_reset_seeds=null",
         "rew_end_model.training.steps_first_epoch=1", "actor_critic.training.steps_first_epoch=1",
         *([BOUNDED_DIAGNOSTIC, "denoiser.training.steps_per_epoch=1",
            "rew_end_model.training.steps_per_epoch=1", "actor_critic.training.steps_per_epoch=1"]

@@ -3984,3 +3984,95 @@ Uncommitted, pending independent review. Starting point `073774c`, clean working
 - The launch scripts themselves, including distinct Cartpole run folders.
 - Whether to drop `h5py` / `opencv-python`.
 - The server environment setup.
+
+## Production launch scripts, scripts/ cleanup and Plan2Explore storage smoke (2026-11-05)
+
+**Launchers** (`scripts/run_<method>_100k.sh` for lcg, uniform, ensemble, laplace, plan2explore), built from the user's `scripts/reference.sh`:
+- **Order:** each explores the seven accepted groups first, then adapts every task of every group on the ten selected milestones, one task at a time.
+- **Groups:** walker, hopper, acrobot, cartpole-balance, cartpole-swingup, humanoid and humanoid_CMU. The two Cartpole groups use separate folders but the same `cartpole` domain.
+- **Outputs:**
+  - run folders: `outputs/<method label>/<group>/seed_0` (`lcg`, `uniform`, `full-ensemble`, `laplace-ensemble`, `plan2explore`);
+  - terminal logs: one per run in `logs/<label>/<date>-<id>/`, written through `tee`.
+- **Settings at the top:** GPU, Python, seeds and the W&B projects (`EXPLORATION_PROJECT`, `DOWNSTREAM_PROJECT`). The scripts run with `set -euo pipefail` and unbuffered Python.
+- **Device binding:** `CUDA_VISIBLE_DEVICES`, `MUJOCO_EGL_DEVICE_ID` and `common.devices` all name the selected GPU.
+- **Budgets:** read from the YAML.
+- **Safety:** existing run folders are refused before anything starts; resume works as before (`scripts/resume.sh`).
+- **Changes from the reference:**
+  - preset and output label per method;
+  - CUDA bound explicitly;
+  - downstream `wandb.name` = `<label>-<group>-exploration-seed0`, so the two Cartpole groups have distinct run names;
+  - the log folder is created only after the existing-output check;
+  - the reference's stray last line (`previouse generate one is wrong?`) is dropped; it would have exited 127 after all runs. The user later removed `reference.sh`; `run_lcg_100k.sh` replaces it.
+- **Downstream W&B files:** the downstream entry point sets no W&B directory, so with online W&B these local files go to the launch checkout's `wandb/`.
+
+**scripts/ cleanup** (`git rm`; all files were tracked):
+- **Removed:**
+  - `controller_diagnostic/` (27 files);
+  - `historical_precision_diagnostic/` (2);
+  - `lcg_diagnostic/` (235, including 7.3 MB of datasets and frames);
+  - the four `run_walker_100k_pmpo_*.sh`.
+
+  Exploration run folders copy `scripts/`, so each run folder is now about 7 MB smaller.
+- **Kept:** `resume.sh` and `import_run.py` (DIAMOND's remote-run import utility, unreferenced).
+- **Final `scripts/`:** `import_run.py`, `resume.sh`, `run_{lcg,uniform,ensemble,laplace,plan2explore}_100k.sh`, `smoke.sh`.
+- **Test removed:** `test_historical_initialization_fingerprints_ignore_tensor_storage_identity` loaded `lcg_diagnostic/pretrained_collectors/create_theta0.py`, a historical script, so it went with the folder. `src/pmpo_diagnostic.py` is kept.
+
+**Exploration evaluation (final settings):**
+- Periodic: every 10 epochs, 4 episodes with reset seeds 3001–3004.
+- Final: one separate evaluation of 30 episodes with reset seeds 3001–3030 (`collection.test.num_final_episodes: 30`, `evaluation.final_reset_seeds: [3001, …, 3030]`).
+- History: while `num_final_episodes` was already 30, the seed list was still 3001–3004. `check_reset_seeds` rejected that in the trainer's constructor, after W&B had started and the run folder existed, for all 35 production compositions. The user's correction added seeds 3005–3030.
+- After the correction, all 35 compositions pass the trainer's episode-count/reset-seed check (`resolve_launch_configs.py`: 0 mismatches, 0 failures).
+
+**Correction to the previous section:** commit `0874335` included the user's change of `evaluation.reset_seeds` / `final_reset_seeds` to 3001–3004. The "808 passed" run predates that change.
+- With fixed seeds, 91 tests failed. They set their own episode counts (1–4) but inherited the four seeds.
+- The tiny override lists (`TINY`, `REAL`, `test_pmpo_integration.py`) now also set `evaluation.reset_seeds=null` and `evaluation.final_reset_seeds=null`.
+- Affected files: 361 passed. Full suite: 807 passed, 0 failed (808 minus the removed fingerprint test).
+
+**Launcher checks** (CPU; `outputs/step33-launchers/scripts/`):
+- **Stub runs:** every launcher ran against a stub interpreter that records its commands, in a throwaway copy of the repository. 25 commands each: 7 explorations, then 18 downstream tasks.
+- **Composition:** all commands were composed with Hydra: 35 production explorations and 90 production downstream commands, plus the smoke's. Checked: preset to output label, domain/tasks, seed, devices, 100k schedule, 20 milestones, update budgets, evaluation, compilation, W&B identities, the ten selected milestones, 30 evaluation seeds and 500 steps. 0 failures apart from the final-seed mismatch above.
+- **Failure propagation:**
+  - an exploration failure stops at that call (exit 3);
+  - a downstream failure stops at that call (exit 3);
+  - a missing milestones folder stops before the first downstream call (exit 1);
+  - an existing run folder is refused before any command or log folder (exit 1).
+
+**Smoke** (`scripts/smoke.sh`, written by the user):
+- **Structure:** `run_plan2explore_100k.sh` with the same paths, logs and W&B identities. Only these differ:
+  - the groups: Walker `[walk]` and Hopper `[stand]`;
+  - inline overrides: one denoiser, one PMPO and one predictor-fit update per epoch, all warmups 0;
+  - one-episode evaluations with seed 3001;
+  - one reward-model and one policy downstream update.
+- **Why not LCG:** LCG was tried first. Its one denoiser update fell inside the warmup (learning rate 0 at step 0), so the zero-initialized output stayed zero and LCG's reference calibration refused (`Reference scores must be non-empty with a finite positive mean, got 0.0`) at epoch 1.
+- **Where it ran:** kingplus0 GPU 1, in the separate checkout `~/scfeng/LCG-plan2explore-smoke-20261105` (working-tree tar `6892b73c…`, `smoke.sh` `e1a78c4b…`). W&B was online in `lcg-reward-free-exploration-smoke` / `lcg-reward-free-downstream-smoke`. 17:24–19:25, exit 0.
+- **Verification** (`server/verify_smoke.py`, 0 failures):
+  - **Exploration (each run):** 100,000 training env steps; 190 denoiser and 190 PMPO updates; 190 fits per predictor head.
+  - **Milestones:** exactly the 20 at 5,500 and 10k–100k (epochs 1 and 10–190), with manifest counters equal to their epoch.
+  - **Exploration evaluations:** 20 reports (epochs 10–190 and the final one), each one episode with seed 3001.
+  - **Physical state:** in all 200 training episode files (qpos/qvel/recorded); none in test replay.
+  - **Downstream:** each task adapted exactly steps 10k–100k from its own run's milestones, with `num_updates` {rew_end_model 1, actor_critic 1}. Each output has one evaluation report with one episode (seed 3001), no checkpoints and no work folders.
+  - **Sources unchanged:** milestones and replay (263 files per run) had the same hashes as snapshots taken when each exploration finished.
+  - **Formats:** YAML configs, JSON metadata, JSONL metrics.
+  - **W&B:** 2 + 20 runs, all finished, with ids matching the local `wandb_run.json` files.
+- **Elapsed time:** exploration 57.7 min (Walker) + 58.2 min (Hopper); downstream 3.0 min (walk) + 2.0 min (stand); 120.8 min total.
+  - Of each exploration's ~56 epoch-minutes, the Plan2Explore refresh took ~47 (pool encoding and scoring, independent of `fit_updates`), collection ~7, and denoiser/PMPO/test ~3.
+- **Storage** (each inode counted once; no hard links):
+
+| Phase / category | Walker | Hopper |
+| --- | --- | --- |
+| Exploration: replay (200 episodes) | 1.264 GB | 1.260 GB |
+| Exploration: milestones (20 × denoiser + index) | 0.355 GB | 0.355 GB |
+| Exploration: checkpoints (state + kept agent versions) | 0.391 GB (peak 0.420) | 0.391 GB (peak 0.461) |
+| Exploration: W&B, metrics, logs, evaluation, run copy | 0.010 GB | 0.010 GB |
+| **Exploration total** | **2.019 GB** | **2.015 GB** |
+| Downstream: 10 outputs (reward model 23.6 MB + policy 8.3 MB each) | 0.319 GB | 0.319 GB |
+| Downstream: metrics, evaluation, logs; W&B (both tasks, `wandb/`) | < 1 MB | < 1 MB (W&B 1 MB total) |
+| **Downstream total** | **0.319 GB** | **0.319 GB** |
+
+- **Peaks:** final usage equals the sampled peak except the checkpoint rotation (+30–70 MB while a new agent version is written before an old one is removed).
+
+**Production projection for metrics and logs** (these scale with updates and runtime, not with the smoke):
+- **Downstream metrics:** one JSONL row per update, about 0.3 KB for the reward model and 1.6 KB for the policy. That is about 17.5 MB per production adaptation (5,000 + 10,000 updates), about 3.2 GB per method for 180 adaptations, plus a comparable local W&B history.
+- **Exploration metrics:** `wandb_history.jsonl` holds about 3 rows per epoch whatever the update count, about 0.74 MB per run.
+- **Terminal logs:** about 2 MB per smoke exploration (progress bars, time-throttled), so they grow with runtime.
+- **Replay, milestones, checkpoints and downstream models:** the same per run in production as in the smoke.

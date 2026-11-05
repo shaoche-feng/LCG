@@ -4,7 +4,7 @@ This project explores DM Control tasks without task reward, using a DIAMOND-deri
 
 ## Configuration
 
-- [config/exploration.yaml](config/exploration.yaml) (entry point `src/exploration_main.py`): the shared exploration settings, i.e. the selected 100k schedule (5,000 initial uniform steps, then 190 epochs of 500 steps; denoiser 10,000 then 400 updates; 200 PMPO updates per epoch; batch 32; no training-only epochs), the 20 saved milestones, physical-state recording, test diagnostics, checkpoints and the default run folder.
+- [config/exploration.yaml](config/exploration.yaml) (entry point `src/exploration_main.py`): the shared exploration settings, i.e. the selected 100k schedule (5,000 initial uniform steps, then 190 epochs of 500 steps; denoiser 10,000 then 400 updates; 200 PMPO updates per epoch; batch 32; no training-only epochs), the 20 saved milestones, physical-state recording, test diagnostics (every 10 epochs: 4 episodes, reset seeds 3001–3004; final: 30 episodes, reset seeds 3001–3030), checkpoints and the default run folder.
 - [config/experiment/](config/experiment/): reusable method presets `uniform_100k`, `lcg_100k`, `ensemble_100k`, `laplace_100k` and `plan2explore_100k` (method, controller objective, world-model compilation), and `downstream_10_milestones` (downstream folder mode over the ten selected milestones).
 - [config/intrinsic_reward/](config/intrinsic_reward/): each method's scoring settings (`lcg.yaml` is the default group, with the selected R1 selector and reference reward scaling).
 - [config/downstream.yaml](config/downstream.yaml) (entry points `src/downstream_main.py` and `src/downstream_analysis.py`): downstream adaptation (5,000 reward-predictor and 10,000 policy updates), evaluation (seeds 3001–3030, at most 500 steps), W&B, result collection and comparison.
@@ -26,13 +26,52 @@ Use the established `lcg` conda environment (Python 3.10). On kingplus0 its inte
 
 ## Running and validating
 
+### Launch scripts
+
+Each method has one launcher: `scripts/run_lcg_100k.sh`, `run_uniform_100k.sh`, `run_ensemble_100k.sh`, `run_laplace_100k.sh` and `run_plan2explore_100k.sh`. Run one in the foreground inside tmux:
+
+```bash
+GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/run_lcg_100k.sh
+```
+
+- **Order:** a launcher first explores all seven task groups (walker, hopper, acrobot, cartpole-balance, cartpole-swingup, humanoid, humanoid_CMU) with its `<method>_100k` preset. It then adapts every task of every group, one task at a time, on the ten selected milestones (`downstream_10_milestones`).
+- **Seeds and budgets:** exploration seed 0 and adaptation seed 0. Training and evaluation budgets come from the YAML.
+- **Settings at the top of each script:** the GPU, the Python interpreter, the seeds and the W&B projects (`EXPLORATION_PROJECT`, `DOWNSTREAM_PROJECT`).
+- **GPU and output:** the script binds CUDA and EGL rendering to `GPU` and logs to W&B online.
+- **Exploration outputs:** `outputs/<method>/<group>/seed_0/`, where `<method>` is `lcg`, `uniform`, `full-ensemble`, `laplace-ensemble` or `plan2explore`. The two Cartpole groups get separate folders (`cartpole-balance`, `cartpole-swingup`), but both run the `cartpole` domain.
+- **Downstream outputs:** inside each run folder, under `downstream/`.
+- **Terminal logs:** one per run, in a new folder `logs/<method>/<date>-<id>/`.
+- **Existing output:** a launcher refuses to start if any of its seven run folders exists. Resume an interrupted exploration with `scripts/resume.sh <run folder>`.
+- **Failures:** any failure stops the script with a nonzero exit status.
+- **W&B identities:**
+  - exploration runs: `<method>-<group>-exploration-seed0`, grouped by `<method>-<group>-exploration`;
+  - downstream runs: `<method>-<group>-exploration-seed0-steps_NNNNNN-<task>-adaptation-seed0`, one per milestone, grouped by `<method>-<group>-exploration-seed0-<task>-adaptation-seed0`.
+
+`scripts/smoke.sh` is a storage and integration smoke built on `run_plan2explore_100k.sh`.
+- **Scope:** it keeps that launcher's structure, paths, logs and W&B identities. Only its task groups and inline training/evaluation overrides differ.
+- **Groups:** Walker `[walk]`, then Hopper `[stand]`, each with the full 100k training steps.
+- **Training:**
+  - one update per epoch for the denoiser, the policy and the Plan2Explore predictors, with no warmup;
+  - one downstream reward-model and one policy update.
+- **Milestones:** the production 20 are saved; downstream adapts the selected ten.
+- **Evaluation:** one episode, reset seed 3001.
+- **YAML:** unchanged.
+- **Outputs:** it writes `outputs/plan2explore/<group>/seed_0` and `logs/plan2explore/`, exactly like the production launcher. Run it only in a separate checkout; in the production checkout those folders would make the real launcher refuse to start.
+- **W&B:** separate projects, set on the command line:
+
+```bash
+GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python \
+    EXPLORATION_PROJECT=lcg-reward-free-exploration-smoke DOWNSTREAM_PROJECT=lcg-reward-free-downstream-smoke \
+    bash scripts/smoke.sh
+```
+
 Exploration (one method, one domain/task group, one seed):
 
 ```bash
 MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=1 OMP_NUM_THREADS=1 /home/bigking/anaconda3/envs/lcg/bin/python src/exploration_main.py     +experiment=lcg_100k env.train.domain_name=walker "env.train.task_names=[stand,walk,run]"     common.seed=0 common.devices=1 wandb.mode=online wandb.project=<project> wandb.name=<name>
 ```
 
-Two groups of one domain (Cartpole's `[balance, balance_sparse]` and `[swingup, swingup_sparse]`) would share the default run folder `outputs/<method>/cartpole/seed_<N>`; their launchers must give each group its own `hydra.run.dir`.
+Two groups of one domain (Cartpole's `[balance, balance_sparse]` and `[swingup, swingup_sparse]`) would share the default run folder `outputs/<method>/cartpole/seed_<N>`; the launch scripts therefore give each group its own `hydra.run.dir`.
 
 Downstream adaptation of the ten selected milestones, for one task and adaptation seed:
 
@@ -40,7 +79,7 @@ Downstream adaptation of the ten selected milestones, for one task and adaptatio
 python src/downstream_main.py +experiment=downstream_10_milestones     initialization.milestones_dir=<run>/milestones downstream.task_name=walk downstream.seed=0
 ```
 
-The `scripts/run_walker_100k_pmpo_*.sh` files are historical Stage 3 controller launchers kept for provenance; they no longer run against the current code. PMPO supports one device, `grad_acc_steps=1`, and zero data-loader workers for checkpointed imagination RNG behavior.
+PMPO supports one device, `grad_acc_steps=1`, and zero data-loader workers for checkpointed imagination RNG behavior.
 
 For tests without training:
 
