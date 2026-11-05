@@ -37,6 +37,10 @@ TINY = [
     "actor_critic.training.steps_first_epoch=2", "actor_critic.training.steps_per_epoch=1",
     "intrinsic_reward.theta_s.include=[conv_out.*]", "intrinsic_reward.precision_reference_size=8",
     "intrinsic_reward.precision_num_mc=1", "intrinsic_reward.candidate_num_mc=2", "intrinsic_reward.candidate_chunk_size=4",
+    # Tiny models: the production R1 guards (10 tensors, 217,664 scalars) do not apply, and the tiny replay
+    # is smaller than the 32 reference prompts, so these tests keep RMS scaling (the earlier group default).
+    "intrinsic_reward.theta_s.expected_num_tensors=null", "intrinsic_reward.theta_s.expected_dim=null",
+    "intrinsic_reward.reward_scaling=rms", "intrinsic_reward.rms_enabled=true", "intrinsic_reward.reference_num_prompts=null",
 ]
 # Real collection with the fake env: 12 uniform steps, then two epochs of 6.
 COLLECT = [
@@ -238,7 +242,7 @@ def test_learned_exploration_loop_without_reward_end_model(tmp_path, monkeypatch
 @pytest.mark.parametrize("overrides,match", [
     (["intrinsic_reward.enabled=false"], "needs intrinsic_reward.enabled=true"),
     (["collection.train.mode=uniform"], "set intrinsic_reward.enabled=false"),
-    (UNIFORM + ["+pmpo_diagnostic=bounded"], "pmpo_diagnostic needs PMPO updates"),
+    (UNIFORM + ["+pmpo_diagnostic={enabled:true,max_epochs:20,evaluation_seeds:[1001,1002,1003,1004],output_dir:pmpo_diagnostic}"], "pmpo_diagnostic needs PMPO updates"),
     (["env.train.domain_name=lqr", "env.train.task_names=[lqr_2_1]"], "not verified to end only at its time limit"),
 ])
 def test_invalid_exploration_settings_are_rejected_before_any_work(tmp_path, monkeypatch, overrides, match):
@@ -365,15 +369,16 @@ def test_default_run_folder_is_method_domain_and_seed(preset, label):
     import exploration_main  # noqa: F401  (registers the run-folder resolver, as the entry point does)
     from hydra import compose as hydra_compose, initialize_config_dir
     with initialize_config_dir(version_base="1.3", config_dir=str(ROOT / "config")):
-        cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment=walker_{preset}_100k"],
+        # Presets set no seed or domain (launch scripts do): the env default's Walker and the given seed.
+        cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment={preset}_100k", "common.seed=0"],
                             return_hydra_config=True)
         assert cfg.hydra.run.dir == f"outputs/{label}/walker/seed_0"
         # The configured domain and seed, whatever they are; the method label is the preset's.
-        cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment=walker_{preset}_100k", "common.seed=7",
+        cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment={preset}_100k", "common.seed=7",
                                                                   "env.train.domain_name=cheetah"], return_hydra_config=True)
         assert cfg.hydra.run.dir == f"outputs/{label}/cheetah/seed_7"
         if preset == "uniform":  # without a fixed seed there is no default run folder
-            cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment=walker_{preset}_100k", "common.seed=null"],
+            cfg = hydra_compose(config_name="exploration", overrides=[f"+experiment={preset}_100k", "common.seed=null"],
                                 return_hydra_config=True)
             with pytest.raises(Exception, match="needs a fixed exploration seed"):
                 cfg.hydra.run.dir
@@ -402,7 +407,7 @@ def test_the_entry_point_refuses_a_new_run_in_a_finished_run_folder(tmp_path):
     (run_dir / "checkpoints").mkdir(parents=True)
     (run_dir / ".run_is_over").touch()
     before = sorted(p.name for p in run_dir.iterdir())
-    result = subprocess.run([sys.executable, str(ROOT / "src/exploration_main.py"), "+experiment=walker_uniform_100k",
+    result = subprocess.run([sys.executable, str(ROOT / "src/exploration_main.py"), "+experiment=uniform_100k",
                              "common.devices=cpu", f"hydra.run.dir={run_dir.as_posix()}"], cwd=tmp_path,
                             capture_output=True, text=True)
     assert result.returncode != 0 and "already holds run outputs (checkpoints)" in result.stderr

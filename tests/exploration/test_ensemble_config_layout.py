@@ -31,9 +31,9 @@ def to_old_layout(cfg):
 
 
 def test_defaults_and_command_line_overrides(tmp_path, monkeypatch):
-    cfg = compose(["+experiment=walker_ensemble_100k"])
+    cfg = compose(["+experiment=ensemble_100k"])
     assert (cfg.intrinsic_reward.num_members, cfg.intrinsic_reward.bootstrap) == (5, True) and "ensemble" not in cfg
-    cfg = compose(["+experiment=walker_ensemble_100k", "intrinsic_reward.num_members=7", "intrinsic_reward.bootstrap=false"])
+    cfg = compose(["+experiment=ensemble_100k", "intrinsic_reward.num_members=7", "intrinsic_reward.bootstrap=false"])
     assert (cfg.intrinsic_reward.num_members, cfg.intrinsic_reward.bootstrap) == (7, False)
     trainer, _ = run_ens(tmp_path, monkeypatch, ["intrinsic_reward.num_members=4", "intrinsic_reward.bootstrap=false"],
                          build_only=True)

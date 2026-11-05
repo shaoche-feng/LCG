@@ -97,11 +97,11 @@ def test_config_group_and_preset():
         5, True, ["unet.d_blocks.2", "unet.d_blocks.3"], 4, 0.1)
     assert (cfg.hidden_dims, cfg.lr, cfg.batch_size, cfg.fit_updates, cfg.reward_scaling, cfg.fixed_divisor) == (
         [256, 256], 1e-3, 256, 500, "fixed", 1.0)
-    preset = compose(["+experiment=walker_plan2explore_100k"])
+    preset = compose(["+experiment=plan2explore_100k"])
     OmegaConf.resolve(preset)
     assert preset.intrinsic_reward.method == "plan2explore_disagreement" and "ensemble" not in preset
     assert preset.training.compile_wm is False
-    ens = compose(["+experiment=walker_ensemble_100k"])
+    ens = compose(["+experiment=ensemble_100k"])
     OmegaConf.resolve(ens)
     # Same budget, schedules, milestones, diagnostics, env, controller and models as the ensemble preset
     # (whose budget/schedules equal the LCG and uniform presets'), only the method differs.

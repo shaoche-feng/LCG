@@ -4,17 +4,20 @@
 #   resume:   the same command with downstream.mode=resume (same settings; the run folder may move)
 #   evaluate: the same command with downstream.mode=evaluate (a completed output's final policy)
 #   folder:   initialization.milestones_dir=<run>/milestones instead of milestone_path: every milestone
-#             in the folder, in collection order, one independent run (child process) each; train only
+#             in the folder, in collection order, one independent run (child process) each; train only.
+#             The ten selected milestones: +experiment=downstream_10_milestones initialization.milestones_dir=...
 # Outputs: <run>/downstream/steps_N/<task>/seed_<seed>/ (never overwritten); training runs in
-# .seed_<seed>.tmp/ beside it. Budgets below are placeholders; final values are undecided.
+# .seed_<seed>.tmp/ beside it. Every adaptation trains a fresh reward predictor (5,000 updates) and a
+# fresh controller (10,000 updates) on the milestone's frozen denoiser and replay.
 defaults:
   - env: dm_control  # env.train is replaced by the milestone's
   - agent: pmpo_beta  # agent.denoiser is replaced by the milestone's; reward model and PMPO are fresh
   - override hydra/job_logging: stdout
   - _self_  # last, so the explicit downstream controller settings below take precedence
 
-# Downstream controller: the Gaussian H10 EMA-critic controller of config/agent/pmpo_beta.yaml with
-# the sign-only PMPO objective, stated explicitly (exploration presets use advantage_weighted).
+# Downstream controller: the Gaussian H10 EMA-critic controller of config/agent/pmpo_beta.yaml (repeat-frame
+# imagined resets, EMA critic regularization) with the sign-only PMPO objective, stated explicitly
+# (the learned exploration presets use advantage_weighted).
 agent:
   actor_critic:
     actor_objective: sign
@@ -108,7 +111,7 @@ rew_end_model:
   # the end head is trained as before either way.
   debug_metrics: false
   training:
-    steps: 1000
+    steps: 5000
     batch_size: 32
     # 19 = the reference H10 runs' rew_end_model.training.seq_length override (the H15 value
     # 15 + 4 conditioning frames, kept when they moved to horizon 10).
@@ -124,7 +127,7 @@ rew_end_model:
 # Phase 2: PMPO in imagination on predicted task reward (reward model frozen).
 actor_critic:
   training:
-    steps: 1000
+    steps: 10000
     batch_size: 32
     sample_weights: null
     lr_warmup_steps: 100

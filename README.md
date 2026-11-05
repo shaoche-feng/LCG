@@ -1,31 +1,46 @@
-# DM Control + PMPO-Beta
+# Reward-free exploration with DIAMOND world models on DM Control
 
-This project trains a PMPO-Beta controller through a DIAMOND-derived diffusion world model on DM Control RGB observations. The DM Control configuration retains its original Cheetah Run default; the experiment launch scripts explicitly select Walker Walk. The only supported controller is feedforward PMPO, with four-frame stacks, sign-only advantage grouping, separate actor/value optimizers, and a frozen prior within each refresh block. The reward/end model retains its LSTM and predicts raw scalar rewards and termination probabilities.
+This project explores DM Control tasks without task reward, using a DIAMOND-derived diffusion world model trained on RGB observations and a PMPO controller trained in imagination on an intrinsic reward (LCG, a full world-model ensemble, Laplace-sampled ensemble, Plan2Explore-style predictors, or uniform random as the baseline). Task rewards are recorded in the replay only for later adaptation: from saved exploration milestones, a fresh reward predictor and sign-only PMPO controller are trained on the frozen denoiser and replay, then evaluated on the real task.
 
-## Environment and configuration
+## Configuration
 
-Use the established `lcg` conda environment. On kingplus0 its interpreter is `/home/bigking/anaconda3/envs/lcg/bin/python`. Dependency versions are in [requirements.txt](requirements.txt).
-
-- [config/exploration.yaml](config/exploration.yaml) (entry point `src/exploration_main.py`; named `config/trainer.yaml` and `src/main.py` before 2026-10-30): collection budgets, world-model training, evaluation, checkpoints, the exploration method and the default run folder.
-- [config/downstream.yaml](config/downstream.yaml) (entry points `src/downstream_main.py` and `src/downstream_analysis.py`): downstream adaptation, evaluation and W&B; result collection and comparison.
-- [config/agent/pmpo_beta.yaml](config/agent/pmpo_beta.yaml): PMPO architecture and learning settings; includes the shared world-model architecture in [default.yaml](config/agent/default.yaml).
-- [config/env/dm_control.yaml](config/env/dm_control.yaml): task, RGB size, camera, action repeat, and time limit.
-- [config/pmpo_diagnostic/](config/pmpo_diagnostic/): optional bounded diagnostics and checkpoint recording.
-- Source: `src/exploration_main.py`/`exploration_trainer.py` (exploration), `src/downstream_main.py`/`downstream_trainer.py` (downstream), `src/downstream_analysis.py` (results), `src/intrinsic_reward/` (LCG in `lcg/`, full ensemble, Plan2Explore, Laplace and the real-episode intrinsic evaluation), `src/models/` (denoiser, reward predictor, PMPO), `src/data/` (replay, sampling, milestones), `src/pmpo_diagnostic.py` (opt-in PMPO controller diagnostics) and `src/utils.py` (shared helpers, including compute/rendering device reporting).
+- [config/exploration.yaml](config/exploration.yaml) (entry point `src/exploration_main.py`): the shared exploration settings, i.e. the selected 100k schedule (5,000 initial uniform steps, then 190 epochs of 500 steps; denoiser 10,000 then 400 updates; 200 PMPO updates per epoch; batch 32; no training-only epochs), the 20 saved milestones, physical-state recording, test diagnostics, checkpoints and the default run folder.
+- [config/experiment/](config/experiment/): reusable method presets `uniform_100k`, `lcg_100k`, `ensemble_100k`, `laplace_100k` and `plan2explore_100k` (method, controller objective, world-model compilation), and `downstream_10_milestones` (downstream folder mode over the ten selected milestones).
+- [config/intrinsic_reward/](config/intrinsic_reward/): each method's scoring settings (`lcg.yaml` is the default group, with the selected R1 selector and reference reward scaling).
+- [config/downstream.yaml](config/downstream.yaml) (entry points `src/downstream_main.py` and `src/downstream_analysis.py`): downstream adaptation (5,000 reward-predictor and 10,000 policy updates), evaluation (seeds 3001–3030, at most 500 steps), W&B, result collection and comparison.
+- [config/agent/pmpo_beta.yaml](config/agent/pmpo_beta.yaml): the Gaussian H10 EMA-critic PMPO controller; the shared world-model architecture is in [default.yaml](config/agent/default.yaml).
+- [config/env/dm_control.yaml](config/env/dm_control.yaml): RGB size, camera, action repeat and time limit. Its Walker `[stand, walk, run]` task group is only a default: launch scripts set `env.train.domain_name` and `env.train.task_names` (accepted groups: `src/envs/dm_control_env.py`, `REWARD_LABEL_TASK_GROUPS`).
+- Launch scripts choose the domain and task group, `common.seed`, `common.devices`, the run folder (`hydra.run.dir`) and the W&B identity (`wandb.mode`, `project`, `name`, `group`). The presets set none of these; W&B is disabled unless a launcher enables it.
+- Source: `src/exploration_main.py`/`exploration_trainer.py` (exploration), `src/downstream_main.py`/`downstream_trainer.py` (downstream), `src/downstream_analysis.py` (results), `src/intrinsic_reward/` (LCG in `lcg/`, full ensemble, Plan2Explore, Laplace and the real-episode intrinsic evaluation), `src/models/` (denoiser, reward predictor, PMPO), `src/data/` (replay, sampling, milestones), `src/pmpo_diagnostic.py` (opt-in PMPO controller diagnostics, configured inline as `+pmpo_diagnostic.*`) and `src/utils.py` (shared helpers, including compute/rendering device reporting).
 
 Action dimensions and bounds come from the task's action specification. RGB pixels are normalized to [-1, 1]. Each agent action executes `action_repeat` physics steps, summing their raw rewards. True termination suppresses bootstrapping; time-limit truncation uses the pre-reset final observation. Real collection continues across epoch boundaries.
 
-The base collection cadence remains 100 steps per epoch. The historical 100k Walker launch scripts explicitly use 500; use those scripts to reproduce the experiments instead of assuming the defaults encode that protocol. No experiment learning settings, budgets, or evaluation seeds were changed by the cleanup.
+## Setup
+
+Use the established `lcg` conda environment (Python 3.10). On kingplus0 its interpreter is `/home/bigking/anaconda3/envs/lcg/bin/python`. Dependency versions are pinned in [requirements.txt](requirements.txt).
+
+- **PyTorch:** install `torch==2.7.1` from the PyTorch wheel index matching the CUDA driver before the other requirements. For the RTX 5090 (Blackwell, driver 570 with CUDA 12.8) this is `pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128`; builds for CUDA older than 12.8 lack the RTX 5090's (sm_120) kernels.
+- **Headless rendering (Linux servers):** MuJoCo renders through EGL. The NVIDIA driver's EGL library (`libEGL_nvidia`, with `libEGL.so.1` from libglvnd) must be installed. Set `MUJOCO_GL=egl` and `MUJOCO_EGL_DEVICE_ID=<GPU>` for the GPU used for compute (the resume script sets both). Windows and macOS use MuJoCo's platform default.
+- **Analysis plots:** `python src/downstream_analysis.py downstream.mode=compare` needs `matplotlib` (pinned); training does not import it.
+- **Tests** need `pytest` (not pinned in `requirements.txt`).
 
 ## Running and validating
 
-For the existing baseline recipe:
+Exploration (one method, one domain/task group, one seed):
 
 ```bash
-PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python bash scripts/run_walker_100k_pmpo_baseline.sh
+MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=1 OMP_NUM_THREADS=1 /home/bigking/anaconda3/envs/lcg/bin/python src/exploration_main.py     +experiment=lcg_100k env.train.domain_name=walker "env.train.task_names=[stand,walk,run]"     common.seed=0 common.devices=1 wandb.mode=online wandb.project=<project> wandb.name=<name>
 ```
 
-The Stage 3, Stage 3B, and refresh=250 scripts remain in `scripts/`. They record launch provenance. Headless rendering needs both `MUJOCO_GL=egl` and `MUJOCO_EGL_DEVICE_ID` matching the selected GPU; the recipes set these. PMPO supports one device, `grad_acc_steps=1`, and zero data-loader workers for checkpointed imagination RNG behavior.
+Two groups of one domain (Cartpole's `[balance, balance_sparse]` and `[swingup, swingup_sparse]`) would share the default run folder `outputs/<method>/cartpole/seed_<N>`; their launchers must give each group its own `hydra.run.dir`.
+
+Downstream adaptation of the ten selected milestones, for one task and adaptation seed:
+
+```bash
+python src/downstream_main.py +experiment=downstream_10_milestones     initialization.milestones_dir=<run>/milestones downstream.task_name=walk downstream.seed=0
+```
+
+The `scripts/run_walker_100k_pmpo_*.sh` files are historical Stage 3 controller launchers kept for provenance; they no longer run against the current code. PMPO supports one device, `grad_acc_steps=1`, and zero data-loader workers for checkpointed imagination RNG behavior.
 
 For tests without training:
 
@@ -33,7 +48,7 @@ For tests without training:
 OMP_NUM_THREADS=1 MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 /home/bigking/anaconda3/envs/lcg/bin/python -m pytest -q tests
 ```
 
-Runs save the effective Hydra configuration (`config/exploration.yaml`), source/scripts, datasets, agent versions, milestones and full resume state under their output directory. By default an exploration run's folder is `outputs/<method>/<domain>/seed_<exploration seed>/` (method: `uniform`, `lcg`, `full-ensemble`, `laplace-ensemble` or `plan2explore`; a fixed `common.seed` is required), and a new run refuses a folder that already holds run outputs; resume it instead. Downstream outputs go to `<run>/downstream/steps_<N>/<task>/seed_<s>/`; `python src/downstream_analysis.py downstream.mode=collect` writes `<run>/result/<task>/seed_<s>/result.csv` and `downstream.mode=compare` writes `outputs/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<s>/` (CSV, analysis.json and plots; matplotlib needed). Custom output roots are pending. `static_dataset.path` retains training from an existing dataset. `intrinsic_reward.enabled` controls the optional LCG lifecycle; it is disabled by default.
+Runs save the effective Hydra configuration (`config/exploration.yaml`), source/scripts, datasets, agent versions, milestones and full resume state under their output directory. By default an exploration run's folder is `outputs/<method>/<domain>/seed_<exploration seed>/` (method: `uniform`, `lcg`, `full-ensemble`, `laplace-ensemble` or `plan2explore`; a fixed `common.seed` is required), and a new run refuses a folder that already holds run outputs; resume it instead. Downstream outputs go to `<run>/downstream/steps_<N>/<task>/seed_<s>/`; `python src/downstream_analysis.py downstream.mode=collect` writes `<run>/result/<task>/seed_<s>/result.csv` and `downstream.mode=compare` writes `outputs/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<s>/` (CSV, analysis.json and plots; matplotlib needed). Custom output roots are pending. `static_dataset.path` retains training from an existing dataset. `intrinsic_reward.enabled` switches the intrinsic scorer; the uniform preset disables it.
 
 To resume a run, pass its folder to the resume script, from the repository or anywhere else:
 
@@ -51,7 +66,7 @@ The script resumes with the run folder's own copied `src/`, saved `config/explor
 - `MUJOCO_GL` / `MUJOCO_EGL_DEVICE_ID`: on Linux they default to `egl` and the same GPU index; a conflicting EGL device is an error. On Windows and macOS, MuJoCo's platform default is used unless `MUJOCO_GL` is set.
 - `OMP_NUM_THREADS`: defaults to 1, as in the launch scripts.
 
-A completed run has a `.run_is_over` sentinel, written whenever training returns normally, including at a `pmpo_diagnostic.max_epochs` cap. The script refuses such a run. To extend it deliberately, rename the sentinel (for example `mv .run_is_over .run_is_over.<date>`) and pass the override that raises the bound, such as `pmpo_diagnostic.max_epochs=300`. `bash scripts/resume.sh --help` lists these details. Run folders created before this script changed keep their own older copy in `<run>/scripts/`; use this repository's script for them.
+A completed run has a `.run_is_over` sentinel, written whenever training returns normally, including at a `pmpo_diagnostic.max_epochs` cap. The script refuses such a run. To extend it deliberately, rename the sentinel (for example `mv .run_is_over .run_is_over.<date>`) and pass the override that raises the bound, such as `pmpo_diagnostic.max_epochs=300` or a higher `collection.train.num_steps_total` (whole collection epochs; see `scripts/resume.sh --help`). `bash scripts/resume.sh --help` lists these details. Run folders created before this script changed keep their own older copy in `<run>/scripts/`; use this repository's script for them.
 
 `python src/play.py` shows the PMPO policy in the world model and real environments; arrow keys switch environments and adjust imagination horizon. `-r` records policy episodes and `-d` browses datasets, displaying continuous action vectors. The viewer uses the same four-frame state and action sampling as collection.
 

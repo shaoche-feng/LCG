@@ -2,10 +2,11 @@
 # requires `enabled: True` when collection.train.mode=policy and `enabled: False` for the
 # uniform baseline (collection.train.mode=uniform). Other values are read only when enabled.
 #
-# This is a config GROUP (config/intrinsic_reward/), selected via exploration.yaml's
-# `defaults: - intrinsic_reward: lcg`, so a future baseline (RND, ICM, ...) can be added
-# as a sibling file (config/intrinsic_reward/rnd.yaml, ...) and swapped in the same way,
-# instead of accumulating multiple mutually-exclusive top-level `enabled` blocks.
+# The default of the config GROUP config/intrinsic_reward/ (exploration.yaml's
+# `defaults: - intrinsic_reward: lcg`); the other methods' scorers are its siblings
+# (ensemble_disagreement, laplace_disagreement, plan2explore_disagreement), selected by
+# their config/experiment/<method>_100k.yaml presets. The values below are the selected
+# production settings; the uniform preset disables the scorer.
 #
 # The method: historical precision h_D is a backward/VJP diagonal Gauss-Newton estimate
 # with simple IID Monte Carlo sigma sampling (precision_num_mc draws per historical
@@ -20,43 +21,37 @@ enabled: True
 
 theta_s:
   _target_: intrinsic_reward.lcg.theta_s.ThetaSConfig
-  # theta_S = the final decoder level's ResBlocks + output norm + output conv (d_S=654,851
-  # under the current agent.denoiser.inner_model.depths=[2,2,2,2] architecture -- "3" below
-  # is that architecture's last u_block index, confirmed by inspecting the real model, not
-  # assumed). Change theta_s here (YAML only, no Python) to ablate which coordinates LCG's
-  # curvature estimate covers -- see tests/lcg/test_theta_s.py for worked examples
-  # (conv_out-only, norm_out+conv_out, broad-include-with-exclude, ...).
-  include:
-    - "unet.u_blocks.3.*"
-    - "norm_out.*"
-    - "conv_out.*"
+  # Selected production setting, R1: the first ResBlock of the last decoder level (under the
+  # agent.denoiser.inner_model.depths=[2,2,2,2] architecture, "3" is the last u_block index). The guards
+  # fail at model construction if the architecture gives a different block. Other selections remain
+  # available for ablations (YAML only; set or null the guards with them), e.g. the broader
+  # ["unet.u_blocks.3.*", "norm_out.*", "conv_out.*"] (654,851 scalars); see tests/lcg/test_theta_s.py.
+  include: ["unet.u_blocks.3.resblocks.0.*"]
   exclude: []
-  # Optional guards: fail if the selection does not have exactly this many tensors/scalars.
-  expected_num_tensors: null
-  expected_dim: null
+  expected_num_tensors: 10  # optional guards (null: unchecked)
+  expected_dim: 217664
 
-precision_reference_size: 320
-precision_num_mc: 3
+precision_reference_size: 320  # historical reference transitions
+precision_num_mc: 3  # historical MC probes
 damping: 1e-4
 beta: 1.0
 
-# Policy reward from raw LCG scores: rms (RunningRMS below), fixed (raw / fixed_divisor, no
-# running statistics, centering or clipping), none, data_scaled (replay-size correction), or
-# reference (a frozen mean raw score of uniform-action imagination per refresh; see docs/REWARD_SCALING.md).
-# Must agree with rms_enabled (true only
-# for rms); a config without reward_scaling means rms if rms_enabled else none.
-reward_scaling: rms
+# Policy reward from raw LCG scores. Selected: reference (this refresh's mean raw score of
+# reference_num_prompts uniform-action imagined rollouts, frozen through PMPO and intrinsic evaluation;
+# see docs/REWARD_SCALING.md). Alternatives for ablations: rms (RunningRMS below), fixed (raw /
+# fixed_divisor), none, data_scaled (replay-size correction). rms_enabled must agree (true only for
+# rms); a config without reward_scaling means rms if rms_enabled else none.
+reward_scaling: reference
 fixed_divisor: null
 data_reference_steps: null
-reference_num_prompts: null
+reference_num_prompts: 32
 
-rms_enabled: True
+rms_enabled: false
 rms_alpha: 1.0
 rms_ema_decay: 0.99
 rms_eps: 1e-8
 
-candidate_num_mc: 12 #16, 24
-# 16 was benchmarked as the fastest AND lowest-memory candidate chunk size among C in
-# {4,8,16,32,64,96,128,240} at M=12 (22.9s/480 candidates, 958MB peak reserved on an
-# 8GB laptop GPU); C=240 hit a genuine GPU-memory cliff and was slower than C=4.
-candidate_chunk_size: 16
+candidate_num_mc: 5  # candidate MC probes (forward JVP, Full CRN)
+# Candidates per scoring chunk: the fastest of 16/32/64 on the RTX 5090 (1.90 / 1.60 / 1.70 s per 480
+# candidates); scores do not depend on it.
+candidate_chunk_size: 32

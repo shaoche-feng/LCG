@@ -306,7 +306,7 @@ def test_evaluation_defaults_and_old_configs():
     assert check_evaluation_config(compose([]).evaluation) == (True, True)
     assert check_evaluation_config(OmegaConf.create(dict(should=True, every=10))) == (True, True)  # no collect_test
     assert check_evaluation_config(OmegaConf.create(dict(should=False, every=0))) == (False, True)  # interval unused
-    preset = compose(["+experiment=walker_uniform_100k"]).evaluation
+    preset = compose(["+experiment=uniform_100k"]).evaluation
     assert (preset.should, preset.every, preset.collect_test) == (True, 10, True)
 
 

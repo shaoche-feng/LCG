@@ -41,6 +41,10 @@ REAL = [
     "actor_critic.training.steps_first_epoch=2", "actor_critic.training.steps_per_epoch=2",
     "intrinsic_reward.theta_s.include=[conv_out.*]", "intrinsic_reward.precision_reference_size=8",
     "intrinsic_reward.precision_num_mc=1", "intrinsic_reward.candidate_num_mc=2", "intrinsic_reward.candidate_chunk_size=4",
+    # Tiny models: the production R1 guards (10 tensors, 217,664 scalars) do not apply, and the tiny replay
+    # is smaller than the 32 reference prompts, so these tests keep RMS scaling (the earlier group default).
+    "intrinsic_reward.theta_s.expected_num_tensors=null", "intrinsic_reward.theta_s.expected_dim=null",
+    "intrinsic_reward.reward_scaling=rms", "intrinsic_reward.rms_enabled=true", "intrinsic_reward.reference_num_prompts=null",
     "collection.train.first_epoch.min=12", "collection.train.steps_per_epoch=6", "collection.train.num_steps_total=30",
     "collection.test.num_episodes=1", "collection.test.num_final_episodes=1", "training.num_final_epochs=0",
     "evaluation.every=2", "milestones.at_steps=[12,24]",

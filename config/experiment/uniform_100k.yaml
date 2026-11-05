@@ -1,0 +1,15 @@
+# @package _global_
+# Uniform-random exploration baseline: uniform actions throughout, no intrinsic scorer and no PMPO
+# updates; only the denoiser trains. Schedule, milestones and diagnostics: config/exploration.yaml.
+#
+#   python src/exploration_main.py +experiment=uniform_100k env.train.domain_name=<domain> \
+#       "env.train.task_names=[<tasks>]" common.seed=<seed> common.devices=<gpu> [hydra.run.dir=<run folder>]
+# On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
+# scripts/resume.sh <run folder>.
+
+collection:
+  train:
+    mode: uniform  # after the initial uniform steps too; the policy is never evaluated or trained
+
+intrinsic_reward:
+  enabled: false  # no scorer, no PMPO updates

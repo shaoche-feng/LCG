@@ -12,6 +12,11 @@ from models.rew_end_model import RewEndModel, RewEndModelConfig
 from models.pmpo_beta import PMPOOptimizers
 from test_pmpo_beta import make_controller
 
+# The PMPO diagnostic mode, given inline (the config/pmpo_diagnostic/ presets were removed); the values
+# of the former bounded.yaml.
+BOUNDED_DIAGNOSTIC = ("+pmpo_diagnostic={enabled:true,max_epochs:20,evaluation_seeds:[1001,1002,1003,1004],"
+                      "output_dir:pmpo_diagnostic}")
+
 
 def compose_cleanup_config(overrides=()):
     from pathlib import Path
@@ -30,7 +35,7 @@ def test_default_hydra_agent_and_checkpoint(tmp_path):
     assert cfg.env.train.domain_name == "walker"
     assert list(cfg.env.train.task_names) == list(cfg.env.test.task_names) == ["stand", "walk", "run"]
     assert cfg.agent.actor_critic.prior_refresh_interval == 500
-    assert cfg.collection.train.steps_per_epoch == 100  # Recipes override this to 500.
+    assert cfg.collection.train.steps_per_epoch == 500  # the selected 100k schedule
     env = SimpleNamespace(action_dim=6, action_low=torch.full((6,), -1.), action_high=torch.ones(6))
     agent = Agent(instantiate(cfg.agent, **get_action_space_kwargs(env)))
     assert isinstance(agent.rew_end_model.lstm, torch.nn.LSTM)
@@ -231,8 +236,12 @@ def test_static_dataset_trainer_world_model_and_pmpo_resume(tmp_path, monkeypatc
         "intrinsic_reward.theta_s.include=[conv_out.*]", "intrinsic_reward.precision_reference_size=8",
         "intrinsic_reward.precision_num_mc=1", "intrinsic_reward.candidate_num_mc=2",
         "intrinsic_reward.candidate_chunk_size=4",
+        # Tiny model: no production R1 guards; tiny replay: RMS rather than 32-prompt reference scaling.
+        "intrinsic_reward.theta_s.expected_num_tensors=null", "intrinsic_reward.theta_s.expected_dim=null",
+        "intrinsic_reward.reward_scaling=rms", "intrinsic_reward.rms_enabled=true",
+        "intrinsic_reward.reference_num_prompts=null",
         "rew_end_model.training.steps_first_epoch=1", "actor_critic.training.steps_first_epoch=1",
-        *(["+pmpo_diagnostic=bounded", "denoiser.training.steps_per_epoch=1",
+        *([BOUNDED_DIAGNOSTIC, "denoiser.training.steps_per_epoch=1",
            "rew_end_model.training.steps_per_epoch=1", "actor_critic.training.steps_per_epoch=1"]
           if diagnostic else []),
     ])

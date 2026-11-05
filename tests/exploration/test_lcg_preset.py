@@ -13,8 +13,8 @@ SHARED = ["env", "collection", "denoiser", "milestones", "evaluation", "training
           "agent"]
 
 
-def test_walker_lcg_100k_preset_resolves_the_agreed_settings():
-    cfg = compose(["+experiment=walker_lcg_100k"])
+def test_lcg_100k_preset_resolves_the_agreed_settings():
+    cfg = compose(["+experiment=lcg_100k"])
     OmegaConf.resolve(cfg)
     c = cfg.collection.train
     assert (cfg.env.train.domain_name, list(cfg.env.train.task_names)) == ("walker", ["stand", "walk", "run"])
@@ -29,7 +29,7 @@ def test_walker_lcg_100k_preset_resolves_the_agreed_settings():
     assert (cfg.actor_critic.training.steps_first_epoch, cfg.actor_critic.training.steps_per_epoch) == (200, 200)
     # The environment, replay budget, denoiser and PMPO schedules, milestones and models match
     # uniform (which never uses its PMPO schedule). LCG's exploration objective is the explicit difference.
-    uniform = compose(["+experiment=walker_uniform_100k"])
+    uniform = compose(["+experiment=uniform_100k"])
     OmegaConf.resolve(uniform)
     for key in SHARED:
         a, b = OmegaConf.to_container(cfg[key]), OmegaConf.to_container(uniform[key])
@@ -52,7 +52,7 @@ def test_lcg_preset_rejects_a_mismatched_parameter_block_before_any_work(tmp_pat
     # The tiny test denoiser has no u_blocks.3: the preset's R1 pattern must fail when the
     # model is built, before any collection, checkpoint or training.
     with pytest.raises(ValueError, match="matched no parameters"):
-        run_trainer(tmp_path, monkeypatch, ["+experiment=walker_lcg_100k", "wandb.mode=disabled",
+        run_trainer(tmp_path, monkeypatch, ["+experiment=lcg_100k", "wandb.mode=disabled",
                                             "env.train.task_names=[stand,walk]",
                                             "intrinsic_reward.theta_s.include=[unet.u_blocks.3.resblocks.0.*]",
                                             *COLLECT], build_only=True)

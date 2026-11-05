@@ -3919,3 +3919,68 @@ Committed at the user's request; the review package was built from the identical
   - a real YAML-defined selection reaching the children cleared;
   - the existing folder-mode tests, updated for the second clearing override.
 - `tests/downstream`: 102 passed (before the progress change). Terminal-output tests after the progress change: 61 passed. Full suite: 778 passed, 0 failed, before the compact-bar refinement; after it, the focused formatting tests (device report, exploration logging, downstream screen and plan) gave 75 passed.
+
+## Production configuration cleanup and requirements check (2026-11-05)
+
+Uncommitted, pending independent review. Starting point `073774c`, clean working tree. Evidence: `outputs/step32-config-cleanup/`. Review package: `docs/changes/config_cleanup_review.zip`. No source module, algorithm or hyperparameter changed; no training was run.
+
+**Layout:**
+- `config/exploration.yaml` / `config/downstream.yaml`: shared settings.
+- `config/intrinsic_reward/*.yaml`: method scoring.
+- `config/experiment/*.yaml`: domain-free method presets.
+- Launch scripts: domain and task group, `common.seed`, `common.devices`, `hydra.run.dir` and the W&B identity.
+- `config/env/dm_control.yaml` is kept, with Walker `[stand, walk, run]` only as the default. No per-environment YAML files.
+
+**Exploration (`exploration.yaml`):**
+- `collection.train.steps_per_epoch` 100 → 500. The other schedule values were already the selected ones: 100,000 steps, 5,000 initial uniform, denoiser 10,000/400, PMPO 200/200, batch 32, no training-only epochs, recording on for training and off for evaluation, debug metrics off.
+- Milestones: `at_steps` lists 20 counts (5,500, then 10,000, 15,000, …, 100,000), `every_steps: null`, `keep_last: null`. They are published at epochs 1, 10, 20, …, 190 and all retained (checked with `mark_due_milestone`).
+- Unchanged and still undecided: test diagnostics every 10 epochs (4 episodes) and a separate final 100, with `evaluation.reset_seeds` / `final_reset_seeds: null` (random reset seeds).
+
+**Downstream (`downstream.yaml`):**
+- Reward predictor 1,000 → 5,000 updates; policy 1,000 → 10,000 updates; both batch 32.
+- Unchanged: the Gaussian H10 sign-only controller, seed 0, member 0, evaluation seeds 3001–3030 and 500 steps, debug off.
+- `initialization.milestone_steps: null` stays generic.
+- New preset `experiment/downstream_10_milestones.yaml`: `milestone_path: null`, `milestones_dir: ???`, `milestone_steps: [10000, …, 100000]`. Without a folder, the launcher's "exactly one of milestone_path and milestones_dir" error applies.
+
+**Presets:**
+- `walker_{uniform,lcg,ensemble,laplace,plan2explore}_100k.yaml` were renamed with `git mv` to `{…}_100k.yaml`. Removed from them: the Walker environment, the collection schedule, evaluation settings, `common.seed: 0` and the W&B settings (`online`, project, name). W&B is now disabled unless a launcher enables it.
+- Kept: uniform collection with the scorer disabled for `uniform_100k`; advantage-weighted PMPO with cap 5 for all four learned presets; `training.compile_wm: false` for ensemble, Laplace and Plan2Explore (LCG and uniform use the default `true`).
+
+**Scoring:**
+- `intrinsic_reward/lcg.yaml` now holds the production LCG settings: R1 `unet.u_blocks.3.resblocks.0.*` with guards 10 / 217,664; 5 candidate probes, chunk 32; 320 × 3 historical reference; damping 1e-4; beta 1.0; `reward_scaling: reference`, `reference_num_prompts: 32`, `rms_enabled: false`.
+  - Previously the group default was the broad selector, MC 12, chunk 16 and RMS scaling, and the preset overrode it.
+  - The other scaling modes and selectors remain available by override.
+- `laplace_disagreement.yaml` gains the same R1 guards.
+- Ensemble and Plan2Explore settings are unchanged.
+- Stale comments were corrected, including "the maintained LCG preset is sign-only" and the "future baseline" header.
+
+**Removed:** `config/pmpo_diagnostic/bounded*.yaml` (4 files). `src/pmpo_diagnostic.py` and its tests are kept; the two tests that used `+pmpo_diagnostic=bounded` pass the same values inline. The historical `scripts/run_walker_100k_pmpo_*.sh` Stage 3 launchers still name `+pmpo_diagnostic=bounded_full_loop`. They were already not runnable against the current trainer (`env.train.task_name`, disabled intrinsic reward under policy collection), are kept for provenance, and the README now says so.
+
+**Verification:**
+- `outputs/step32-config-cleanup/scripts/resolve_presets.py` composed every method preset with every accepted group (35 compositions) and the downstream preset. Results are in `evidence/config_resolution.json`, with 0 failures. It checked that:
+  - the launched domain and task list reach `env.train` and `env.test`, with no preset resetting them to Walker;
+  - the schedule, 20 milestones, recording, debug flags, objective and compilation are the selected ones;
+  - the R1 selector with its guards holds on the real denoiser for every accepted domain's action dimension (14 checks, all 10 tensors / 217,664 scalars).
+- Default run folders are `outputs/<method>/<domain>/seed_<N>`, so the two Cartpole groups collide unless their launchers set distinct `hydra.run.dir` values. This is a launcher requirement.
+
+**Tests:** tiny test configurations now null the R1 guards and keep RMS scaling explicitly (tiny models and replays; `TINY` in `test_exploration_trainer.py`, `REAL` in the resume tests, `test_pmpo_integration.py`, the Laplace list). Preset names were updated, and the schedule test now covers all 5 presets × 7 task groups. The full suite before the test updates gave 82 failed (expected: guards, renamed presets, removed diagnostic preset, scaling defaults); on the final code it gave 808 passed, 0 failed.
+
+**Requirements (laptop, Windows, Python 3.10.20):**
+- `pip check`: no broken requirements.
+- Every pin equals the installed version (`hydra-core==1.3` is 1.3.0). torch 2.7.1+cu128 with CUDA available, and W&B 0.30.0 kept.
+- Maintained imports in `src/` are all declared:
+  - `matplotlib` is imported only by the analysis's plotting subprocess;
+  - `pillow` and `pygame` are used only by `src/game` / `play.py`;
+  - `h5py` is not imported by maintained code;
+  - `opencv-python` is used only by historical diagnostic scripts.
+  Both are kept pending a decision.
+- Tests also need `pytest`, which is not pinned.
+- The README now documents the cu128 wheel index for the RTX 5090 (driver 570, CUDA 12.8) and the EGL requirements.
+- **Not checked here (servers):** `pip check`, imports, CUDA/compilation, EGL rendering and W&B login on both RTX 5090 servers. The kingplus0 environment is known to lack matplotlib. No server environment was touched.
+
+**Open decisions:**
+- Exploration test reset seeds: periodic, proposed 3001–3004; final, 100 random episodes kept for now.
+- W&B projects, groups and run names for both phases.
+- The launch scripts themselves, including distinct Cartpole run folders.
+- Whether to drop `h5py` / `opencv-python`.
+- The server environment setup.

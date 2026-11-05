@@ -6,7 +6,7 @@
 # member). Every member runs the full diffusion chain from the same initial noise with its
 # sampled parameters fixed; reward and next observation are the full ensemble's (population
 # pixel variance; one uniformly drawn member per trajectory and transition). A curvature-based
-# approximation, not a calibrated posterior. Values are working placeholders, not tuned.
+# approximation, not a calibrated posterior. The values are the selected settings, not tuned.
 _target_: intrinsic_reward.laplace.LaplaceConfig
 
 method: laplace_disagreement
@@ -15,13 +15,14 @@ enabled: True
 num_members: 5  # sampled parameter sets, >= 2
 posterior_temperature: 1.0  # covariance multiplier T: perturbation std = sqrt(T) / sqrt(h)
 
-# Selected parameters: LCG's R1 (first ResBlock of the last decoder level), LCG's selector.
+# Selected parameters: LCG's R1 (first ResBlock of the last decoder level), LCG's selector, with the
+# same guards (fail at model construction if the architecture gives a different block).
 theta_s:
   _target_: intrinsic_reward.lcg.theta_s.ThetaSConfig
   include: ["unet.u_blocks.3.resblocks.0.*"]
   exclude: []
-  expected_num_tensors: null
-  expected_dim: null
+  expected_num_tensors: 10
+  expected_dim: 217664
 
 # LCG's historical precision, unchanged (lcg.lcg_historical_precision): diagonal
 # damping + beta * (N / B) * sum over B reference transitions of the probe-averaged squared VJP.

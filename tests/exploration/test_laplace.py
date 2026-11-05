@@ -35,7 +35,8 @@ LAP = [o for o in base.TINY if not o.startswith("intrinsic_reward.") and not o.s
     "agent.denoiser.inner_model.depths=[1,1]", "agent.denoiser.inner_model.channels=[8,8]",
     "agent.denoiser.inner_model.attn_depths=[0,0]",
     "intrinsic_reward=laplace_disagreement", "intrinsic_reward.num_members=3",
-    f"intrinsic_reward.theta_s.include=[{R1_TINY}]", "intrinsic_reward.precision_reference_size=8",
+    f"intrinsic_reward.theta_s.include=[{R1_TINY}]", "intrinsic_reward.theta_s.expected_num_tensors=null",
+    "intrinsic_reward.theta_s.expected_dim=null", "intrinsic_reward.precision_reference_size=8",
     "intrinsic_reward.precision_num_mc=1", "agent.actor_critic.actor_objective=advantage_weighted"]
 OFF = ["evaluation.should=false"]
 TINY_LCG = list(base.TINY)  # the default (LCG) tiny settings, captured before any test patches them
@@ -110,11 +111,11 @@ def test_config_group_and_preset():
     assert (cfg.num_members, cfg.posterior_temperature, cfg.theta_s.include, cfg.precision_reference_size,
             cfg.precision_num_mc, cfg.damping, cfg.beta) == (5, 1.0, ("unet.u_blocks.3.resblocks.0.*",), 320, 3, 1e-4, 1.0)
     assert (cfg.num_noise_samples, cfg.reward_scaling, cfg.fixed_divisor, cfg.shared_prefix) == (1, "fixed", 1.0, True)
-    preset = compose(["+experiment=walker_laplace_100k"])
+    preset = compose(["+experiment=laplace_100k"])
     OmegaConf.resolve(preset)
-    ens = compose(["+experiment=walker_ensemble_100k"])
+    ens = compose(["+experiment=ensemble_100k"])
     OmegaConf.resolve(ens)
-    lcg = compose(["+experiment=walker_lcg_100k"])
+    lcg = compose(["+experiment=lcg_100k"])
     OmegaConf.resolve(lcg)
     assert preset.intrinsic_reward.method == "laplace_disagreement" and preset.training.compile_wm is False
     for key in ("collection", "denoiser", "milestones", "evaluation", "env", "actor_critic", "agent",

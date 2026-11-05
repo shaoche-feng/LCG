@@ -1,0 +1,21 @@
+# @package _global_
+# Laplace-inspired sampled diffusion ensemble: one denoiser, 5 Gaussian samples of its R1 parameters from
+# LCG's historical precision; full-ensemble pixel disagreement. Settings (R1 selector and guards, samples,
+# temperature, precision): config/intrinsic_reward/laplace_disagreement.yaml.
+# Schedule, milestones and diagnostics: config/exploration.yaml.
+#
+#   python src/exploration_main.py +experiment=laplace_100k env.train.domain_name=<domain> \
+#       "env.train.task_names=[<tasks>]" common.seed=<seed> common.devices=<gpu> [hydra.run.dir=<run folder>]
+# On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
+# scripts/resume.sh <run folder>.
+defaults:
+  - override /intrinsic_reward: laplace_disagreement
+
+# Advantage-weighted PMPO (cap 5), as in every learned exploration preset.
+agent:
+  actor_critic:
+    actor_objective: advantage_weighted
+    advantage_weight_cap: 5.0
+
+training:
+  compile_wm: false

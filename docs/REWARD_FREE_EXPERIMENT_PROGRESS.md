@@ -34,6 +34,11 @@ Task rewards are recorded separately during exploration and used only for downst
   method (38,000), and ten saved milestones at 10k, 20k, ..., 100k (epochs 10, 30, ..., 190; all kept). For LCG,
   reference reward scaling with 32 prompts (`e5b1e61`). Downstream budgets and evaluation seeds remain open.
   Notes: "Selected 100k exploration schedule".
+  Production configuration (2026-11-05, uncommitted, pending review): shared settings in exploration.yaml /
+  downstream.yaml, domain-free presets `{uniform,lcg,ensemble,laplace,plan2explore}_100k`, LCG/Laplace production
+  scoring in intrinsic_reward/; 20 saved milestones (5,500, then 10k to 100k every 5k), ten adapted
+  (`downstream_10_milestones`); downstream 5,000 + 10,000 updates. Open: exploration evaluation reset seeds,
+  W&B identities, launch scripts, server environments. Notes: "Production configuration cleanup".
   Downstream throughput measured on the RTX 5090 (2026-11-02, measurement only; one uniform milestone, Walker walk):
   reward predictor 0.093 s/update, policy 0.380 s/update, evaluation 45 s. Working plan 5,000 + 10,000 updates:
   projected 72 min per adaptation, 362 GPU-hours for 5 methods x 3 seeds x 20 milestones x 1 task. Budgets remain
@@ -126,12 +131,12 @@ Start with random and LCG, then add the remaining methods.
 - [x] LCG. Preset with R1 and M5, verified by smoke and resume (`be8a38d`), originally with a fixed reward scale
   (raw / 100); now reference reward scaling with 200 PMPO updates per epoch (`e5b1e61`). The advantage-weighted PMPO
   objective, a 10k-step online pilot and a pilot downstream run are done; no full 100k run.
-- [x] Full world-model ensemble (5 bootstrapped denoisers, preset `walker_ensemble_100k`).
+- [x] Full world-model ensemble (5 bootstrapped denoisers, preset `ensemble_100k`, formerly `walker_ensemble_100k`).
   Implemented and verified, settings in `intrinsic_reward` (`4a82dde`, `ea3356d`); no pilot or full run.
 - [x] Plan2Explore-style predictor ensemble (one denoiser plus 5 bootstrapped feature heads, preset
-  `walker_plan2explore_100k`). Implemented and verified (`cd78477`); settings are placeholders, no pilot or full run.
+  `plan2explore_100k`, formerly `walker_plan2explore_100k`). Implemented and verified (`cd78477`); settings are placeholders, no pilot or full run.
 - [x] Laplace-sampled ensemble (5 samples of LCG's R1 parameters from its historical precision, T = 1, preset
-  `walker_laplace_100k`). Implemented and verified as software (`9176c13`); T = 1 kept provisionally, no pilot or full run.
+  `laplace_100k`, formerly `walker_laplace_100k`). Implemented and verified as software (`9176c13`); T = 1 kept provisionally, no pilot or full run.
 
 Details and status history: `REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6.
 

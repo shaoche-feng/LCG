@@ -1,0 +1,17 @@
+# @package _global_
+# LCG exploration: PMPO on the LCG score of imagined transitions (no task reward), the scorer refreshed
+# once per epoch on that epoch's denoiser and replay. Scoring settings (R1 selector and guards, probes,
+# historical precision, reference reward scaling): config/intrinsic_reward/lcg.yaml, the default group.
+# Schedule, milestones and diagnostics: config/exploration.yaml.
+#
+#   python src/exploration_main.py +experiment=lcg_100k env.train.domain_name=<domain> \
+#       "env.train.task_names=[<tasks>]" common.seed=<seed> common.devices=<gpu> [hydra.run.dir=<run folder>]
+# On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
+# scripts/resume.sh <run folder>.
+
+# The Gaussian H10 EMA-critic controller (config/agent/pmpo_beta.yaml) with advantage-weighted PMPO,
+# as in every learned exploration preset. World-model compilation stays on (training.compile_wm).
+agent:
+  actor_critic:
+    actor_objective: advantage_weighted
+    advantage_weight_cap: 5.0

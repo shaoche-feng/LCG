@@ -1,0 +1,22 @@
+# @package _global_
+# Full diffusion-world-model ensemble (MAX-inspired ensemble disagreement): 5 independently initialized,
+# bootstrapped denoisers and PMPO on their disagreement. Settings: config/intrinsic_reward/ensemble_disagreement.yaml.
+# Every member trains the shared per-epoch denoiser schedule, so the ensemble performs `members` times
+# the denoiser updates of a single-denoiser run (not equal training compute).
+# Schedule, milestones and diagnostics: config/exploration.yaml.
+#
+#   python src/exploration_main.py +experiment=ensemble_100k env.train.domain_name=<domain> \
+#       "env.train.task_names=[<tasks>]" common.seed=<seed> common.devices=<gpu> [hydra.run.dir=<run folder>]
+# On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
+# scripts/resume.sh <run folder>.
+defaults:
+  - override /intrinsic_reward: ensemble_disagreement
+
+# Advantage-weighted PMPO (cap 5), as in every learned exploration preset.
+agent:
+  actor_critic:
+    actor_objective: advantage_weighted
+    advantage_weight_cap: 5.0
+
+training:
+  compile_wm: false  # ensemble imagination runs uncompiled

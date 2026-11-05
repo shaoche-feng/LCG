@@ -1,0 +1,14 @@
+# @package _global_
+# Downstream folder mode over the ten selected milestones of an exploration run (of the 20 it saves),
+# for use with config/downstream.yaml (src/downstream_main.py), not with exploration:
+#
+#   python src/downstream_main.py +experiment=downstream_10_milestones \
+#       initialization.milestones_dir=<run>/milestones downstream.task_name=<task> [downstream.seed=0]
+#
+# Selected by the milestones' recorded collected_steps; every listed step must exist. One task and one
+# adaptation seed per command; each milestone is an independent child run.
+initialization:
+  milestone_path: null
+  milestones_dir: ???
+  milestone_steps: [10000, 20000, 30000, 40000, 50000,
+                    60000, 70000, 80000, 90000, 100000]

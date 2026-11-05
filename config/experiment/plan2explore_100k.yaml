@@ -1,0 +1,21 @@
+# @package _global_
+# Plan2Explore-style baseline (lightweight feature-predictor ensemble disagreement): one denoiser and
+# 5 bootstrapped next-feature predictor heads; PMPO trains on their disagreement.
+# Settings: config/intrinsic_reward/plan2explore_disagreement.yaml.
+# Schedule, milestones and diagnostics: config/exploration.yaml.
+#
+#   python src/exploration_main.py +experiment=plan2explore_100k env.train.domain_name=<domain> \
+#       "env.train.task_names=[<tasks>]" common.seed=<seed> common.devices=<gpu> [hydra.run.dir=<run folder>]
+# On Linux/EGL also set MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=<device>. Resume a run with
+# scripts/resume.sh <run folder>.
+defaults:
+  - override /intrinsic_reward: plan2explore_disagreement
+
+# Advantage-weighted PMPO (cap 5), as in every learned exploration preset.
+agent:
+  actor_critic:
+    actor_objective: advantage_weighted
+    advantage_weight_cap: 5.0
+
+training:
+  compile_wm: false

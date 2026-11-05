@@ -2,7 +2,7 @@
 
 Instructions for Codex, Claude Code and other coding agents working on this reward-free experiment repository.
 
-Updated: 2026-11-04, branch `lcg-reward-scaling`: reward scaling (`e5b1e61`), the collection-budget extension, and the selected 100k schedule and milestones are committed. This identifies the snapshot the guide was checked against; inspect the actual checkout before claiming its current commit or status.
+Updated: 2026-11-05, branch `lcg-reward-scaling`: production configuration layout (shared settings, domain-free method presets, launcher-set domain/seed/device/output/W&B), 20 saved and ten adapted milestones, downstream budgets. This identifies the snapshot the guide was checked against; inspect the actual checkout before claiming its current commit or status.
 
 ## Project and authority
 
@@ -12,7 +12,7 @@ This project studies task-agnostic exploration with DIAMOND-style diffusion worl
 - Inspect the actual checkout, resolved configuration and current code before making changes. Do not assume an old server path or worktree is the active repository.
 - Treat saved configurations and executable code as the description of existing behavior. Design documents describe intent; the notes record implementation changes and limitations. Report contradictions instead of silently choosing a historical description.
 - Historical Stage 3 Beta/H15 experiments are context, not this repository’s current controller specification. Do not copy their settings or results into the reward-free experiment as defaults.
-- Current software implementation and bounded validation are complete. Selected so far: the 100k schedule under "Environment and schedules" (190 epochs, no training-only epochs, 200 PMPO updates per epoch for every learned method, ten milestones at 10k, 20k, …, 100k), and LCG reference reward scaling with 32 prompts (`walker_lcg_100k`). Other budgets, schedules and the seed design are still pending; the remaining numerical defaults are executable placeholders, not an approved final protocol.
+- Current software implementation and bounded validation are complete. Selected: the 100k schedule and milestones under "Environment and schedules", the method settings in `config/intrinsic_reward/` (LCG: R1, reference reward scaling with 32 prompts), and the downstream budgets (5,000 reward-predictor + 10,000 policy updates). Still open: the exploration evaluation reset seeds, the exploration-seed design, W&B identities and server-specific launch settings (see the launch checklist).
 
 ## Working rules
 
@@ -98,19 +98,19 @@ The implementation retains the name `PMPOBeta`, but the current configured actor
 
 The EMA critic is a regularizer, not the bootstrap target network. The online critic supplies bootstraps and advantages. Preserve the reference implementation rather than substituting a conventional target-critic algorithm.
 
-The shared agent config’s actor objective remains sign-only; the learned exploration presets override it. Resolve the selected preset before judging actual behavior. Some historical config comments incorrectly call the LCG preset sign-only; its actual current override is advantage-weighted.
+The shared agent config’s actor objective remains sign-only (downstream uses it); all four learned exploration presets override it to advantage-weighted with cap 5. Resolve the selected preset before judging actual behavior.
 
 ## Exploration methods and working settings
 
 | Output label | Preset | Current distinguishing settings |
 | --- | --- | --- |
-| `uniform` | `walker_uniform_100k` | Uniform actions throughout; denoiser only; no intrinsic reward or PMPO training |
-| `lcg` | `walker_lcg_100k` | R1 selector, candidate MC 5, chunk 32, historical reference 320 with MC 3, damping 1e-4, beta 1; reference reward scaling (32 prompts; see `docs/REWARD_SCALING.md`) |
-| `full-ensemble` | `walker_ensemble_100k` | 5 independently initialized denoisers; episode bootstrap enabled; shared diffusion noise; pixel disagreement |
-| `plan2explore` | `walker_plan2explore_100k` | One denoiser; 5 independent lightweight MLP predictors; replay-feature cache; bootstrap enabled; feature disagreement |
-| `laplace-ensemble` | `walker_laplace_100k` | One denoiser; 5 sampled R1 parameter sets; shared LCG historical precision; temperature 1; pixel disagreement |
+| `uniform` | `uniform_100k` | Uniform actions throughout; denoiser only; no intrinsic reward or PMPO training |
+| `lcg` | `lcg_100k` | R1 selector, candidate MC 5, chunk 32, historical reference 320 with MC 3, damping 1e-4, beta 1; reference reward scaling (32 prompts; see `docs/REWARD_SCALING.md`) |
+| `full-ensemble` | `ensemble_100k` | 5 independently initialized denoisers; episode bootstrap enabled; shared diffusion noise; pixel disagreement |
+| `plan2explore` | `plan2explore_100k` | One denoiser; 5 independent lightweight MLP predictors; replay-feature cache; bootstrap enabled; feature disagreement |
+| `laplace-ensemble` | `laplace_100k` | One denoiser; 5 sampled R1 parameter sets; shared LCG historical precision; temperature 1; pixel disagreement |
 
-- Base `intrinsic_reward/lcg.yaml` differs from the Walker preset: broad selector, candidate MC 12, chunk 16 and RMS scaling. Do not confuse base-group defaults with resolved Walker settings.
+- Configuration layout: `exploration.yaml` / `downstream.yaml` hold shared settings; `intrinsic_reward/*.yaml` hold each method's scoring settings (the production LCG and Laplace settings, including the R1 guards, live there, not in the presets); `experiment/*.yaml` are domain-free method presets; launch scripts set the domain/task group, seed, device, run folder and W&B identity. The presets set no environment, schedule, seed or W&B values.
 - R1 is `unet.u_blocks.3.resblocks.0.*`, guarded as 10 tensors / 217,664 scalars for the current architecture.
 - Full ensemble and Laplace compare completed sampler predictions on the uint8 grid represented as float tensors. They use population pixel variance, shared noise and one uniformly selected member per trajectory/transition for the next observation. Do not advance the world with the ensemble mean.
 - Full ensemble trains the full denoiser schedule per member. Bootstrap multiplicities are fixed per episode/member. Equal PMPO update time does not imply equal total compute.
@@ -118,7 +118,7 @@ The shared agent config’s actor objective remains sign-only; the learned explo
 - Laplace samples `theta_hat + sqrt(T) * epsilon / sqrt(h)`. Replay-size scaling and damping are already included in the shared precision; do not apply them twice. Samples stay fixed during the epoch’s PMPO phase and each denoising chain. Preserve the stored settings label `lcg.lcg_historical_precision`; it is an identity string, not an import path.
 - Temperature 1 is provisional. Extremely undertrained smoke models collapsed, while the tested first-refresh model under the actual pilot schedule retained coherent predictions. Neither observation establishes calibrated uncertainty or exploration benefit.
 - Full ensemble, Plan2Explore and Laplace currently divide raw reward by 1.0; these are provisional scales. Raw intrinsic rewards are not comparable across methods.
-- Current presets leave world-model compilation enabled for LCG/uniform and disable it for full ensemble, Plan2Explore and Laplace. Record the resolved setting in timing comparisons; do not silently align it during a refactor.
+- World-model compilation is enabled by default (LCG, uniform); the full-ensemble, Plan2Explore and Laplace presets disable it. Record the resolved setting in timing comparisons; do not silently align it during a refactor.
 
 ## Downstream contract
 
@@ -138,9 +138,9 @@ One `DownstreamTrainer` handles exactly one milestone, task, adaptation seed and
 
 ## Environment and schedules
 
-Current Walker configuration: RGB 64x64, camera 0, action repeat 2, four conditioning frames, `time_limit: null` (the existing environment default). Do not claim compatibility for additional task groups without the compatibility evidence.
+Environment (`config/env/dm_control.yaml`): RGB 64x64, camera 0, action repeat 2, four conditioning frames, `time_limit: null`; its Walker `[stand, walk, run]` group is only the default, overridden by launch scripts. Accepted groups are `REWARD_LABEL_TASK_GROUPS` (7 groups over acrobot, cartpole ×2, hopper, humanoid, humanoid_CMU, walker); do not claim others without the compatibility evidence. The two Cartpole groups share a domain and therefore the default run folder: their launchers must set distinct `hydra.run.dir` values.
 
-The selected 100k schedule, resolved by all five Walker presets without overrides (`config/exploration.yaml`; pinned by `tests/exploration/test_uniform_preset.py`):
+The selected 100k schedule, resolved by all five method presets for every accepted task group (`config/exploration.yaml`; pinned by `tests/exploration/test_uniform_preset.py`):
 
 | Setting | Value |
 | --- | --- |
@@ -149,11 +149,12 @@ The selected 100k schedule, resolved by all five Walker presets without override
 | Replay steps after epoch k | 5,000 + 500k: 5,500 at epoch 1, 10,000 at epoch 10, 100,000 at epoch 190 |
 | Denoiser updates | 10,000 in epoch 1, then 400: 85,600 per denoiser (428,000 over the full ensemble's 5 members) |
 | PMPO updates | 200 per epoch, first epoch included: 38,000 for each learned method; 0 for uniform |
-| Milestones | `every_steps: 10000`, `at_steps: []`, `keep_last: null`: 10k, 20k, …, 100k, at epochs 10, 30, …, 190, all retained |
+| Saved milestones | `at_steps` 5,500 and 10,000, 15,000, …, 100,000 (20; epochs 1 and 10, 20, …, 190), `every_steps: null`, `keep_last: null`: all retained |
+| Adapted milestones | 10k, 20k, …, 100k (`+experiment=downstream_10_milestones`, matched by manifest step count) |
 
 Periodic test diagnostics (every 10 epochs) and the final diagnostic are extra interaction: 19 × 4 + 100 episodes. Apart from the selections listed under "Project and authority", the remaining numerical settings are current defaults, not a finalized experimental protocol. Earlier runs and notes used 50 training-only epochs (240 epochs) and 5,000-then-400 PMPO updates; those records are historical.
 
-Downstream currently defaults to 1,000 reward-model + 1,000 policy updates, batches of 32 and reward-model sequence length 19. Its evaluation defaults are deterministic actions, seeds 3001–3030 and at most 500 environment steps per episode. Budgets and the final seed protocol remain open decisions.
+Downstream (`config/downstream.yaml`): a fresh reward predictor (5,000 updates) and fresh sign-only Gaussian H10 EMA-critic controller (10,000 updates), batches of 32, reward-model sequence length 19, on the milestone's frozen denoiser and replay; adaptation seed 0, member 0; evaluation with deterministic actions, seeds 3001–3030, at most 500 environment steps per episode. Exploration test diagnostics: 4 episodes every 10 epochs and a separate final 100, with random reset seeds (`evaluation.reset_seeds` / `final_reset_seeds: null`); whether to pin them is an open decision.
 
 Return convention: sum the requested task’s reward over environment steps; each step already sums action-repeat substeps. Do not divide by action repeat or silently normalize returns.
 
@@ -196,7 +197,7 @@ outputs/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<N>/
 - Preserve periodic diagnostics and one final diagnostic after exploration training. Evaluation must restore RNG and each submodule’s own mode and must not update frozen reward scaling.
 - W&B debug metrics are off by default. Current Walker schemas: exploration actor_critic 43 keys (148 with debug), downstream actor_critic 39 (132 with debug), downstream reward_model 4 (8 with debug), plus configured evaluation returns. Different action dimensions change per-dimension counts.
 - Training curves use component update counters. Downstream evaluation’s x-axis is the milestone’s exploration training steps. Preserve existing W&B identities on resume/evaluate-only.
-- Base W&B mode is disabled, but the Walker experiment presets enable online logging. Explicitly select disabled/offline for authorized smokes when no sync is requested.
+- W&B is disabled unless a launcher enables it (the presets set no W&B values). Explicitly select disabled/offline for authorized smokes when no sync is requested.
 - `python src/downstream_analysis.py downstream.mode=collect` and `compare` perform CPU-only analysis. They do not train, collect data or evaluate policies. Each entry point rejects the other's modes. The analysis module must not import `downstream_trainer`, `exploration_trainer` or `envs`: with `MUJOCO_GL=egl`, importing dm_control opens the GPU devices. Definitions it shares with training live in `data/milestone.py`.
 - Recompute result aggregates from episode returns. Threshold fractions use strict `return > 200/400/500/600`. Preserve individual evaluation returns and source paths.
 - Reject incompatible effective training/environment/return settings and ambiguous reports. Old result fingerprints require recollection. Do not silently combine protocols or select among multiple policies under one protocol.

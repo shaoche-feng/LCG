@@ -1,3 +1,6 @@
+# Shared exploration settings: the selected 100k schedule for every method. Method choices are in
+# config/experiment/<method>_100k.yaml, scoring settings in config/intrinsic_reward/; launch scripts set the
+# domain and task group (env.train.domain_name / task_names), seed, device, output folder and W&B identity.
 defaults:
   - _self_
   - env: dm_control
@@ -49,18 +52,23 @@ checkpointing:
   save_agent_every: 5
   num_to_keep: 11  # number of checkpoints to keep, use null to disable
 
-# Downstream milestones (milestones/steps_NNNNNN/), published at epoch boundaries. Selected
-# setting: ten milestones per 100k run, at 10k, 20k, ..., 100k replay steps (the 5,000 initial
-# steps included), all on epoch boundaries of the 100k presets' schedule, all kept.
+# Downstream milestones (milestones/steps_NNNNNN/), published at epoch boundaries. Selected setting:
+# 20 milestones per 100k run, all kept: 5,500 (epoch 1) and every 5,000 replay steps from 10,000 (epoch 10)
+# to 100,000 (epoch 190), the 5,000 initial steps included; each is an epoch boundary of the schedule
+# below. Downstream adapts ten of them (config/experiment/downstream_10_milestones.yaml).
 milestones:
-  at_steps: []  # publish at the first epoch boundary reaching each real-step count
-  every_steps: 10000  # also publish every N real steps (null: off)
+  at_steps: [5500, 10000, 15000, 20000, 25000,
+             30000, 35000, 40000, 45000, 50000,
+             55000, 60000, 65000, 70000, 75000,
+             80000, 85000, 90000, 95000, 100000]  # publish at the first epoch boundary reaching each count
+  every_steps: null  # also publish every N real steps (null: off)
   keep_last: null  # keep only the newest N milestones (null: keep all)
 
 collection:
   train:
     num_envs: 1
     epsilon: 0.01
+    # 100,000 training env steps: 5,000 initial uniform steps, then 190 collection epochs of 500.
     num_steps_total: 100000
     first_epoch:
       min: 5000  # Initial collection budget for continuous rewards.
@@ -68,15 +76,15 @@ collection:
     # After the initial budget: policy = learned exploration (needs intrinsic_reward.enabled),
     # uniform = uniform-random baseline (no policy updates; intrinsic_reward.enabled=false).
     mode: policy
-    steps_per_epoch: 100
+    steps_per_epoch: 500
     # Store each frame's MuJoCo qpos/qvel in the training episodes (Episode.physical_state), for
     # coverage analysis only: never read by training, scoring or downstream adaptation.
     record_physical_state: true
   test:
     num_envs: 1
-    num_episodes: 4
+    num_episodes: 4  # per periodic diagnostic (evaluation.every)
     epsilon: 0.0
-    num_final_episodes: 100
+    num_final_episodes: 4  # the separate final diagnostic
     record_physical_state: false  # test (evaluation) episodes
 
 static_dataset:
@@ -101,8 +109,8 @@ evaluation:
   # Fixed env reset seeds, one test episode per seed (null: a random seed per collection, the
   # earlier behaviour). reset_seeds needs collection.test.num_episodes equal to its length,
   # final_reset_seeds likewise num_final_episodes; both need collection.test.num_envs=1.
-  reset_seeds: null
-  final_reset_seeds: null
+  reset_seeds: [3001, 3002, 3003, 3004]
+  final_reset_seeds: [3001, 3002, 3003, 3004]
   # Score the test episodes with the current frozen intrinsic scorer (learned methods; results in
   # evaluation/*.json and W&B). Intrinsic returns are in method-specific units.
   intrinsic: True
