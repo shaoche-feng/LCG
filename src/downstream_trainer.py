@@ -13,7 +13,9 @@ import json
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import secrets
 import shutil
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from dm_control import suite
@@ -29,7 +31,8 @@ from coroutines.frame_history import FrameHistory
 from data import BatchSampler, collate_segments_without_rewards
 from data.milestone import (RETURN_CONVENTION, SUMMARY_FILE, check_evaluation_config, deterministic_policy_description,
                             downstream_output_dir, downstream_summary, evaluation_path, exploration_identity, load_milestone,
-                            method_label, milestone_members, state_sha256, write_json)
+                            method_label, milestone_members, protocol_id, read_json, shared_run_path, state_sha256,
+                            write_json)
 from data.utils import make_task_reward_collate
 from utils import physical_gpu_index
 from envs import DMControlEnv, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
@@ -46,14 +49,31 @@ DOWNSTREAM_RESUME_FORMAT = 3
 RESUME_MAY_CHANGE = ("downstream.mode", "initialization.milestone_path", "wandb", "rew_end_model.debug_metrics",
                      "agent.actor_critic.debug_metrics")
 
-# W&B (wandb.mode: disabled | offline | online). One run per milestone x task x adaptation seed x denoiser
-# member. Rows: one per update (reward model, then PMPO) and one per evaluation; the W&B step of an update
-# is its index in the whole training (reward-model updates first), so a resume knows which rows the
-# checkpoint committed. Every update row is derived from its metrics.jsonl row (wandb_row), which is
-# therefore also the history a resume backfills from.
-REWARD_AXIS = "reward_model/train/core/num_updates"
+# W&B (wandb.mode: disabled | offline | online). One run per exploration run x task x adaptation seed x denoiser
+# member, shared by every milestone adapted for them (shared_run_path: its identity and publication state as
+# JSON). Each milestone's process attaches to it in turn; the folder launcher only prepares the record. Every
+# adaptation stays independent (fresh models, own outputs and metrics.jsonl); in the shared history each
+# milestone has its own block of W&B steps (register_milestone): one row per update (reward model, then PMPO),
+# then its after-training evaluation. The W&B step of an update is its block's first step plus its index in
+# that training, so a resume knows which rows the checkpoint committed. Every update row is derived from its
+# metrics.jsonl row (wandb_row), which is therefore also the history a resume backfills from. Update rows of one
+# process reach the server in order, so for an update a step below the server's next step is on the server.
+# Evaluation points are confirmed only by the server's history (reconcile_evaluations), never by a local logged
+# state or by later server rows.
+REWARD_AXIS = "reward_model/train/core/num_updates"  # this adaptation's own counters (restart at every milestone)
 POLICY_AXIS = "actor_critic/train/core/num_batch_train_actor_critic"
-EVAL_AXIS = "exploration/train_env_steps"  # the milestone's recorded collected_steps (fixed per run)
+# Training charts: updates counted across the run's milestones (each milestone trains fresh models).
+REWARD_CUMULATIVE_AXIS = "reward_model/train/core/cumulative_updates"
+POLICY_CUMULATIVE_AXIS = "actor_critic/train/core/cumulative_updates"
+EVAL_AXIS = "exploration/train_env_steps"  # the milestone's recorded collected_steps; also identifies training rows
+# Evaluation points: the run's primary protocol (seeds, step limit; recorded in the shared run's record) under
+# eval/, any other protocol under eval_protocols/protocol-<id>/, so incompatible protocols never share a curve.
+PRIMARY_EVAL = "eval"
+OTHER_EVAL = "eval_protocols"
+SHARED_RUN_SCHEMA = 1
+HISTORY_ATTEMPTS = 3
+HISTORY_RETRY_SECONDS = 0.2
+_publication_run, _publication_next = None, 0
 # Reward-model keys below reward_model/train/: W&B name -> metrics.jsonl name. Debug keys only with
 # rew_end_model.debug_metrics (rows that recorded prediction_mae).
 REWARD_CORE = dict(loss_reward="loss_rew", predicted_reward_mean="predicted_reward_mean",
@@ -158,6 +178,10 @@ class DownstreamTrainer:
         self._wandb_next = 0  # the next W&B step to log (rows below it are on the W&B server)
         self._replayed = None  # resume: updates the server already holds from the interrupted segment
         self._resume_event = {}  # resume: what the W&B reconciliation found (summary "resume")
+        # The shared run (dict(path, record)) and this milestone's block of W&B steps in it; a work folder from
+        # before shared runs resumes its own run with the block at step 0 (no record).
+        self._shared, self._block = None, None
+        self._blocked = False  # the run holds later steps than this block: its remaining rows cannot be logged
         rng = None
         if resume:
             rng = self.load_checkpoint()
@@ -175,6 +199,8 @@ class DownstreamTrainer:
             finish_wandb("failed", error)
             raise
         finish_wandb("completed")
+        if self._shared is not None:  # finished (uploaded): confirm what the server holds; nothing is logged
+            reconcile_evaluations(self._shared, 0, self.cfg.wandb.mode == "offline", recover=False)
         return output_dir
 
     def _run(self) -> Path:
@@ -186,14 +212,27 @@ class DownstreamTrainer:
         output_dir = self.save()
         if wandb.run is not None:
             wandb.summary["output"] = str(output_dir.resolve())
+            if self._shared is not None:
+                wandb.summary[f"milestones/{self.milestone.path.name}"] = dict(
+                    self.milestone_summary(), status="trained", output=str(output_dir.resolve()))
         try:
             if self.cfg.evaluation.after_training:
+                if self._shared is not None:
+                    target = evaluation_path(output_dir, self.milestone.task_name, self.cfg.evaluation.seeds,
+                                             self.cfg.evaluation.max_steps, self.agent.actor_critic.state_dict())
+                    prepare_evaluation(self._shared, target,
+                                       dict(seeds=list(self.cfg.evaluation.seeds), max_steps=self.cfg.evaluation.max_steps),
+                                       "after_training", self._block["evaluation_step"])
                 result = evaluate_policy(self.agent.actor_critic, self.cfg.env.train, self.milestone.task_name,
                                          self.cfg.evaluation.seeds, self.cfg.evaluation.max_steps)
-                path = save_evaluation(output_dir, result, self.agent.actor_critic.state_dict())
+                path = save_evaluation(output_dir, result, self.agent.actor_critic.state_dict(), "after_training")
                 report_evaluation(result, path)
-                log_evaluation(result, path, self.milestone.manifest["collected_steps"], "after_training",
-                               self.total_updates(), self._wandb_next)
+                steps = self.milestone.manifest["collected_steps"]
+                if self._shared is not None:  # its reserved step, unless the run already holds later steps
+                    publish_evaluation(self._shared, path, result, steps, "after_training",
+                                       None if self._blocked else self._block["evaluation_step"])
+                else:
+                    log_evaluation(result, path, steps, "after_training", self.total_updates(), self._wandb_next)
         finally:  # also when the evaluation fails: the published outputs stay
             say(f"Downstream outputs saved: > {output_dir.resolve()}")
         return output_dir
@@ -273,23 +312,29 @@ class DownstreamTrainer:
         return self.cfg.rew_end_model.training.steps + self.cfg.actor_critic.training.steps
 
     def wandb_step(self, phase: str, update: int) -> int:
-        """The W&B step of an update: its index in the whole training, reward-model updates first."""
-        return update - 1 + (self.cfg.rew_end_model.training.steps if phase == "actor_critic" else 0)
+        """The W&B step of an update: its block's first step plus its index in this training, reward-model
+        updates first."""
+        first = self._block["first_step"] if self._block else 0
+        return first + update - 1 + (self.cfg.rew_end_model.training.steps if phase == "actor_critic" else 0)
 
     def publish(self, row: Dict[str, Any]) -> None:
-        if wandb.run is None:
+        if wandb.run is None or self._blocked:
             return
         step = self.wandb_step(row["phase"], row["update"])
         if step < self._wandb_next:  # replayed after a resume; the server holds this update already
             self.check_replayed(step, row)
             return
-        wandb.log(wandb_row(row, self.cfg.agent.actor_critic.actor_distribution), step=step)
+        if step < server_next_step():
+            self._blocked = True
+            say("W&B warning: later publications closed this milestone's block; remaining updates stay in metrics.jsonl only")
+            return
+        log_wandb(wandb_row(row, self.cfg.agent.actor_critic.actor_distribution, self._block), step)
         self._wandb_next = step + 1
 
     def check_replayed(self, step: int, row: Dict[str, Any]) -> None:
         """A replayed update is not logged again; its values are compared with the local record of
         the interrupted segment (what was sent to the server)."""
-        earlier = self._replayed.pop(step, None)
+        earlier = (self._replayed or {}).pop(step, None)
         outcome = "unverified" if earlier is None else "matched" if earlier == row else "mismatched"
         key = f"replayed_{outcome}"
         self._resume_event[key] = self._resume_event.get(key, 0) + 1
@@ -299,37 +344,79 @@ class DownstreamTrainer:
                 f"value the interrupted segment sent; the server keeps the earlier value")
 
     def start_wandb(self, resume: bool) -> None:
-        """One W&B run per output (milestone x task x adaptation seed x member); its identity is kept
-        in the work folder's wandb_run.json (published with the output), so a resume continues the
-        same run and evaluate-only can add to it. Nothing with wandb.mode=disabled."""
+        """Attach to the run shared by this exploration run, task, adaptation seed and member (its record,
+        shared_run_path, is created if absent), reconcile the recorded evaluations with the server's history
+        (reconcile_evaluations: missing ones are logged again), and take this milestone's block of steps (a
+        resume keeps its block). The work folder's
+        wandb_run.json (published with the output) names the run and its record. A work folder from before
+        shared runs resumes its own run. Nothing with wandb.mode=disabled."""
         mode = OmegaConf.select(self.cfg, "wandb.mode", default="disabled")
         if mode == "disabled":
             return
+        m = self.milestone
         path_identity = self._work_dir / "wandb_run.json"
         identity = json.loads(path_identity.read_text()) if resume and path_identity.is_file() else None
-        name, group = run_names(self.cfg, self.milestone.path, self.milestone.member_index,
-                                milestone_members(self.milestone.manifest), self.milestone.manifest)
-        init_wandb(self.cfg, identity, name, group, "adaptation", self._device,
-                   config=dict(OmegaConf.to_container(self.cfg), provenance=self.provenance()))
-        path_identity.write_text(json.dumps(run_identity(), indent=2))
+        config = dict(OmegaConf.to_container(self.cfg), provenance=self.provenance())
+        if identity is not None and "shared_run" not in identity:  # its own run, from before shared runs
+            name, group = run_names(self.cfg, m.path, m.member_index, milestone_members(m.manifest), m.manifest)
+            init_wandb(self.cfg, identity, name, group, "adaptation", self._device, config=config)
+            path_identity.write_text(json.dumps(run_identity(), indent=2))
+            define_axes()
+            self.reconcile_wandb(identity)
+            begin_status("adaptation")
+            return
+        path = shared_run_path(m.path, m.task_name, self.cfg.downstream.seed, m.member_index)
+        name, group = run_names(self.cfg, m.path, m.member_index, milestone_members(m.manifest), m.manifest)
+        record = open_shared_run(self.cfg, path, name, group)
+        registered = m.path.name in record["milestones"]
+        config["initialization"].pop("milestone_path", None)  # per milestone: in the summary (milestones/<name>)
+        config["provenance"] = {k: v for k, v in config["provenance"].items() if k not in ("milestone", "denoiser_member")}
+        init_wandb(self.cfg, record["identity"], name, group, "adaptation", self._device, config=config)
+        self._shared = dict(path=path, record=record)
+        save_shared_identity(self._shared)
         define_axes()
+        server = server_next_step()
+        reconcile_evaluations(self._shared, server, wandb_offline(self.cfg))
+        self._block = register_milestone(self._shared, m, self.cfg.rew_end_model.training.steps,
+                                         self.cfg.actor_critic.training.steps, fresh=not (resume and registered),
+                                         server=server)
+        path_identity.write_text(json.dumps(dict(run_identity(), shared_run=Path(
+            os.path.relpath(path, self._work_dir)).as_posix()), indent=2))
+        wandb.summary[f"milestones/{m.path.name}"] = dict(self.milestone_summary(), status="training")
         if resume:
-            self.reconcile_wandb(identity)  # reads the interrupted segment's status first
+            self.reconcile_wandb(identity if registered else None)
+        else:
+            self._wandb_next = self._block["first_step"]  # a new block starts at or after the server's next step
         begin_status("adaptation")
+
+    def milestone_summary(self) -> Dict[str, Any]:
+        """This milestone in the shared run's summary: what it is and where its rows and evaluation are."""
+        m, b = self.milestone, self._block
+        return dict(train_env_steps=m.manifest["collected_steps"], identity=m.manifest["identity"],
+                    path=str(m.path.resolve()), member_index=m.member_index, member_sha256=self.member_sha256,
+                    attempt=b["attempt"], first_step=b["first_step"], evaluation_step=b["evaluation_step"],
+                    reward_offset=b["reward_offset"], policy_offset=b["policy_offset"])
 
     def reconcile_wandb(self, identity: Optional[Dict[str, Any]]) -> None:
         """On resume. The checkpoint committed one W&B row per completed update. Committed rows the
         server lacks (lost with a crash) are backfilled from metrics.jsonl; updates the server holds
         beyond the checkpoint (logged before the crash, now replayed) are not logged twice. An offline
-        segment of an existing run cannot know the server's rows: nothing is backfilled."""
-        committed = sum(self.num_updates.values())
+        segment of an existing run cannot know the server's rows: nothing is backfilled. When the shared run
+        already holds steps after this milestone's block (logged by another process since the crash), its
+        remaining rows cannot be logged (W&B steps only increase); they stay in metrics.jsonl."""
+        first = self._block["first_step"] if self._block else 0
+        end = first + self.total_updates()
+        committed_rows = sum(self.num_updates.values())
+        committed = first + committed_rows
         rows = metrics_rows(self._work_dir / "metrics.jsonl")
         event = dict(count=sum(1 for r in rows if r.get("phase") == "resume"), from_phase=self.phase,
-                     from_updates=dict(self.num_updates), committed_rows=committed,
+                     from_updates=dict(self.num_updates), committed_rows=committed_rows,
                      previous_status=(wandb.summary.get("status") or NOT_RECORDED) if identity else "no earlier W&B run",
                      mode=self.cfg.wandb.mode)
+        if self._block is not None:
+            event["block_first_step"] = first
         offline = bool(getattr(wandb.run, "offline", False))
-        server = int(getattr(wandb.run, "starting_step", 0) or 0)
+        server = server_next_step()
         by_step = {}
         for r in rows:  # the last record of each update (a replayed update repeats an earlier one)
             if r.get("phase") in ("rew_end_model", "actor_critic"):
@@ -337,16 +424,23 @@ class DownstreamTrainer:
         if offline and identity is not None:
             event["note"] = "offline segment: the server's rows are unknown; nothing backfilled"
             self._wandb_next = committed
-        else:
+        elif server > end and server > committed:  # later rows of the run: none of this block can follow them
             event["server_rows"] = server
-            if server < committed:
-                missing = [s for s in range(server, committed) if s not in by_step]
+            event["note"] = "the shared run holds later steps; this milestone's remaining updates are not logged"
+            self._blocked = True
+            say("W&B warning: the shared run already holds later steps; this milestone's remaining updates stay in "
+                "metrics.jsonl only")
+        else:
+            event["server_rows"] = server - first if self._block is not None else server
+            start = max(server, first)
+            if start < committed:
+                missing = [s for s in range(start, committed) if s not in by_step]
                 if missing:
                     raise RuntimeError(f"metrics.jsonl lacks committed updates (W&B steps {missing[:5]}...); cannot backfill")
-                for step in range(server, committed):
-                    wandb.log(wandb_row(by_step[step], self.cfg.agent.actor_critic.actor_distribution), step=step)
-                event["backfilled_rows"] = committed - server
-                say(f"W&B: backfilled {committed - server} committed updates the server did not receive")
+                for step in range(start, committed):
+                    log_wandb(wandb_row(by_step[step], self.cfg.agent.actor_critic.actor_distribution, self._block), step)
+                event["backfilled_rows"] = committed - start
+                say(f"W&B: backfilled {committed - start} committed updates the server did not receive")
             elif server > committed:
                 event["server_rows_beyond_checkpoint"] = server - committed
                 self._replayed = {s: by_step.get(s) for s in range(committed, server)}
@@ -476,25 +570,45 @@ class DownstreamTrainer:
         return state["rng"]
 
 
-def wandb_row(row: Dict[str, Any], actor_distribution: str) -> Dict[str, float]:
+def wandb_row(row: Dict[str, Any], actor_distribution: str, block: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
     """The W&B row of one metrics.jsonl update row: reward_model/train/{core,debug}/ or the accepted
-    actor_critic/train/<group>/ paths (metric_path), with the update axis."""
+    actor_critic/train/<group>/ paths (metric_path), with this adaptation's own update counter and the
+    cumulative one of the shared run (the block's offset plus the update), and the milestone's training env
+    steps identifying the milestone. Without a block (a run of its own), the offsets are 0."""
+    reward_offset, policy_offset = (block["reward_offset"], block["policy_offset"]) if block else (0, 0)
     if row["phase"] == "rew_end_model":
         out = {f"reward_model/train/core/{k}": row[v] for k, v in REWARD_CORE.items() if v in row}
         if "prediction_mae" in row:  # recorded with rew_end_model.debug_metrics
             out.update({f"reward_model/train/debug/{k}": row[v] for k, v in REWARD_DEBUG.items() if v in row})
         out[REWARD_AXIS] = row["update"]
-        return out
-    out = {f"actor_critic/train/{metric_path(k, actor_distribution)}": v for k, v in row.items()
-           if k not in ("phase", "update") and not k.startswith(UNPUBLISHED_POLICY_PREFIXES)}
-    out[POLICY_AXIS] = row["update"]
+        out[REWARD_CUMULATIVE_AXIS] = reward_offset + row["update"]
+    else:
+        out = {f"actor_critic/train/{metric_path(k, actor_distribution)}": v for k, v in row.items()
+               if k not in ("phase", "update") and not k.startswith(UNPUBLISHED_POLICY_PREFIXES)}
+        out[POLICY_AXIS] = row["update"]
+        out[POLICY_CUMULATIVE_AXIS] = policy_offset + row["update"]
+    if block:
+        out[EVAL_AXIS] = block["collected_steps"]
     return out
 
 
-def evaluation_row(result: Dict[str, Any], collected_steps: Optional[int]) -> Dict[str, float]:
-    """eval/seed_<s>/return per configured seed and the saved aggregates, at the milestone's data budget."""
-    row = {f"eval/seed_{e['seed']}/return": e["episode_return"] for e in result["episodes"]}
-    row.update({f"eval/return_{k}": result[f"return_{k}"] for k in ("max", "median", "mean", "min", "std")})
+def protocol_label(path: Path) -> str:
+    """protocol-<id>: the evaluation protocol (seeds and step limit) of an evaluation file, from its name."""
+    return "protocol-" + Path(path).stem.rsplit("_protocol-", 1)[1]
+
+
+def evaluation_namespace(path: Path, primary: Optional[str]) -> str:
+    """eval for the run's primary evaluation protocol (its id; None: none recorded yet), else
+    eval_protocols/protocol-<id>: another protocol never joins the primary curves."""
+    return PRIMARY_EVAL if primary is not None and protocol_label(path) == f"protocol-{primary}" else \
+        f"{OTHER_EVAL}/{protocol_label(path)}"
+
+
+def evaluation_row(result: Dict[str, Any], collected_steps: Optional[int], namespace: str) -> Dict[str, float]:
+    """<namespace>/seed_<s>/return per configured seed and the saved aggregates, at the milestone's data budget
+    (namespace: evaluation_namespace)."""
+    row = {f"{namespace}/seed_{e['seed']}/return": e["episode_return"] for e in result["episodes"]}
+    row.update({f"{namespace}/return_{k}": result[f"return_{k}"] for k in ("max", "median", "mean", "min", "std")})
     if collected_steps is not None:
         row[EVAL_AXIS] = collected_steps
     return row
@@ -507,14 +621,14 @@ def metrics_rows(path: Path) -> List[Dict[str, Any]]:
 
 def run_names(cfg: DictConfig, milestone_path: Path, member: int, members: Optional[int],
               manifest: Optional[Dict[str, Any]] = None, domain: Optional[str] = None) -> Tuple[str, str]:
-    """W&B name <prefix>-<milestone>-<task>-adaptation-seed<s>[-member<k>] and group
-    <prefix>-<task>-adaptation-seed<s>[-member<k>]: the milestones of one exploration run, task, adaptation seed and
-    member share the group. prefix: wandb.name, else <method>-<domain>-exploration-seed<N> (exploration_label).
-    wandb.group replaces the group."""
-    prefix = OmegaConf.select(cfg, "wandb.name") or exploration_label(Path(milestone_path).parent.parent, manifest, domain)
-    suffix = f"-{cfg.downstream.task_name}-adaptation-seed{cfg.downstream.seed}" + (
-        f"-member{member}" if member or (members or 1) > 1 else "")
-    return f"{prefix}-{Path(milestone_path).name}{suffix}", OmegaConf.select(cfg, "wandb.group") or f"{prefix}{suffix}"
+    """W&B name and group of the run shared by the milestones of one exploration run, task, adaptation seed and
+    member: wandb.name and wandb.group exactly as given; else <method>-<domain>-exploration-seed<N>
+    (exploration_label)-<task>-adaptation-seed<s>[-member<k>], and the group the name."""
+    default = exploration_label(Path(milestone_path).parent.parent, manifest, domain) + \
+        f"-{cfg.downstream.task_name}-adaptation-seed{cfg.downstream.seed}" + \
+        (f"-member{member}" if member or (members or 1) > 1 else "")
+    name = OmegaConf.select(cfg, "wandb.name") or default
+    return name, OmegaConf.select(cfg, "wandb.group") or name
 
 
 def exploration_label(run_dir: Path, manifest: Optional[Dict[str, Any]] = None, domain: Optional[str] = None) -> str:
@@ -555,12 +669,15 @@ def run_identity() -> Dict[str, Any]:
 
 
 def define_axes() -> None:
-    wandb.define_metric(REWARD_AXIS, hidden=True)
-    wandb.define_metric("reward_model/train/*", step_metric=REWARD_AXIS)
-    wandb.define_metric(POLICY_AXIS)
-    wandb.define_metric("actor_critic/train/*", step_metric=POLICY_AXIS)
+    """Training metrics against the cumulative update axes (the own counters, which restart at every milestone,
+    are plotted too); evaluations against the milestone's training env steps."""
+    wandb.define_metric(REWARD_CUMULATIVE_AXIS, hidden=True)
+    wandb.define_metric("reward_model/train/*", step_metric=REWARD_CUMULATIVE_AXIS)
+    wandb.define_metric(POLICY_CUMULATIVE_AXIS, hidden=True)
+    wandb.define_metric("actor_critic/train/*", step_metric=POLICY_CUMULATIVE_AXIS)
     wandb.define_metric(EVAL_AXIS, hidden=True)
-    wandb.define_metric("eval/*", step_metric=EVAL_AXIS)
+    wandb.define_metric(f"{PRIMARY_EVAL}/*", step_metric=EVAL_AXIS)
+    wandb.define_metric(f"{OTHER_EVAL}/*", step_metric=EVAL_AXIS)
 
 
 def begin_status(activity: str) -> None:
@@ -591,17 +708,361 @@ def finish_wandb(status: str, error: Optional[BaseException] = None) -> None:
 
 def log_evaluation(result: Dict[str, Any], path: Path, collected_steps: Optional[int], kind: str,
                    total_updates: int, next_step: int) -> None:
-    """One W&B row per evaluation file: after training at step total_updates, later evaluate-only
-    ones after it (one step per earlier evaluation file of the output). The summary records what each
-    evaluation was (after_training or evaluate_only) and its file."""
+    """A run of one output (from before shared runs, or a standalone evaluate-only run): one W&B row per
+    evaluation file, after training at step total_updates, later evaluate-only ones after it (one step per
+    earlier evaluation file of the output)."""
     if wandb.run is None:
         return
-    earlier = sum(1 for p in Path(path).parent.glob("eval_*.json") if p != Path(path))
-    step = max(next_step, int(getattr(wandb.run, "starting_step", 0) or 0), total_updates + earlier)
-    wandb.log(evaluation_row(result, collected_steps), step=step)
+    files = sorted(Path(path).parent.glob("eval_*.json"), key=lambda p: (p.stat().st_mtime_ns, p.name))
+    earlier = sum(1 for p in files if p != Path(path))
+    step = max(next_step, server_next_step(), total_updates + earlier)
+    primary = protocol_label(files[0])[len("protocol-"):]  # the output's first evaluation: its primary protocol
+    namespace = evaluation_namespace(path, primary)
+    log_wandb(evaluation_row(result, collected_steps, namespace), step)
+    summarize_evaluation(path, result, collected_steps, kind, step, namespace)
+
+
+def summarize_evaluation(path: Path, result: Dict[str, Any], collected_steps: Optional[int], kind: str, step: int,
+                         namespace: str) -> None:
+    """The summary records what each evaluation was (after_training, evaluate_only, recovered), its file, step
+    and metric namespace, and the seeds and step limit of its protocol."""
+    protocol = protocol_label(path)
     wandb.summary[f"evaluations/{Path(path).stem}"] = dict(
-        kind=kind, step=step, file=str(Path(path).resolve()), seeds=result["seeds"], max_steps=result["max_steps"],
+        kind=kind, step=step, file=str(Path(path).resolve()), protocol=protocol, namespace=namespace,
+        seeds=result["seeds"], max_steps=result["max_steps"],
         train_env_steps=collected_steps if collected_steps is not None else NOT_RECORDED)
+    wandb.summary[f"evaluation_protocols/{protocol}"] = dict(seeds=result["seeds"], max_steps=result["max_steps"],
+                                                             namespace=namespace)
+
+
+# ---------------------------------------------------------------------- the shared W&B run
+
+def wandb_offline(cfg: DictConfig) -> bool:
+    """Whether the current run cannot know the server's state (offline mode)."""
+    return cfg.wandb.mode == "offline" or bool(getattr(wandb.run, "offline", False))
+
+
+def server_next_step() -> int:
+    """The live append floor, including this attachment's publications (not proof of server receipt)."""
+    run = wandb.run
+    sdk_step = getattr(run, "step", 0)
+    return max(int(getattr(run, "starting_step", 0) or 0),
+               int(sdk_step) if isinstance(sdk_step, int) else 0,
+               _publication_next if run is _publication_run else 0)
+
+
+def log_wandb(row: Dict[str, Any], step: int) -> None:
+    """Track attempted appends too: an exception may occur after W&B queued the row."""
+    global _publication_run, _publication_next
+    floor = server_next_step()
+    if step < floor:
+        raise RuntimeError(f"W&B step {step} is below the live append watermark {floor}")
+    _publication_run, _publication_next = wandb.run, max(floor, step + 1)
+    wandb.log(row, step=step)
+
+
+def open_shared_run(cfg: DictConfig, path: Path, name: str, group: str) -> Dict[str, Any]:
+    """The record of the shared run (path: shared_run_path), created without starting W&B if absent: its
+    identity (a new random id, project, entity, name, group), the next free step, the registered milestones
+    and the evaluations with their steps and publication state (evaluation_status). Explicitly set wandb.project/name/group must be the recorded ones: a run
+    is never silently renamed or split."""
+    w = cfg.wandb
+    path = Path(path)
+    if path.is_file():
+        record = read_json(path, "shared W&B run record")
+        if record.get("schema") != SHARED_RUN_SCHEMA:
+            raise ValueError(f"{path} is not a shared W&B run record (schema {SHARED_RUN_SCHEMA})")
+        identity = record["identity"]
+        differ = [f"wandb.{key}={value!r} (recorded: {identity.get(key)!r})"
+                  for key, value in (("project", w.project), ("name", w.name), ("group", w.group))
+                  if value is not None and value != identity.get(key)]
+        if differ:
+            raise ValueError(f"{path} records the W&B run {identity['name']!r} ({identity['id']}) shared by this "
+                             f"exploration run, task, adaptation seed and member; this command sets {'; '.join(differ)}. "
+                             "Use the recorded settings, or move the record aside to start a new run.")
+        shared = dict(path=path, record=record)
+        migrate_evaluations(shared)
+        return record
+    record = dict(schema=SHARED_RUN_SCHEMA,
+                  identity=dict(id=secrets.token_hex(4), project=w.project, entity=w.entity, name=name, group=group,
+                                url=None),
+                  selection=dict(task=cfg.downstream.task_name, adaptation_seed=cfg.downstream.seed,
+                                 member_index=OmegaConf.select(cfg, "initialization.member_index", default=0)),
+                  primary_protocol=configured_protocol(cfg) if cfg.evaluation.after_training else None,
+                  next_step=0, cumulative_updates=dict(reward_model=0, actor_critic=0), milestones={}, evaluations={})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, record)
+    return record
+
+
+def save_shared_identity(shared: Dict[str, Any]) -> None:
+    """After wandb.init: the run's identity as W&B reports it (URL, entity) into the record."""
+    shared["record"]["identity"].update(run_identity())
+    write_json(shared["path"], shared["record"])
+
+
+def register_milestone(shared: Dict[str, Any], milestone: Any, reward_updates: int, policy_updates: int,
+                       fresh: bool, server: int) -> Dict[str, Any]:
+    """This milestone's block of W&B steps in the shared run, recorded before anything is logged: its training
+    rows (reward model, then PMPO) from first_step and its after-training evaluation at evaluation_step, after
+    every step recorded or on the server; and its cumulative update offsets. A resume keeps its block; a new
+    training of a milestone registered before (an abandoned attempt) gets a new block (attempt + 1)."""
+    record, name = shared["record"], milestone.path.name
+    entry = record["milestones"].get(name)
+    if entry is not None and not fresh:
+        if (entry["reward_updates"], entry["policy_updates"]) != (reward_updates, policy_updates) or \
+                entry["identity"] != milestone.manifest["identity"]:
+            raise ValueError(f"{shared['path']}: {name} was registered with another milestone or update budget")
+        return entry
+    first = max(record["next_step"], server)
+    totals = record["cumulative_updates"]
+    entry = dict(collected_steps=milestone.manifest["collected_steps"], identity=milestone.manifest["identity"],
+                 attempt=(entry or {}).get("attempt", 0) + 1, first_step=first, reward_updates=reward_updates,
+                 policy_updates=policy_updates, evaluation_step=first + reward_updates + policy_updates,
+                 reward_offset=totals["reward_model"], policy_offset=totals["actor_critic"])
+    record["milestones"][name] = entry
+    record["next_step"] = entry["evaluation_step"] + 1
+    totals["reward_model"] += reward_updates
+    totals["actor_critic"] += policy_updates
+    write_json(shared["path"], record)
+    return entry
+
+
+def evaluation_status(entry: Dict[str, Any]) -> str:
+    """assigned (step recorded, maybe never logged), logged (wandb.log returned: queued, not proof that it reached
+    the server) or confirmed (found in the server's history). Records written before these states had published:
+    true meant logged."""
+    if "status" in entry:
+        return entry["status"]
+    return "logged" if entry.get("published") else "assigned"
+
+
+def report_protocol(path: Path, result: Dict[str, Any]) -> Dict[str, Any]:
+    check_evaluation_config(OmegaConf.create(dict(seeds=result["seeds"], max_steps=result["max_steps"])))
+    protocol = dict(id=protocol_id(result["seeds"], result["max_steps"]),
+                    seeds=[int(s) for s in result["seeds"]], max_steps=int(result["max_steps"]))
+    if protocol_label(path) != "protocol-" + protocol["id"] or result.get("protocol_id", protocol["id"]) != protocol["id"]:
+        raise ValueError(f"{path}: evaluation protocol metadata disagrees with its filename")
+    return protocol
+
+
+def evaluation_origin(path: Path, result: Dict[str, Any]) -> str:
+    """New reports carry origin. Historical unregistered files use the output's saved protocol only when it
+    unambiguously agrees with enabled after-training evaluation; otherwise their origin stays unknown."""
+    if result.get("evaluation_kind") in ("after_training", "evaluate_only"):
+        return result["evaluation_kind"]
+    saved = Path(path).parents[1] / "config.yaml"
+    if saved.is_file():
+        cfg = OmegaConf.load(saved)
+        if OmegaConf.select(cfg, "evaluation.after_training", default=False) and \
+                configured_protocol(cfg) == report_protocol(path, result):
+            return "after_training"
+    return "recovered"
+
+
+def migrate_evaluations(shared: Dict[str, Any]) -> None:
+    """Select historical primary from all recorded after-training entries, including confirmed ones.
+    Old namespaces are provisional until server history identifies the actual published namespace."""
+    record, root = shared["record"], Path(shared["path"]).parent
+    if record.get("primary_protocol") is None:
+        for key, entry in sorted(record["evaluations"].items(), key=lambda kv: (
+                kv[1].get("original_step", kv[1].get("recovered_from_step", kv[1]["step"])), kv[0])):
+            path = root / key
+            if entry["kind"] == "after_training" and path.is_file():
+                record["primary_protocol"] = report_protocol(path, read_json(path, "evaluation report"))
+                break
+    for key, entry in record["evaluations"].items():
+        if "namespace" not in entry:
+            entry["namespace"] = evaluation_namespace(root / key, (record.get("primary_protocol") or {}).get("id"))
+            entry["namespace_inferred"] = True
+    write_json(shared["path"], record)
+
+
+def prepare_evaluation(shared: Dict[str, Any], path: Path, result: Dict[str, Any], kind: str,
+                       reserved: Optional[int] = None) -> Dict[str, Any]:
+    """Durable origin, primary and namespace before evaluation/report publication or any W&B append."""
+    record = shared["record"]
+    migrate_evaluations(shared)
+    protocol = report_protocol(path, result)
+    if record.get("primary_protocol") is None and kind == "after_training":
+        record["primary_protocol"] = protocol
+    key = Path(os.path.relpath(path, Path(shared["path"]).parent)).as_posix()
+    entry = record["evaluations"].get(key)
+    if entry is None:
+        assigned = max(server_next_step(), reserved if reserved is not None else record["next_step"])
+        entry = record["evaluations"][key] = dict(
+            step=assigned, original_step=assigned,
+            kind=kind, status="assigned", attempted=False, protocol=protocol,
+            namespace=evaluation_namespace(path, (record.get("primary_protocol") or {}).get("id")))
+        record["next_step"] = max(record["next_step"], entry["step"] + 1)
+    elif not entry.get("attempted", True) and entry["kind"] != kind and not Path(path).exists():
+        # A failed evaluation produced no report. A later evaluate-only command owns its new intent,
+        # rather than inheriting the abandoned after-training label and reserved step.
+        assigned = max(record["next_step"], server_next_step())
+        entry.update(step=assigned, original_step=assigned, kind=kind)
+        record["next_step"] = assigned + 1
+    write_json(shared["path"], record)
+    return entry
+
+
+def restore_evaluation_summary(shared: Dict[str, Any], path: Path, result: Dict[str, Any],
+                               collected_steps: Optional[int], entry: Dict[str, Any]) -> None:
+    if wandb.run is not None:
+        summarize_evaluation(path, result, collected_steps, entry["kind"], entry["step"], entry["namespace"])
+        wandb.summary["evaluation_protocols/primary"] = shared["record"].get("primary_protocol") or NOT_RECORDED
+
+
+def publish_evaluation(shared: Dict[str, Any], path: Path, result: Dict[str, Any], collected_steps: Optional[int],
+                       kind: str, reserved: Optional[int] = None, step: Optional[int] = None) -> None:
+    """Only reconciliation may retry a possibly published point. A fresh or proven missing append records
+    its immutable namespace and attempt before calling W&B; returned log calls are not receipt evidence."""
+    if wandb.run is None:
+        return
+    record = shared["record"]
+    entry = prepare_evaluation(shared, path, result, kind, reserved)
+    if evaluation_status(entry) == "confirmed":
+        restore_evaluation_summary(shared, path, result, collected_steps, entry)
+        return
+    if entry.get("attempted", evaluation_status(entry) != "assigned") and step is None:
+        # Do not bypass verification by calling publication twice in the same process.
+        restore_evaluation_summary(shared, path, result, collected_steps, entry)
+        return
+    if step is not None and entry["step"] != step:
+        entry["recovered_from_step"] = entry["step"]
+        entry["step"] = step
+    elif entry["step"] < server_next_step():
+        if entry.get("attempted", True):
+            entry["status"] = "unverified"
+            entry["verification"] = "append floor passed the recorded step; receipt not established"
+            write_json(shared["path"], record)
+            say(f"W&B warning: {path.name} remains unverified; not republished")
+            return
+        entry["step"] = max(record["next_step"], server_next_step())
+    record["next_step"] = max(record["next_step"], entry["step"] + 1)
+    entry.update(status="assigned", attempted=True)
+    entry.pop("published", None)
+    write_json(shared["path"], record)
+    log_wandb(evaluation_row(result, collected_steps, entry["namespace"]), entry["step"])
+    entry["status"] = "logged"
+    entry.pop("verification", None)
+    write_json(shared["path"], record)
+    restore_evaluation_summary(shared, path, result, collected_steps, entry)
+
+
+def server_history(shared: Dict[str, Any], offline: bool, low: int, high: int) -> Tuple[Optional[Dict[int, Dict[str, Any]]], str]:
+    """The shared run's rows with steps low..high as the W&B server holds them ({step: row}), and where they came
+    from; None when they cannot be read (offline, or the server or API unavailable)."""
+    if offline:
+        return None, "offline: the server's history cannot be read"
+    identity = shared["record"]["identity"]
+    rng = rng_state()
+    try:
+        run = wandb.Api(timeout=10).run(f"{identity['entity']}/{identity['project']}/{identity['id']}")
+        rows = {int(r["_step"]): r for r in run.scan_history(min_step=low, max_step=high + 1)}
+    except Exception as error:  # noqa: BLE001 - any failure to read means: not verified
+        return None, f"unavailable ({type(error).__name__}: {error})"[:300]
+    finally:
+        set_rng_state(rng)
+    return rows, "server"
+
+
+def evaluation_matches(row: Dict[str, Any], path: Path, result: Dict[str, Any], collected_steps: Optional[int],
+                       primary: Optional[str], namespace: Optional[str] = None) -> bool:
+    """Whether a server row is this evaluation: the mean return in its protocol's namespace and the milestone's
+    training env steps."""
+    namespace = namespace or evaluation_namespace(path, primary)
+    return row.get(f"{namespace}/return_mean") == result["return_mean"] and \
+        row.get(EVAL_AXIS) == collected_steps
+
+
+def reconcile_evaluations(shared: Dict[str, Any], server: int, offline: bool, recover: bool = True) -> Dict[str, Any]:
+    """Repair metadata regardless of confirmation. Retry history reads with a bounded wait; a missing old
+    point may move only after repeated reads include the server's indexed tail. Empty/lagging/unreadable
+    history never establishes absence. Same-step retries preserve uniqueness when that step is appendable.
+    Offline points stay explicitly unverified. A finished attachment confirms only, never republishes."""
+    migrate_evaluations(shared)
+    record, root = shared["record"], Path(shared["path"]).parent
+    s = record["selection"]
+    candidates = []
+    for name, milestone in record["milestones"].items():
+        output = downstream_output_dir(root.parent / "milestones" / name, s["task"], s["adaptation_seed"], s["member_index"])
+        for path in sorted((output / "evaluations").glob("eval_*.json")):
+            result = read_json(path, "evaluation report")
+            report_protocol(path, result)
+            key = Path(os.path.relpath(path, root)).as_posix()
+            entry = record["evaluations"].get(key)
+            if entry is None:
+                entry = prepare_evaluation(shared, path, result, evaluation_origin(path, result))
+            restore_evaluation_summary(shared, path, result, milestone["collected_steps"], entry)
+            if evaluation_status(entry) != "confirmed" or entry.get("namespace_inferred"):
+                candidates.append((path, result, milestone["collected_steps"], entry))
+    counts = dict(confirmed=0, recovered=0, unverified=0)
+    if not candidates:
+        return dict(counts, history="nothing to verify")
+    attempted = [e["step"] for _, _, _, e in candidates if e.get("attempted", True)]
+    history, source, tail_reads = {}, "server", 0
+    tail = max(server - 1, server_next_step() - 1)
+    if attempted:
+        for attempt in range(HISTORY_ATTEMPTS):
+            history_read, source = server_history(shared, offline, min(attempted), max(tail, max(attempted)))
+            if history_read is None:
+                if offline:
+                    history = None
+                    break
+                if attempt + 1 < HISTORY_ATTEMPTS:
+                    time.sleep(HISTORY_RETRY_SECONDS)
+                elif not history:
+                    history = None
+                continue
+            history.update(history_read)
+            tail_reads += int(tail >= 0 and tail in history_read)
+            if all(e["step"] in history for _, _, _, e in candidates if e.get("attempted", True)):
+                break
+            if attempt + 1 < HISTORY_ATTEMPTS:
+                time.sleep(HISTORY_RETRY_SECONDS)
+    pending = []
+    for path, result, collected_steps, entry in candidates:
+        row = history.get(entry["step"]) if history is not None else None
+        namespace = entry["namespace"]
+        if row is not None and entry.get("namespace_inferred"):
+            for possible in (namespace, PRIMARY_EVAL, f"{OTHER_EVAL}/{protocol_label(path)}", f"eval/{protocol_label(path)}"):
+                if row.get(f"{possible}/return_mean") == result["return_mean"] and row.get(EVAL_AXIS) == collected_steps:
+                    namespace = entry["namespace"] = possible
+                    entry.pop("namespace_inferred", None)
+                    break
+        matched = row is not None and evaluation_matches(row, path, result, collected_steps, None, namespace)
+        if matched:
+            entry["status"] = "confirmed"
+            entry.pop("verification", None)
+            entry.pop("published", None)
+            counts["confirmed"] += 1
+        elif evaluation_status(entry) == "confirmed":
+            # A historical namespace may be unknown, but an earlier receipt confirmation remains proof.
+            # A lagging scan must never revoke it and turn this point into a retry candidate.
+            entry["verification"] = "historical publication namespace unverified"
+            counts["unverified"] += 1
+        elif recover and not entry.get("attempted", True):
+            pending.append((max(entry["step"], server_next_step()), path, result, collected_steps, entry))
+        elif recover and history is not None and (entry["step"] >= server_next_step() or
+                                                  tail_reads == HISTORY_ATTEMPTS):
+            pending.append((entry["step"] if entry["step"] >= server_next_step() else
+                            max(record["next_step"], server_next_step()), path, result, collected_steps, entry))
+        else:
+            entry["status"] = "unverified"
+            entry["verification"] = source if history is None else "receipt or indexed absence uncertain after bounded verification"
+            counts["unverified"] += 1
+        restore_evaluation_summary(shared, path, result, collected_steps, entry)
+    write_json(shared["path"], record)
+    for step, path, result, collected_steps, entry in sorted(pending, key=lambda item: item[0]):
+        publish_evaluation(shared, path, result, collected_steps, entry["kind"], step=max(step, server_next_step()))
+        say(f"W&B: logged the evaluation {path.name} (new or verified missing on the server)")
+        counts["recovered"] += 1
+    if counts["unverified"] and recover:
+        say(f"W&B warning: {counts['unverified']} evaluation(s) unverified ({source}); neither confirmed nor logged again")
+    summary = dict(counts, history=source)
+    if wandb.run is not None:
+        wandb.summary["evaluation_publication"] = summary
+    return summary
 
 
 def exploration_seed(milestone_path: Path, manifest: Dict[str, Any]) -> Any:
@@ -614,9 +1075,16 @@ def exploration_seed(milestone_path: Path, manifest: Dict[str, Any]) -> Any:
     return seed if isinstance(seed, int) else NOT_RECORDED + " (common.seed was null: drawn at random)"
 
 
+def configured_protocol(cfg: DictConfig) -> Dict[str, Any]:
+    """The configured evaluation protocol: its identifier (as in evaluation file names), seeds and step limit."""
+    e = cfg.evaluation
+    return dict(id=protocol_id(e.seeds, e.max_steps), seeds=[int(s) for s in e.seeds], max_steps=int(e.max_steps))
+
+
 def evaluation_protocol(c: DictConfig) -> Dict[str, Any]:
-    return dict(seeds=list(c.seeds), max_steps=int(c.max_steps), after_training=bool(c.get("after_training", True)),
-                policy="deterministic (mean action)", return_convention=RETURN_CONVENTION)
+    return dict(protocol=protocol_id(c.seeds, c.max_steps), seeds=list(c.seeds), max_steps=int(c.max_steps),
+                after_training=bool(c.get("after_training", True)), policy="deterministic (mean action)",
+                return_convention=RETURN_CONVENTION)
 
 
 def recover_metrics_log(path: Path, committed_bytes: Optional[int] = None,
@@ -766,14 +1234,16 @@ def frame_tensor(image: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.tensor(image, device=device).div(255).mul(2).sub(1).permute(0, 3, 1, 2).contiguous()
 
 
-def save_evaluation(output_dir: Path, result: Dict[str, Any], policy_state: Dict[str, Any]) -> Path:
+def save_evaluation(output_dir: Path, result: Dict[str, Any], policy_state: Dict[str, Any],
+                    kind: Optional[str] = None) -> Path:
     """Write to evaluations/, named by policy weights and protocol; never overwritten."""
     path = evaluation_path(output_dir, result["task_name"], result["seeds"], result["max_steps"], policy_state)
     policy = path.stem.split("_policy-")[1].split("_protocol-")[0]
     if path.exists():
         raise FileExistsError(f"Evaluation {path} already exists; not overwriting it")
     path.parent.mkdir(exist_ok=True)
-    write_json(path, dict(result, policy_sha256_prefix=policy))
+    write_json(path, dict(result, policy_sha256_prefix=policy, protocol_id=protocol_label(path)[len("protocol-"):],
+                          **({"evaluation_kind": kind} if kind is not None else {})))
     return path
 
 
@@ -815,33 +1285,53 @@ def evaluate_saved_output(cfg: DictConfig) -> Path:
     logged = None
     if OmegaConf.select(cfg, "wandb.mode", default="disabled") != "disabled":
         logged = start_saved_evaluation(cfg, output_dir, saved, device)  # status running
+    if logged is not None and logged["shared"] is not None:
+        prepare_evaluation(logged["shared"], existing,
+                           dict(seeds=list(cfg.evaluation.seeds), max_steps=cfg.evaluation.max_steps), "evaluate_only")
     try:
         result = evaluate_policy(model, saved.env.train, task_name, cfg.evaluation.seeds, cfg.evaluation.max_steps)
-        path = save_evaluation(output_dir, result, model.state_dict())
+        path = save_evaluation(output_dir, result, model.state_dict(), "evaluate_only")
         report_evaluation(result, path)
         if logged is not None:
-            log_evaluation(result, path, logged["steps"], "evaluate_only", logged["total"], 0)
+            if logged["shared"] is not None:  # the next free step of the shared run
+                publish_evaluation(logged["shared"], path, result, logged["steps"], "evaluate_only")
+            else:
+                log_evaluation(result, path, logged["steps"], "evaluate_only", logged["total"], 0)
             wandb.summary["last_evaluate_only"] = dict(file=str(Path(path).resolve()), seeds=result["seeds"],
                                                        max_steps=result["max_steps"])
     except BaseException as error:
         finish_wandb("failed", error)
         raise
     finish_wandb("completed")
+    if logged is not None and logged["shared"] is not None:  # confirm what the server holds; nothing is logged
+        reconcile_evaluations(logged["shared"], 0, cfg.wandb.mode == "offline", recover=False)
     return path
 
 
 def start_saved_evaluation(cfg: DictConfig, output_dir: Path, saved: DictConfig, device: torch.device) -> Dict[str, Any]:
-    """Evaluate-only to W&B: the output's adaptation run when its identity (wandb_run.json) exists,
-    else a new run of job type evaluate-only; its status becomes running (begin_status). Everything
-    comes from the completed output. Returns the evaluation row's axis value and update count."""
+    """Evaluate-only to W&B: the shared run the milestone is registered in (its record, shared_run_path;
+    its evaluations are first reconciled with the server's history), else the output's own run (wandb_run.json, from before shared
+    runs), else a new run of job type evaluate-only; its status becomes running (begin_status). Everything
+    comes from the completed output and the record; the milestone itself is not read. Returns the evaluation
+    row's axis value, the update count and the shared run (None: a run of its own)."""
     summary = downstream_summary(output_dir) or {}
     recorded = summary.get("milestone") or {}
     steps = recorded.get("collected_steps")
-    path_identity = output_dir / "wandb_run.json"
-    identity = json.loads(path_identity.read_text()) if path_identity.is_file() else None
     milestone_path = Path(cfg.initialization.milestone_path)
     member = recorded.get("member_index", 0)
     name, group = run_names(cfg, milestone_path, member, None, domain=saved.env.train.domain_name)
+    total = sum((summary.get("num_updates") or {}).values())
+    path = shared_run_path(milestone_path, cfg.downstream.task_name, cfg.downstream.seed, member)
+    if path.is_file() and milestone_path.name in read_json(path, "shared W&B run record").get("milestones", {}):
+        shared = dict(path=path, record=open_shared_run(cfg, path, name, group))
+        init_wandb(cfg, shared["record"]["identity"], name, group, "evaluate-only", device)
+        save_shared_identity(shared)
+        define_axes()
+        begin_status("evaluate_only")
+        reconcile_evaluations(shared, server_next_step(), wandb_offline(cfg))
+        return dict(steps=steps, total=total, shared=shared)
+    path_identity = output_dir / "wandb_run.json"
+    identity = json.loads(path_identity.read_text()) if path_identity.is_file() else None
     config = None
     if identity is None:
         config = dict(config=OmegaConf.to_container(saved), provenance=dict(
@@ -852,7 +1342,9 @@ def start_saved_evaluation(cfg: DictConfig, output_dir: Path, saved: DictConfig,
             denoiser_member=dict(index=member, sha256=recorded.get("member_sha256", NOT_RECORDED)),
             output=str(output_dir.resolve()), evaluation=evaluation_protocol(cfg.evaluation),
             note="evaluate-only run: the output has no W&B adaptation run (wandb_run.json)"))
-    init_wandb(cfg, identity, name + ("" if identity else "-evaluate-only"), group, "evaluate-only", device, config)
+    if identity is None and not OmegaConf.select(cfg, "wandb.name"):  # an explicit name is used exactly
+        name += "-evaluate-only"
+    init_wandb(cfg, identity, name, group, "evaluate-only", device, config)
     define_axes()
     begin_status("evaluate_only")
-    return dict(steps=steps, total=sum((summary.get("num_updates") or {}).values()))
+    return dict(steps=steps, total=total, shared=None)

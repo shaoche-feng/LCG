@@ -1,9 +1,11 @@
 """Step 5 (part 2): real-task evaluation and faithful downstream checkpoint/resume."""
 from copy import deepcopy
 import json
+import os
 import re
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -155,7 +157,9 @@ def test_saved_policy_evaluation_matches_in_memory(tmp_path, monkeypatch):
     (saved,) = (output / "evaluations").iterdir()
     in_memory = trainer.evaluate()
     stored = OmegaConf.to_container(OmegaConf.load(saved))
-    assert {k: v for k, v in stored.items() if k != "policy_sha256_prefix"} == in_memory
+    assert {k: v for k, v in stored.items() if k not in ("policy_sha256_prefix", "protocol_id", "evaluation_kind")} == in_memory
+    assert stored["evaluation_kind"] == "after_training"
+    assert stored["protocol_id"] == downstream_module.protocol_id(in_memory["seeds"], in_memory["max_steps"])
     assert not any(row["phase"] == "evaluation" for row in last_rows(output / "metrics.jsonl")[1])
 
     cfg = compose("downstream", [f"initialization.milestone_path={milestone.as_posix()}", "downstream.task_name=walk",
@@ -630,7 +634,8 @@ def test_resume_continues_the_wandb_run_without_duplicate_updates(tmp_path, monk
     held = dict(equal=8, lost_rows=5, beyond_checkpoint=9, beyond_mismatch=9, beyond_unverified=9, offline=0)[server]
     second = FakeWandb(starting_step=held, offline=server == "offline", summary=dict(status="running"))
     output = wandb_run(milestone, monkeypatch, second, resume=True).run()
-    assert second.inits[0]["id"] == "dsrun1" and second.inits[0]["resume"] == "allow"  # the same run
+    run_id = json.loads((tmp_path / "split/run/downstream/wandb_walk_seed_0.json").read_text())["identity"]["id"]
+    assert second.inits[0]["id"] == run_id and second.inits[0]["resume"] == "allow"  # the same run
     event = second.summary["resume"]
     assert (event["committed_rows"], event["previous_status"], event["count"]) == (8, "running", 1)
 
@@ -654,7 +659,7 @@ def test_resume_continues_the_wandb_run_without_duplicate_updates(tmp_path, monk
     assert (warning in out) == (server == "beyond_mismatch")
     if server == "offline":
         assert "nothing backfilled" in event["note"] and [s for s, _ in second.logged][0] == 8
-    assert second.summary["status"] == "completed" and json.loads((output / "wandb_run.json").read_text())["id"] == "dsrun1"
+    assert second.summary["status"] == "completed" and json.loads((output / "wandb_run.json").read_text())["id"] == run_id
 
 
 def test_resume_of_a_run_without_wandb_starts_one_and_backfills_its_committed_updates(tmp_path, monkeypatch):
@@ -716,3 +721,582 @@ def test_resume_needs_the_milestone_manifest_json(tmp_path, monkeypatch):
     manifest.write_bytes(saved)
     output = make(milestone, monkeypatch, resume=True).run()
     assert json.loads((output / "summary.json").read_text())["num_updates"] == {"rew_end_model": 6, "actor_critic": 4}
+
+
+# ---------------------------------------------------------------- the shared W&B run: resume and publication
+
+EVALUATED = ["evaluation.after_training=true", "evaluation.seeds=[3001]", "evaluation.max_steps=3"]
+
+
+def crash_at_policy_update(monkeypatch, n):
+    original = DownstreamTrainer.policy_update
+
+    def crash(self):
+        original(self)
+        if self.num_updates["actor_critic"] == n:
+            raise Crash()
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", crash)
+    return original
+
+
+def shared_rows(root, server):
+    record = json.loads((Path(root) / "run/downstream/wandb_walk_seed_0.json").read_text())
+    return record, server[record["identity"]["id"]]["rows"]
+
+
+def test_resume_in_a_shared_run_continues_the_milestone_block(tmp_path, monkeypatch):
+    """Milestone 20 completes; milestone 26 crashes at PMPO update 3 (checkpoint at 2) and is resumed. Every row
+    is in the one shared run once, in increasing steps, equal to an uninterrupted reference."""
+    def adapt(root, server, crash=False):
+        milestones = build_milestone(root, early=(2,)).parent
+        wandb_run(milestones / "steps_000020", monkeypatch, FakeWandb(server=server), EVALUATED).run()
+        if not crash:
+            return wandb_run(milestones / "steps_000026", monkeypatch, FakeWandb(server=server), EVALUATED).run()
+        original = crash_at_policy_update(monkeypatch, 3)
+        with pytest.raises(Crash):
+            wandb_run(milestones / "steps_000026", monkeypatch, FakeWandb(server=server), EVALUATED).run()
+        monkeypatch.setattr(DownstreamTrainer, "policy_update", original)
+        second = FakeWandb(server=server)
+        output = wandb_run(milestones / "steps_000026", monkeypatch, second, EVALUATED, resume=True).run()
+        event = second.summary["resume"]
+        # 6 + 2 committed rows from step 11; the server holds update 3 too (replayed, not logged again).
+        assert (event["block_first_step"], event["committed_rows"], event["server_rows_beyond_checkpoint"]) == (11, 8, 1)
+        assert event["replayed_matched"] == 1
+        return output
+
+    reference_server, server = {}, {}
+    adapt(tmp_path / "reference", reference_server)
+    output = adapt(tmp_path / "split", server, crash=True)
+    (_, reference), (record, rows) = shared_rows(tmp_path / "reference", reference_server), shared_rows(tmp_path / "split", server)
+    assert [s for s, _ in rows] == list(range(22))  # 20: steps 0-9 + evaluation 10; 26: steps 11-20 + evaluation 21
+    for (step, row), (ref_step, ref_row) in zip(rows, reference):
+        assert step == ref_step and set(row) == set(ref_row)
+        assert all(row[k] == ref_row[k] for k in row if not k.startswith(("eval/", "eval_protocols/"))), step  # same values as uninterrupted
+    block = record["milestones"]["steps_000026"]
+    assert (block["first_step"], block["reward_offset"], block["policy_offset"], block["attempt"]) == (11, 6, 4, 1)
+    reward = [r for _, r in rows if downstream_module.REWARD_AXIS in r]
+    assert [r[downstream_module.REWARD_CUMULATIVE_AXIS] for r in reward] == list(range(1, 13))
+    assert [r[downstream_module.REWARD_AXIS] for r in reward] == list(range(1, 7)) * 2  # fresh model per milestone
+    assert [r["exploration/train_env_steps"] for _, r in rows if any(k.startswith(("eval/", "eval_protocols/")) for k in r)] == [20, 26]
+    assert json.loads((output / "summary.json").read_text())["num_updates"] == {"rew_end_model": 6, "actor_critic": 4}
+
+
+def evaluate_only(milestone, monkeypatch, fake, seeds, *extra):
+    """An evaluate-only command (another protocol) attaching to the shared run through `fake`."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(downstream_module, "wandb", fake)
+    cfg = compose("downstream", [f"initialization.milestone_path={Path(milestone).as_posix()}", "downstream.task_name=walk",
+                                 "downstream.mode=evaluate", *RESUMABLE, "wandb.mode=online", f"evaluation.seeds={seeds}",
+                                 "evaluation.max_steps=3", *extra])
+    return evaluate_saved_output(cfg)
+
+
+def points(rows, report):
+    """Steps of the server's points of one evaluation file (its protocol and training env steps)."""
+    result = json.loads(Path(report).read_text())
+    record = json.loads((Path(report).parents[5] / "downstream/wandb_walk_seed_0.json").read_text())
+    namespace = downstream_module.evaluation_namespace(report, (record.get("primary_protocol") or {}).get("id"))
+    return [s for s, r in rows if r.get(f"{namespace}/return_mean") == result["return_mean"]]
+
+
+def entry_of(root, report):
+    record = json.loads((Path(root) / "run/downstream/wandb_walk_seed_0.json").read_text())
+    return record["evaluations"][Path(os.path.relpath(report, Path(root) / "run/downstream")).as_posix()]
+
+
+def is_evaluation(step, row):
+    return any(k.startswith(("eval/", "eval_protocols/")) for k in row)
+
+
+@pytest.mark.parametrize("interrupted", ["before_record", "after_record", "after_log"])
+def test_interrupted_evaluation_publication_is_completed_exactly_once(tmp_path, monkeypatch, interrupted):
+    """The after-training evaluation's publication is interrupted: before its step is recorded, after that but
+    before logging, or after logging but before the local record is updated. The next process attaching to the
+    shared run checks the server's history: a point that is there is confirmed, a missing one is logged again;
+    the point is in the run exactly once. A second protocol is a separate series."""
+    milestone = build_milestone(tmp_path)
+    server = {}
+    first = FakeWandb(server=server)
+    if interrupted == "before_record":
+        def interrupt(*args, **kwargs):
+            raise Crash()
+        monkeypatch.setattr(downstream_module, "publish_evaluation", interrupt)
+    elif interrupted == "after_record":
+        def log(row, step=None):
+            if any(k.startswith(("eval/", "eval_protocols/")) for k in row):
+                raise Crash()
+            FakeWandb.log(first, row, step)
+        first.log = log
+    else:
+        original_write = downstream_module.write_json
+
+        def write(path, data):
+            if Path(path).name.startswith("wandb_") and any(e.get("status") == "logged" for e in data["evaluations"].values()):
+                raise Crash()
+            original_write(path, data)
+        monkeypatch.setattr(downstream_module, "write_json", write)
+    with pytest.raises(Crash):
+        wandb_run(milestone, monkeypatch, first, EVALUATED).run()
+    monkeypatch.undo()
+    output = tmp_path / "run/downstream/steps_000026/walk/seed_0"
+    (after_training,) = (output / "evaluations").iterdir()
+    record = json.loads((tmp_path / "run/downstream/wandb_walk_seed_0.json").read_text())
+    entry = record["evaluations"].get(f"steps_000026/walk/seed_0/evaluations/{after_training.name}")
+    assert entry == dict(step=10, original_step=10, kind="after_training", status="assigned",
+                         attempted=interrupted != "before_record", namespace="eval", protocol=record["primary_protocol"])
+
+    second = FakeWandb(server=server)
+    path = evaluate_only(milestone, monkeypatch, second, "[5,6]")
+    record, rows = shared_rows(tmp_path, server)
+    # 6 + 4 updates at steps 0-9, then the reserved step 10; without a recorded step: the next free one (11).
+    expected = 10  # the intent and reserved step now survive even a crash before publication registration
+    assert points(rows, after_training) == [expected] and points(rows, path) == [expected + 1]
+    assert second.summary["evaluation_publication"]["confirmed"] == (1 if interrupted == "after_log" else 0)
+    assert second.summary["evaluation_publication"]["recovered"] == (0 if interrupted == "after_log" else 1)
+    assert {evaluation_status(e) for e in record["evaluations"].values()} == {"confirmed"}  # both seen on the server
+    assert entry_of(tmp_path, after_training)["kind"] == "after_training"
+
+
+def evaluation_status(entry):
+    return downstream_module.evaluation_status(entry)
+
+
+def test_a_logged_evaluation_lost_before_upload_is_recovered_once(tmp_path, monkeypatch, capsys):
+    """Regression (1, 3): wandb.log returns and the logged state is saved, but the row never reaches the server
+    (the process died before upload). It is not confirmed; the next attachment finds it missing in the server's
+    history and logs it again, once; further attachments find it there and change nothing."""
+    milestone = build_milestone(tmp_path)
+    server = {}
+    lost = FakeWandb(server=server, lose=is_evaluation)
+    wandb_run(milestone, monkeypatch, lost, EVALUATED).run()
+    (report,) = (tmp_path / "run/downstream/steps_000026/walk/seed_0/evaluations").iterdir()
+    assert [s for s, r in lost.logged if is_evaluation(s, r)] == [10]  # wandb.log returned
+    record, rows = shared_rows(tmp_path, server)
+    assert points(rows, report) == [] and entry_of(tmp_path, report)["status"] == "unverified"
+
+    capsys.readouterr()
+    evaluate_only(milestone, monkeypatch, FakeWandb(server=server), "[5]")
+    assert "logged the evaluation" in capsys.readouterr().out
+    record, rows = shared_rows(tmp_path, server)
+    assert points(rows, report) == [10] and entry_of(tmp_path, report)["status"] == "confirmed"
+    shared = dict(path=tmp_path / "run/downstream/wandb_walk_seed_0.json", record=record)
+    for _ in range(2):  # repeated recovery: idempotent
+        again = FakeWandb(server=server)
+        monkeypatch.setattr(downstream_module, "wandb", again)
+        again.init(id=record["identity"]["id"])
+        assert downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False) == dict(
+            confirmed=0, recovered=0, unverified=0, history="nothing to verify")
+        assert not again.logged
+    evaluate_only(milestone, monkeypatch, FakeWandb(server=server), "[7]")
+    record, rows = shared_rows(tmp_path, server)
+    assert points(rows, report) == [10] and len([s for s, r in rows if is_evaluation(s, r)]) == 3
+
+
+def test_an_evaluation_already_on_the_server_is_confirmed_not_duplicated(tmp_path, monkeypatch):
+    """Regression (2): the point reached the server but its confirmation could not be read (history unavailable
+    after the run); the next attachment finds it and confirms it without logging it again."""
+    milestone = build_milestone(tmp_path)
+    server = {}
+    wandb_run(milestone, monkeypatch, FakeWandb(server=server, api_error=ConnectionError("no API")), EVALUATED).run()
+    (report,) = (tmp_path / "run/downstream/steps_000026/walk/seed_0/evaluations").iterdir()
+    assert entry_of(tmp_path, report)["status"] == "unverified"
+    second = FakeWandb(server=server)
+    evaluate_only(milestone, monkeypatch, second, "[5]")
+    record, rows = shared_rows(tmp_path, server)
+    assert points(rows, report) == [10] and entry_of(tmp_path, report)["status"] == "confirmed"
+    assert second.summary["evaluation_publication"] == dict(confirmed=1, recovered=0, unverified=0, history="server")
+
+
+def test_a_missing_evaluation_behind_later_server_rows_is_logged_at_the_next_free_step(tmp_path, monkeypatch):
+    """Regression (4): the evaluation of milestone 20 never reached the server, and while it could not be
+    verified, milestone 26 logged later rows. A later server step is no proof: once the history is readable the
+    point is found missing and logged again at the next free step (W&B steps only increase), exactly once."""
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    server = {}
+    wandb_run(milestones / "steps_000020", monkeypatch, FakeWandb(server=server, lose=is_evaluation), EVALUATED).run()
+    unavailable = FakeWandb(server=server, api_error=ConnectionError("no API"))
+    wandb_run(milestones / "steps_000026", monkeypatch, unavailable, EVALUATED).run()
+    assert unavailable.summary["evaluation_publication"]["unverified"] == 1  # not confirmed, not logged again
+    assert unavailable.summary["evaluation_publication"]["history"].startswith("unavailable (ConnectionError")
+    (report,) = (tmp_path / "run/downstream/steps_000020/walk/seed_0/evaluations").iterdir()
+    record, rows = shared_rows(tmp_path, server)
+    assert points(rows, report) == [] and max(s for s, _ in rows) == 21  # 26's block (11-21) is on the server
+    evaluate_only(milestones / "steps_000026", monkeypatch, FakeWandb(server=server), "[5]")
+    record, rows = shared_rows(tmp_path, server)
+    entry = entry_of(tmp_path, report)
+    assert points(rows, report) == [22] and (entry["step"], entry["recovered_from_step"], entry["status"]) == (22, 10, "confirmed")
+    assert [r["exploration/train_env_steps"] for s, r in rows if is_evaluation(s, r)] == [26, 20, 26]
+
+
+def test_offline_evaluations_are_never_claimed_confirmed(tmp_path, monkeypatch):
+    """Offline the server's history cannot be read: logged evaluations stay unconfirmed and are not logged
+    again by later offline attachments; the summary says why."""
+    milestone = build_milestone(tmp_path)
+    offline = FakeWandb(offline=True)
+    wandb_run(milestone, monkeypatch, offline, [*EVALUATED, "wandb.mode=offline"]).run()
+    (report,) = (tmp_path / "run/downstream/steps_000026/walk/seed_0/evaluations").iterdir()
+    assert entry_of(tmp_path, report)["status"] == "unverified"
+    again = FakeWandb(offline=True)
+    evaluate_only(milestone, monkeypatch, again, "[5]", "wandb.mode=offline")
+    assert entry_of(tmp_path, report)["status"] == "unverified" and len(again.logged) == 1  # only its own point
+    assert again.summary["evaluation_publication"]["unverified"] == 1
+    assert again.summary["evaluation_publication"]["history"].startswith("offline")
+
+
+def test_resume_after_later_steps_in_the_shared_run_keeps_its_rows_local(tmp_path, monkeypatch, capsys):
+    """Milestone 26 crashes; before it is resumed, evaluate-only adds a point for milestone 20 after the block of
+    26. W&B steps only increase, so the remaining updates of 26 are not logged (they stay in metrics.jsonl); its
+    evaluation is logged at the next free step. Nothing is logged out of order or twice."""
+    milestones = build_milestone(tmp_path, early=(2,)).parent
+    server = {}
+    wandb_run(milestones / "steps_000020", monkeypatch, FakeWandb(server=server), EVALUATED).run()
+    original = crash_at_policy_update(monkeypatch, 3)
+    with pytest.raises(Crash):
+        wandb_run(milestones / "steps_000026", monkeypatch, FakeWandb(server=server), EVALUATED).run()
+    monkeypatch.setattr(DownstreamTrainer, "policy_update", original)
+    cfg = compose("downstream", [f"initialization.milestone_path={(milestones / 'steps_000020').as_posix()}",
+                                 "downstream.task_name=walk", "downstream.mode=evaluate", *RESUMABLE, "wandb.mode=online",
+                                 "evaluation.seeds=[8]", "evaluation.max_steps=3"])
+    monkeypatch.setattr(downstream_module, "wandb", FakeWandb(server=server))
+    evaluate_saved_output(cfg)  # at step 22, after the reserved block of 26 (steps 11-21)
+    capsys.readouterr()
+    second = FakeWandb(server=server)
+    output = wandb_run(milestones / "steps_000026", monkeypatch, second, EVALUATED, resume=True).run()
+    assert "the shared run already holds later steps" in capsys.readouterr().out
+    assert "later steps" in second.summary["resume"]["note"]
+    record, rows = shared_rows(tmp_path, server)
+    steps = [s for s, _ in rows]
+    assert steps == sorted(set(steps)) and steps[-2:] == [22, 23]  # nothing below the server's step; no duplicates
+    assert [r["exploration/train_env_steps"] for _, r in rows if any(k.startswith(("eval/", "eval_protocols/")) for k in r)] == [20, 20, 26]
+    # PMPO update 4 of 26 is local only; the server has updates 1-3 from before the crash.
+    assert [r[downstream_module.POLICY_AXIS] for _, r in rows if r.get("exploration/train_env_steps") == 26
+            and downstream_module.POLICY_AXIS in r] == [1, 2, 3]
+    assert json.loads((output / "summary.json").read_text())["num_updates"] == {"rew_end_model": 6, "actor_critic": 4}
+
+
+# Independent review regressions (CPU, fake W&B only).
+def publication_case(tmp_path, monkeypatch):
+    cfg = OmegaConf.create(dict(wandb=dict(project='review', entity='offline-test', name=None, group=None),
+                                downstream=dict(task_name='walk',seed=0),
+                                evaluation=dict(after_training=False,seeds=[3001,3002],max_steps=3)))
+    path = tmp_path/'run/downstream/wandb_walk_seed_0.json'
+    shared = dict(path=path,record=downstream_module.open_shared_run(cfg,path,'review','review'))
+    server = {}
+    attach_publication_case(shared,server,monkeypatch)
+    milestone = SimpleNamespace(path=tmp_path/'run/milestones/steps_000020',
+                                manifest=dict(identity={'review':'fixed'},collected_steps=20))
+    downstream_module.register_milestone(shared,milestone,6,4,True,0)
+    return cfg,shared,server,milestone
+
+
+def attach_publication_case(shared,server,monkeypatch):
+    fake=FakeWandb(server=server)
+    monkeypatch.setattr(downstream_module,'wandb',fake)
+    fake.init(**shared['record']['identity'])
+    return fake
+
+
+def publication_report(milestone,seeds=(3001,3002),mean=0.25):
+    output=downstream_module.downstream_output_dir(milestone.path,'walk',0)
+    output.mkdir(parents=True,exist_ok=True)
+    result=dict(task_name='walk',seeds=list(seeds),max_steps=3,
+                episodes=[dict(seed=s,episode_return=mean) for s in seeds],
+                return_mean=mean,return_max=mean,return_median=mean,return_min=mean,return_std=0.)
+    return downstream_module.save_evaluation(output,result,{}),result
+
+
+def publication_server_rows(shared,server):
+    return server[shared['record']['identity']['id']]['rows']
+
+
+def test_late_primary_selection_is_durable_before_wandb_log(tmp_path,monkeypatch):
+    cfg,shared,server,m=publication_case(tmp_path,monkeypatch)
+    path,result=publication_report(m)
+    original=downstream_module.wandb.log
+    def interrupted(row,step=None):
+        original(row,step)
+        raise Crash('uploaded before local logged-state write')
+    monkeypatch.setattr(downstream_module.wandb,'log',interrupted)
+    with pytest.raises(Crash):
+        downstream_module.publish_evaluation(shared,path,result,20,'after_training',reserved=10)
+    resumed=dict(path=shared['path'],record=downstream_module.read_json(shared['path'],'shared record'))
+    attach_publication_case(resumed,server,monkeypatch)
+    event=downstream_module.reconcile_evaluations(resumed,downstream_module.server_next_step(),False)
+    assert len(publication_server_rows(resumed,server)) == 1, (event,publication_server_rows(resumed,server))
+
+
+def test_recovering_file_before_publication_establishes_late_primary(tmp_path,monkeypatch):
+    cfg,shared,server,m=publication_case(tmp_path,monkeypatch)
+    cfg.evaluation.after_training=True
+    output=downstream_module.downstream_output_dir(m.path,'walk',0)
+    output.mkdir(parents=True)
+    OmegaConf.save(cfg,output/'config.yaml')
+    path,result=publication_report(m)  # after-training result saved; crash before publish_evaluation
+    downstream_module.reconcile_evaluations(shared,downstream_module.server_next_step(),False)
+    expected=downstream_module.protocol_id(result['seeds'],result['max_steps'])
+    assert shared['record']['primary_protocol'] == dict(id=expected,seeds=result['seeds'],max_steps=3)
+
+
+def test_older_record_preserves_first_after_training_primary(tmp_path,monkeypatch):
+    cfg,shared,server,m=publication_case(tmp_path,monkeypatch)
+    first,result=publication_report(m)
+    downstream_module.publish_evaluation(shared,first,result,20,'after_training',reserved=10)
+    for entry in shared['record']['evaluations'].values():
+        entry['status']='confirmed'
+    expected=shared['record'].pop('primary_protocol')  # older shared schema-1 record
+    downstream_module.write_json(shared['path'],shared['record'])
+    resumed=dict(path=shared['path'],record=downstream_module.open_shared_run(cfg,shared['path'],'review','review'))
+    attach_publication_case(resumed,server,monkeypatch)
+    downstream_module.reconcile_evaluations(resumed,downstream_module.server_next_step(),False)
+    second=SimpleNamespace(path=m.path.with_name('steps_000030'),manifest=dict(identity={'review':'second'},collected_steps=30))
+    downstream_module.register_milestone(resumed,second,6,4,True,downstream_module.server_next_step())
+    other,result2=publication_report(second,seeds=(5,6))
+    downstream_module.publish_evaluation(resumed,other,result2,30,'after_training')
+    assert resumed['record']['primary_protocol'] == expected
+
+
+def test_pre_primary_evaluate_only_namespace_survives_primary_selection(tmp_path,monkeypatch):
+    cfg,shared,server,m=publication_case(tmp_path,monkeypatch)
+    path,result=publication_report(m)
+    downstream_module.publish_evaluation(shared,path,result,20,'evaluate_only')
+    unavailable=attach_publication_case(shared,server,monkeypatch)
+    unavailable.api_error=ConnectionError('history unavailable during the next training attachment')
+    event=downstream_module.reconcile_evaluations(shared,downstream_module.server_next_step(),False)
+    assert event['unverified']==1
+    second=SimpleNamespace(path=m.path.with_name('steps_000030'),manifest=dict(identity={'review':'second'},collected_steps=30))
+    downstream_module.register_milestone(shared,second,6,4,True,downstream_module.server_next_step())
+    path2,result2=publication_report(second)
+    downstream_module.publish_evaluation(shared,path2,result2,30,'after_training')
+    attach_publication_case(shared,server,monkeypatch)
+    event=downstream_module.reconcile_evaluations(shared,downstream_module.server_next_step(),False)
+    first_rows=[row for _,row in publication_server_rows(shared,server) if row[downstream_module.EVAL_AXIS]==20]
+    assert len(first_rows)==1,(event,publication_server_rows(shared,server))
+
+
+def test_recovery_does_not_log_updates_below_its_new_live_step(tmp_path,monkeypatch):
+    cfg,shared,server,m=publication_case(tmp_path,monkeypatch)
+    cfg.evaluation.after_training=True
+    shared['record']['primary_protocol']=downstream_module.configured_protocol(cfg)
+    path,result=publication_report(m)
+    downstream_module.publish_evaluation(shared,path,result,20,'after_training',reserved=10)
+    publication_server_rows(shared,server).clear()  # that evaluation was queued, never uploaded
+    second=SimpleNamespace(path=m.path.with_name('steps_000030'),manifest=dict(identity={'review':'second'},collected_steps=30))
+    block=downstream_module.register_milestone(shared,second,6,4,True,11)
+    publication_server_rows(shared,server).append((18,{'training':1.}))  # server holds next block through PMPO update 2
+    fake=attach_publication_case(shared,server,monkeypatch)
+    downstream_module.reconcile_evaluations(shared,downstream_module.server_next_step(),False)  # older evaluation recovered at step 22
+    trainer=object.__new__(downstream_module.DownstreamTrainer)
+    trainer.cfg=OmegaConf.create(dict(wandb=dict(mode='online'),rew_end_model=dict(training=dict(steps=6)),
+                                    actor_critic=dict(training=dict(steps=4)),
+                                    agent=dict(actor_critic=dict(actor_distribution='tanh_gaussian'))))
+    trainer._block=block; trainer._blocked=False; trainer._replayed=None
+    trainer.num_updates=dict(rew_end_model=6,actor_critic=2); trainer.phase='actor_critic'
+    trainer._work_dir=tmp_path/'work'; trainer._work_dir.mkdir()
+    (trainer._work_dir/'metrics.jsonl').write_text('')
+    trainer.reconcile_wandb({'id':fake.run.id})
+    trainer.publish(dict(phase='actor_critic',update=3,loss_actor=0.50))
+    assert publication_server_rows(shared,server)[-1][0]==22
+
+
+def test_confirmed_recovery_restores_missing_protocol_summary(tmp_path,monkeypatch):
+    cfg,shared,server,m=publication_case(tmp_path,monkeypatch)
+    shared['record']['primary_protocol']=downstream_module.configured_protocol(cfg)
+    downstream_module.write_json(shared['path'],shared['record'])
+    path,result=publication_report(m)
+    original=downstream_module.wandb.log
+    def interrupted(row,step=None):
+        original(row,step)
+        raise Crash('point uploaded; summary not yet published')
+    monkeypatch.setattr(downstream_module.wandb,'log',interrupted)
+    with pytest.raises(Crash):
+        downstream_module.publish_evaluation(shared,path,result,20,'after_training',reserved=10)
+    resumed=dict(path=shared['path'],record=downstream_module.read_json(shared['path'],'record'))
+    fake=attach_publication_case(resumed,server,monkeypatch)
+    event=downstream_module.reconcile_evaluations(resumed,downstream_module.server_next_step(),False)
+    assert event['confirmed']==1 and len(publication_server_rows(resumed,server))==1
+    assert 'evaluation_protocols/'+downstream_module.protocol_label(path) in fake.summary
+
+
+def test_protocol_identifier_normalizes_supported_callers():
+    seeds=[3001,3002]
+    cfg=OmegaConf.create(dict(evaluation=dict(seeds=seeds,max_steps=500,after_training=True)))
+    expected=downstream_module.protocol_id(seeds,500)
+    assert downstream_module.protocol_id(tuple(seeds),500)==expected
+    assert downstream_module.configured_protocol(cfg)['id']==expected
+    assert downstream_module.evaluation_protocol(cfg.evaluation)['protocol']==expected
+    path=downstream_module.evaluation_path(Path('.'),'walk',cfg.evaluation.seeds,cfg.evaluation.max_steps,{})
+    assert downstream_module.protocol_label(path)=='protocol-'+expected
+    assert downstream_module.protocol_id(list(reversed(seeds)),500)!=expected  # ordered protocol, consistently
+    assert downstream_module.protocol_id(seeds,499)!=expected
+
+
+def test_namespace_axes_both_use_exploration_steps(monkeypatch):
+    fake=FakeWandb();monkeypatch.setattr(downstream_module,'wandb',fake)
+    downstream_module.define_axes()
+    assert ('eval/*','exploration/train_env_steps') in fake.metrics
+    assert ('eval_protocols/*','exploration/train_env_steps') in fake.metrics
+
+
+def test_matching_protocols_at_same_budget_and_mean_stay_separate(tmp_path,monkeypatch):
+    cfg,shared,server,m=publication_case(tmp_path,monkeypatch)
+    shared['record']['primary_protocol']=downstream_module.configured_protocol(cfg)
+    first,a=publication_report(m)
+    downstream_module.publish_evaluation(shared,first,a,20,'after_training',reserved=10)
+    second,b=publication_report(m,seeds=(5,6))
+    downstream_module.publish_evaluation(shared,second,b,20,'evaluate_only')
+    fake=attach_publication_case(shared,server,monkeypatch)
+    result=downstream_module.reconcile_evaluations(shared,downstream_module.server_next_step(),False)
+    assert result['confirmed']==2 and result['recovered']==0 and not fake.logged
+    assert len(publication_server_rows(shared,server))==2
+
+
+def test_legacy_missing_protocol_metadata_uses_mtime_then_filename(tmp_path,monkeypatch):
+    cfg,shared,server,m=publication_case(tmp_path,monkeypatch)
+    first,a=publication_report(m)
+    second,b=publication_report(m,seeds=(5,6))
+    for path in (first,second):
+        r=downstream_module.read_json(path,'report');r.pop('protocol_id');downstream_module.write_json(path,r)
+    os.utime(first,ns=(1_000_000_000,1_000_000_000))
+    os.utime(second,ns=(2_000_000_000,2_000_000_000))
+    downstream_module.log_evaluation(a,first,20,'after_training',10,0)
+    attach_publication_case(shared,server,monkeypatch)  # evaluate-only is a new process/run attachment
+    downstream_module.log_evaluation(b,second,20,'evaluate_only',10,0)
+    held=publication_server_rows(shared,server)
+    assert 'eval/return_mean' in held[0][1]
+    assert 'eval_protocols/'+downstream_module.protocol_label(second)+'/return_mean' in held[1][1]
+
+
+@pytest.mark.parametrize("hidden_reads", [1, 2, 10])
+def test_delayed_history_is_retried_without_duplicate_publication(tmp_path, monkeypatch, hidden_reads, capsys):
+    cfg, shared, server, milestone = publication_case(tmp_path, monkeypatch)
+    path, result = publication_report(milestone)
+    downstream_module.publish_evaluation(shared, path, result, 20, "after_training", reserved=10)
+    fake = attach_publication_case(shared, server, monkeypatch)
+    read_history = downstream_module.server_history
+    calls = []
+
+    def delayed(*args):
+        calls.append(1)
+        return ({}, "server") if len(calls) <= hidden_reads else read_history(*args)
+
+    monkeypatch.setattr(downstream_module, "server_history", delayed)
+    monkeypatch.setattr(downstream_module, "HISTORY_RETRY_SECONDS", 0)
+    before = rng_state()
+    event = downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
+    identical(before, rng_state())
+    assert len(calls) == min(hidden_reads + 1, downstream_module.HISTORY_ATTEMPTS)
+    assert not fake.logged and len(publication_server_rows(shared, server)) == 1
+    entry = next(iter(shared["record"]["evaluations"].values()))
+    if hidden_reads < downstream_module.HISTORY_ATTEMPTS:
+        assert event["confirmed"] == 1 and entry["status"] == "confirmed"
+    else:
+        assert event["unverified"] == 1 and entry["status"] == "unverified"
+        assert "unverified" in capsys.readouterr().out
+        monkeypatch.setattr(downstream_module, "server_history", read_history)
+        event = downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
+        assert event["confirmed"] == 1 and not fake.logged
+
+
+def test_delayed_evaluation_with_visible_later_rows_is_not_republished(tmp_path, monkeypatch):
+    cfg, shared, server, milestone = publication_case(tmp_path, monkeypatch)
+    path, result = publication_report(milestone)
+    downstream_module.publish_evaluation(shared, path, result, 20, "after_training", reserved=10)
+    publication_server_rows(shared, server).append((18, {"later_training": 1.0}))
+    fake = attach_publication_case(shared, server, monkeypatch)
+    read_history = downstream_module.server_history
+    calls = []
+
+    def delayed(*args):
+        history, source = read_history(*args)
+        calls.append(1)
+        if len(calls) < downstream_module.HISTORY_ATTEMPTS:
+            history.pop(10)
+        return history, source
+
+    monkeypatch.setattr(downstream_module, "server_history", delayed)
+    monkeypatch.setattr(downstream_module, "HISTORY_RETRY_SECONDS", 0)
+    event = downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
+    assert event["confirmed"] == 1 and event["recovered"] == 0
+    assert len(calls) == downstream_module.HISTORY_ATTEMPTS and not fake.logged
+    assert [s for s, _ in publication_server_rows(shared, server)] == [10, 18]
+
+
+def test_confirmed_summaries_are_rebuilt_on_every_attachment(tmp_path, monkeypatch):
+    cfg, shared, server, milestone = publication_case(tmp_path, monkeypatch)
+    path, result = publication_report(milestone)
+    downstream_module.publish_evaluation(shared, path, result, 20, "after_training", reserved=10)
+    downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
+    fake = attach_publication_case(shared, server, monkeypatch)
+    fake.summary.clear()
+    event = downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
+    assert event["history"] == "nothing to verify" and not fake.logged
+    assert fake.summary["evaluation_protocols/primary"] == shared["record"]["primary_protocol"]
+    assert fake.summary["evaluation_protocols/" + downstream_module.protocol_label(path)]["namespace"] == "eval"
+    assert fake.summary["evaluations/" + path.stem]["step"] == 10
+
+
+def test_primary_migration_uses_original_step_and_published_namespace(tmp_path, monkeypatch):
+    cfg, shared, server, milestone = publication_case(tmp_path, monkeypatch)
+    first, result = publication_report(milestone)
+    downstream_module.publish_evaluation(shared, first, result, 20, "after_training", reserved=10)
+    second, other = publication_report(milestone, seeds=(5, 6))
+    downstream_module.publish_evaluation(shared, second, other, 20, "after_training")
+    entries = list(shared["record"]["evaluations"].values())
+    entries[0].update(step=25, recovered_from_step=10, status="confirmed")
+    entries[1]["status"] = "confirmed"
+    old_namespace = entries[1]["namespace"]
+    expected = shared["record"].pop("primary_protocol")
+    downstream_module.write_json(shared["path"], shared["record"])
+    migrated = downstream_module.open_shared_run(cfg, shared["path"], "review", "review")
+    assert migrated["primary_protocol"] == expected
+    assert list(migrated["evaluations"].values())[1]["namespace"] == old_namespace
+
+
+@pytest.mark.parametrize("unavailable_reads", [2, 10])
+def test_history_api_failures_have_bounded_retries(tmp_path, monkeypatch, unavailable_reads):
+    cfg, shared, server, milestone = publication_case(tmp_path, monkeypatch)
+    path, result = publication_report(milestone)
+    downstream_module.publish_evaluation(shared, path, result, 20, "after_training", reserved=10)
+    fake = attach_publication_case(shared, server, monkeypatch)
+    read_history = downstream_module.server_history
+    calls = []
+
+    def unavailable(*args):
+        calls.append(1)
+        return (None, "unavailable (ConnectionError: fixture)") if len(calls) <= unavailable_reads else read_history(*args)
+
+    monkeypatch.setattr(downstream_module, "server_history", unavailable)
+    monkeypatch.setattr(downstream_module, "HISTORY_RETRY_SECONDS", 0)
+    event = downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
+    assert len(calls) == downstream_module.HISTORY_ATTEMPTS
+    assert not fake.logged and len(publication_server_rows(shared, server)) == 1
+    assert event["confirmed" if unavailable_reads == 2 else "unverified"] == 1
+
+
+def test_historical_confirmation_is_not_revoked_by_lagging_namespace_lookup(tmp_path, monkeypatch):
+    cfg, shared, server, milestone = publication_case(tmp_path, monkeypatch)
+    path, result = publication_report(milestone)
+    downstream_module.publish_evaluation(shared, path, result, 20, "after_training", reserved=10)
+    downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
+    entry = next(iter(shared["record"]["evaluations"].values()))
+    entry.pop("namespace")
+    publication_server_rows(shared, server).append((18, {"later_training": 1.0}))
+    fake = attach_publication_case(shared, server, monkeypatch)
+    monkeypatch.setattr(downstream_module, "server_history", lambda *args: ({18: {"later_training": 1.0}}, "server"))
+    monkeypatch.setattr(downstream_module, "HISTORY_RETRY_SECONDS", 0)
+    event = downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
+    assert entry["status"] == "confirmed" and entry["namespace_inferred"]
+    assert event["unverified"] == 1 and not fake.logged
+    assert len(publication_server_rows(shared, server)) == 2
+
+
+def test_after_training_intent_is_saved_before_evaluation_or_report(tmp_path, monkeypatch):
+    cfg, shared, server, milestone = publication_case(tmp_path, monkeypatch)
+    target = downstream_module.evaluation_path(tmp_path / "output", "walk", cfg.evaluation.seeds, 3, {})
+    metadata = dict(seeds=list(cfg.evaluation.seeds), max_steps=3)
+    downstream_module.prepare_evaluation(shared, target, metadata, "after_training", 10)
+    saved = downstream_module.read_json(shared["path"], "record")
+    entry = next(iter(saved["evaluations"].values()))
+    assert not target.exists() and not publication_server_rows(shared, server)
+    assert entry == dict(step=10, original_step=10, kind="after_training", status="assigned", attempted=False,
+                         protocol=saved["primary_protocol"], namespace="eval")

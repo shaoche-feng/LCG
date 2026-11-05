@@ -4080,3 +4080,71 @@ Uncommitted, pending independent review. Starting point `073774c`, clean working
 - **Exploration metrics:** `wandb_history.jsonl` holds about 3 rows per epoch whatever the update count, about 0.74 MB per run.
 - **Terminal logs:** about 2 MB per smoke exploration (progress bars, time-throttled), so they grow with runtime.
 - **Replay, milestones, checkpoints and downstream models:** the same per run in production as in the smoke.
+
+## Downstream W&B recovery after independent review (2026-11-06)
+
+Worked from the current uncommitted tree on `e70eb09`, preserving the user's `.gitignore`, all production,
+Walker and smoke launchers, project/run names, separated streams, combined logs and reduced smoke
+settings. Protected-file SHA-256 checks cover 17 unchanged files. No launcher was changed, so a new
+launcher syntax/stub run was not required. Nothing was staged, committed or pushed.
+
+Implemented in `src/downstream_trainer.py`, with maintained regressions in the existing downstream tests:
+
+1. `log_wandb` and `server_next_step` track the current attachment's live append floor, including attempted
+   and recovered publications. Resume cannot silently publish older training steps after recovery advanced
+   the run; closed blocks keep remaining rows in metrics.jsonl with an explicit warning. Their evaluation
+   uses an appendable step.
+2. `prepare_evaluation` records primary selection, origin, protocol, namespace and step before evaluation
+   starts or W&B can queue a point. New reports include `evaluation_kind`. Saved but unregistered reports
+   retain this origin; older files can use a matching enabled protocol in saved config, otherwise remain
+   `recovered`. A failed evaluation that produced no file does not mislabel a later evaluate-only command.
+3. `migrate_evaluations` includes confirmed after-training entries when choosing the historical primary.
+   Ordering is original step (or recovered-from/current step for older records), then relative filename.
+4. Each point's publication namespace persists. Changing primary does not reinterpret an earlier
+   evaluate-only row. Legacy missing namespaces are provisional until a matching server row identifies
+   them, including the old eval/protocol-<id> prefix. Prior confirmation is never revoked by a lagging scan.
+5. Every attachment restores evaluation/protocol summaries independently of row confirmation, including
+   previously confirmed rows and points confirmed after the previous process finished.
+
+Delayed/unavailable history: up to three verification reads, 0.2 seconds between attempts and a 10-second
+API timeout. A readable receipt suppresses publication. A new-step retry of a missing older point requires
+all verification reads to contain the indexed tail; empty, lagging or unavailable tails remain explicitly
+`unverified` with a reason and warning. Same-step retry is possible while the assigned step remains
+appendable. API reads restore the global training RNG state. This policy relies on the service's indexed
+prefix: arbitrarily out-of-order indexing and offline synchronization are not an exactly-once guarantee.
+
+Compatibility: shared-record schema remains 1 with additive origin/protocol/namespace/original-step and
+attempt/verification fields. Legacy published booleans and reports without protocol_id/evaluation_kind
+are still readable. Local report overwrite protection remains. No model, optimizer, checkpoint format,
+evaluation action, reward calculation, training budget, schedule or source replay is changed. Each
+milestone still trains fresh independent models, sharing only its W&B run identity and publication record.
+
+Validation (exact commands, environments, raw logs and exit codes: `outputs/sdw_fix/`):
+
+- Every unchanged independent probe ran against current source through the preload command recorded in
+  `probes_final.json`: **10 passed**, exit 0. The original evidence still points at its old snapshot and
+  was not edited. Twenty corresponding maintained cases were added, including delayed history, API
+  errors, migration, namespace preservation, summary repair and intent persistence.
+- Corrected affected integration subset: **11 passed**, exit 0 (`affected_2`). Maintained review/delay
+  subset: **16 passed**, exit 0 (`retries_2`); final API/legacy/intent guards: **4 passed**, exit 0 (`guards`).
+- Final downstream suite: **136 passed, 67 warnings in 394.74s (0:06:34)**, exit 0 (`downstream_final`). CPU only, CUDA hidden; installed Git
+  Bash and short temporary paths; OMP/MKL threads 1; W&B disabled for tests. No unrelated exploration,
+  denoiser, intrinsic-reward or model test suites were launched.
+- Early focused failures are preserved separately: a copied helper referenced `d` instead of
+  `downstream_module`; existing tests expected the old publication schema/status; an abandoned
+  after-training intent initially kept the wrong evaluate-only step/origin. These were corrected without
+  weakening probe assertions. Initial failure logs and corrected subset logs remain distinct.
+- Tiny online check on final source: [fresh smoke run](https://wandb.ai/models-national-tsing-hua-university7947/lcg-downstream-recovery-smoke-20261106-f3a996/runs/f583630b), exit 0. It copied a retained
+  Hopper evaluation report, queued one point, simulated interruption before local completion, flushed and
+  closed the SDK, reattached to the same run and reconciled three times. The server held exactly **one**
+  evaluation point with its original return. It performed no exploration, adaptation, policy evaluation,
+  dataset modification or GPU work. Earlier publication-smoke evidence is retained separately.
+- **The full repository suite was NOT rerun on final code**, per request. The prior independent review's
+  815-pass/6-CUDA-skip full-suite log is historical evidence only. No final full-suite pass is claimed.
+
+Remaining limits: the online check did not kill a real process or impose real service indexing delays;
+those failure paths use deterministic CPU mocks. Offline sync behavior and learning quality were not
+tested. Unresolvable historical origins/namespaces stay labelled rather than silently rewriting earlier
+server values. Earlier ZIPs and evidence remain unchanged; the new complete review package is
+`docs/changes/shared_downstream_wandb_fixed_20261106_review.zip` with a SHA-256 manifest and separate
+complete-worktree and correction-only diffs.

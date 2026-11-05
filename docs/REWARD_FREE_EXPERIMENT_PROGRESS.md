@@ -190,3 +190,14 @@ Details and status history: `REWARD_FREE_EXPERIMENT_NOTES.md`, Step 7.
 - Keep the separate running Stage 3 experiment untouched.
 - File formats: YAML for configuration, JSON (only) for generated metadata, JSONL for append-only training
   metrics (notes: "File formats: generated metadata is JSON only").
+
+
+### Downstream W&B recovery follow-up (2026-11-06)
+
+The five independently reproduced publication/recovery findings were corrected in the existing downstream
+module and tests, with bounded history verification, durable primary/origin/namespace metadata and summary
+repair. Final current-source probes: 10 passed. Final downstream suite: 136 passed, 67 warnings in 394.74s (0:06:34), exit 0.
+The fresh online publication-only smoke resumed the same run and retained one evaluation row; no training
+or evaluation ran. Existing launcher/configuration edits were preserved. The full repository suite was
+not rerun on final code. Exact commands, failures/corrections and limitations are in the notes' matching
+section and `outputs/sdw_fix/`; the new review ZIP preserves earlier packages and evidence.

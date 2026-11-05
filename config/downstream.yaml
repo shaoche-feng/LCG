@@ -65,16 +65,19 @@ analysis:
   exploration_seed: null
   protocol: null  # evaluation protocol id (eval_*_protocol-<id>.json), required when several exist
 
-# W&B: one run per milestone x task x adaptation seed x denoiser member (a folder launch starts one per child;
-# the launcher none). disabled (default) | offline | online. A resume continues the run named in the work
-# folder's wandb_run.json; evaluate-only adds to the output's run when it has one. Logging settings may
-# change on resume; they change no training.
+# W&B: disabled (default) | offline | online. One run per exploration run x task x adaptation seed x denoiser member,
+# shared by every milestone adapted for them (all of a folder, a milestone_steps selection or one milestone_path;
+# later commands join it). Its identity and publication state are in <run>/downstream/wandb_<task>_seed_<s>[_member_<k>].json:
+# the folder launcher prepares it (no run of its own) and each milestone's process attaches in turn; every
+# adaptation stays independent. Evaluation points count as published only when the server's history shows them;
+# missing ones are logged again by the next attachment. A resume continues the shared run; evaluate-only adds a
+# point to it. Logging settings may change on resume; they change no training.
 wandb:
   mode: disabled
-  project: null
+  project: null  # the launchers use one project per task group and task: <prefix>-<group>-<task>
   entity: null
-  name: null  # run-name prefix; null: the exploration run folder's name. Run: <prefix>-<milestone>-<task>-seed<s>[-member<k>]
-  group: null  # null: <prefix>-<task>-seed<s>[-member<k>] (all milestones of one exploration run, task and seed)
+  name: null  # used exactly; null: <method>-<domain>-exploration-seed<N>-<task>-adaptation-seed<s>[-member<k>]
+  group: null  # used exactly; null: the run name
   tags: null
   notes: null
 

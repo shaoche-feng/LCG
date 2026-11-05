@@ -117,8 +117,12 @@ def evaluation_path(output_dir: Path, task_name: str, seeds: List[int], max_step
                     policy_state: Dict[str, Any]) -> Path:
     """evaluations/eval_<task>_policy-<weights hash>_protocol-<seeds and step limit hash>.json"""
     policy = state_sha256({k: v for k, v in policy_state.items() if torch.is_tensor(v)})[:12]
-    protocol = hashlib.sha256(repr(([int(s) for s in seeds], int(max_steps))).encode()).hexdigest()[:12]
-    return Path(output_dir) / "evaluations" / f"eval_{task_name}_policy-{policy}_protocol-{protocol}.json"
+    return Path(output_dir) / "evaluations" / f"eval_{task_name}_policy-{policy}_protocol-{protocol_id(seeds, max_steps)}.json"
+
+
+def protocol_id(seeds: List[int], max_steps: int) -> str:
+    """The evaluation protocol identifier: a hash of the seeds and the step limit (12 hex digits)."""
+    return hashlib.sha256(repr(([int(s) for s in seeds], int(max_steps))).encode()).hexdigest()[:12]
 
 
 def milestone_name(num_steps: int) -> str:
@@ -131,6 +135,13 @@ def downstream_output_dir(milestone_path: Path, task_name: str, seed: int, membe
     milestone_path = Path(milestone_path)
     name = f"seed_{seed}" + (f"_member_{member_index}" if member_index else "")
     return milestone_path.parent.parent / "downstream" / milestone_path.name / task_name / name
+
+
+def shared_run_path(milestone_path: Path, task_name: str, seed: int, member_index: int = 0) -> Path:
+    """<run>/downstream/wandb_<task>_seed_<seed>[_member_<k>].json: the W&B run shared by every milestone of
+    the exploration run adapted for one task, adaptation seed and member (identity and publication state)."""
+    name = f"wandb_{task_name}_seed_{seed}" + (f"_member_{member_index}" if member_index else "")
+    return Path(milestone_path).parent.parent / "downstream" / f"{name}.json"
 
 
 def member_file(member_index: int) -> str:

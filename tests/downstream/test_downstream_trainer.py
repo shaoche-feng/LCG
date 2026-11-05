@@ -886,22 +886,54 @@ def test_folder_plan_singular_and_member_lines(tmp_path, capsys):
 
 class FakeWandb:
     """Stands in for the wandb module of downstream_trainer: init kwargs, axes, (step, row) logs, summary
-    and finish codes. starting_step and summary model what the W&B server holds for a resumed run."""
+    and finish codes. starting_step and summary model what the W&B server holds for a resumed run. With a
+    server (dict: run id -> dict(rows, summary)) one fake serves several processes of the same runs, as W&B
+    does: a resumed run starts after its last step and keeps its summary; a step below that is dropped."""
 
-    def __init__(self, run_id="dsrun1", starting_step=0, offline=False, summary=None):
+    def __init__(self, run_id="dsrun1", starting_step=0, offline=False, summary=None, server=None, lose=None,
+                 api_error=None):
         self.run, self.run_id, self.starting_step, self.offline = None, run_id, starting_step, offline
         self.inits, self.metrics, self.hidden, self.logged, self.finished = [], [], [], [], []
         self.summary = dict(summary or {})
+        self.server = server
+        self.lose = lose  # (step, row) -> True: logged (queued) but never reaches the server (died before upload)
+        self.api_error = api_error  # the server's history cannot be read (wandb.Api raises it)
+
+    def Api(self, timeout=None):
+        """The public API's view of the server's history (scan_history of a run's rows)."""
+        if self.api_error is not None:
+            raise self.api_error
+        if self.server is None:
+            raise RuntimeError("this fake has no server history")
+        server = self.server
+
+        class Run:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def scan_history(self, min_step=None, max_step=None):
+                return [dict(r, _step=s) for s, r in self.rows
+                        if (min_step is None or s >= min_step) and (max_step is None or s < max_step)]
+
+        class Api:
+            def run(self, path):
+                return Run(server[path.rsplit("/", 1)[1]]["rows"])
+        return Api()
 
     def Settings(self, **kwargs):
         return SimpleNamespace(**kwargs)
 
     def init(self, **kwargs):
         self.inits.append(kwargs)
-        self.run = SimpleNamespace(id=kwargs.get("id") or self.run_id, project=kwargs.get("project"),
+        run_id = kwargs.get("id") or self.run_id
+        starting_step = self.starting_step
+        if self.server is not None:
+            held = self.server.setdefault(run_id, dict(rows=[], summary={}))
+            starting_step = max([s for s, _ in held["rows"]], default=-1) + 1
+            self.summary = held["summary"]
+        self.run = SimpleNamespace(id=run_id, project=kwargs.get("project"),
                                    entity=kwargs.get("entity"), name=kwargs.get("name"), group=kwargs.get("group"),
-                                   url=f"https://wandb.test/{kwargs.get('id') or self.run_id}",
-                                   starting_step=self.starting_step, offline=self.offline)
+                                   url=f"https://wandb.test/{run_id}", starting_step=starting_step, offline=self.offline)
 
     def define_metric(self, name, step_metric=None, hidden=None):
         self.metrics.append((name, step_metric))
@@ -910,10 +942,19 @@ class FakeWandb:
 
     def log(self, row, step=None):
         self.logged.append((step, dict(row)))
+        if self.server is not None and not (self.lose and self.lose(step, row)):
+            rows = self.server[self.run.id]["rows"]
+            assert not rows or step > rows[-1][0], f"step {step} after {rows[-1][0]}: W&B would drop it"
+            rows.append((step, dict(row)))
 
     def finish(self, exit_code=0):
         self.finished.append(exit_code)
         self.run = None
+
+
+def shared_record(run, task="walk", seed=0):
+    """The shared W&B run record of an exploration run, task and adaptation seed."""
+    return json.loads((Path(run) / f"downstream/wandb_{task}_seed_{seed}.json").read_text())
 
 
 ONLINE = ["wandb.mode=online", "wandb.project=test-project"]
@@ -950,11 +991,15 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
     reward, policy, (evaluation,) = [r for _, r in fake.logged[:4]], [r for _, r in fake.logged[4:7]], [r for _, r in fake.logged[7:]]
 
     reward_keys = {f"reward_model/train/core/{k}" for k in ("loss_reward", "predicted_reward_mean", "target_reward_mean",
-                                                             "num_updates")} | (REWARD_DEBUG_KEYS if debug else set())
+                                                             "num_updates", "cumulative_updates")} | \
+        (REWARD_DEBUG_KEYS if debug else set()) | {"exploration/train_env_steps"}
     assert all(set(r) == reward_keys for r in reward) and [r[downstream_module.REWARD_AXIS] for r in reward] == [1, 2, 3, 4]
+    assert [r[downstream_module.REWARD_CUMULATIVE_AXIS] for r in reward] == [1, 2, 3, 4]  # the run's first milestone
     ac_keys = downstream_ac_keys(ac_schema, 6, debug)
     assert len(ac_keys) == (132 if debug else 39)
-    assert all(set(r) == ac_keys for r in policy) and [r[downstream_module.POLICY_AXIS] for r in policy] == [1, 2, 3]
+    assert all(set(r) == ac_keys | {downstream_module.POLICY_CUMULATIVE_AXIS, "exploration/train_env_steps"}
+               for r in policy) and [r[downstream_module.POLICY_AXIS] for r in policy] == [1, 2, 3]
+    assert all(r["exploration/train_env_steps"] == 26 for r in reward + policy)  # identifies the milestone
     published = set().union(*map(set, (r for _, r in fake.logged)))
     assert {k.split("/", 1)[0] for k in published} == {"reward_model", "actor_critic", "eval", "exploration"}
     assert not any("intrinsic" in k or "weights/" in k or "weight_" in k for k in published)
@@ -966,33 +1011,54 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
     if debug:
         assert [r["reward_model/train/debug/grad_norm"] for r in reward] == [r["grad_norm_before_clip"] for r in rows[:4]]
 
-    # Evaluation: one point at the milestone's recorded data budget; seed keys from the configured seeds.
+    # Evaluation: one point at the milestone's recorded data budget, under its protocol; seed keys from the
+    # configured seeds.
     (file,) = (output / "evaluations").iterdir()
     saved = OmegaConf.to_container(OmegaConf.load(file))
+    # The run's primary protocol publishes directly under eval/.
+    protocol = "protocol-" + analysis_module.protocol_id(file)
     assert evaluation == {**{f"eval/seed_{e['seed']}/return": e["episode_return"] for e in saved["episodes"]},
                           **{f"eval/return_{k}": saved[f"return_{k}"] for k in ("max", "median", "mean", "min", "std")},
                           "exploration/train_env_steps": 26}
-    assert sorted(k for k in evaluation if k.startswith("eval/seed_")) == [f"eval/seed_{s}/return" for s in (3001, 3002, 3005)]
+    assert sorted(k for k in evaluation if "/seed_" in k) == [f"eval/seed_{s}/return" for s in (3001, 3002, 3005)]
+    assert fake.summary[f"evaluation_protocols/{protocol}"] == dict(seeds=[3001, 3002, 3005], max_steps=3, namespace="eval")
+    assert saved["protocol_id"] == analysis_module.protocol_id(file)  # in the local report too
 
-    # Axes: reward and evaluation axes hidden; groups on their axes.
-    assert fake.metrics == [(downstream_module.REWARD_AXIS, None), ("reward_model/train/*", downstream_module.REWARD_AXIS),
-                            (downstream_module.POLICY_AXIS, None), ("actor_critic/train/*", downstream_module.POLICY_AXIS),
-                            ("exploration/train_env_steps", None), ("eval/*", "exploration/train_env_steps")]
-    assert fake.hidden == [downstream_module.REWARD_AXIS, "exploration/train_env_steps"]
+    # Axes: training metrics on the cumulative update axes, evaluations on the training env steps (all hidden).
+    assert fake.metrics == [(downstream_module.REWARD_CUMULATIVE_AXIS, None),
+                            ("reward_model/train/*", downstream_module.REWARD_CUMULATIVE_AXIS),
+                            (downstream_module.POLICY_CUMULATIVE_AXIS, None),
+                            ("actor_critic/train/*", downstream_module.POLICY_CUMULATIVE_AXIS),
+                            ("exploration/train_env_steps", None), ("eval/*", "exploration/train_env_steps"),
+                            ("eval_protocols/*", "exploration/train_env_steps")]
+    assert fake.hidden == [downstream_module.REWARD_CUMULATIVE_AXIS, downstream_module.POLICY_CUMULATIVE_AXIS,
+                           "exploration/train_env_steps"]
 
-    # Run identity, names and provenance; status; the identity file travels with the output.
+    # Run identity (the shared run's record), names and provenance; status; the identity file travels with the output.
+    record = shared_record(tmp_path / "run")
     (init,) = fake.inits
-    assert (init["name"], init["group"], init["job_type"], init["mode"]) == (
-        "uniform-walker-exploration-seed-unrecorded-steps_000026-walk-adaptation-seed0",
-        "uniform-walker-exploration-seed-unrecorded-walk-adaptation-seed0", "adaptation", "online")
+    default = "uniform-walker-exploration-seed-unrecorded-walk-adaptation-seed0"  # the manifest records no seed
+    assert (init["id"], init["resume"], init["name"], init["group"], init["job_type"], init["mode"]) == (
+        record["identity"]["id"], "allow", default, default, "adaptation", "online")
     provenance = init["config"]["provenance"]
     assert provenance["exploration"]["method"] == "not recorded" and provenance["exploration"]["collection_mode"] == "uniform"
     assert provenance["exploration"]["seed"].startswith("not recorded")
-    assert provenance["milestone"]["collected_steps"] == 26 and provenance["denoiser_member"]["index"] == 0
-    assert provenance["milestone"]["replay_sha256"] == trainer.milestone.manifest["files"]["dataset"]["sha256"]
-    assert provenance["denoiser_member"]["sha256"] == OmegaConf.load(output / "summary.json").milestone.member_sha256
+    assert "milestone" not in provenance and "milestone_path" not in init["config"]["initialization"]  # per milestone:
+    milestone_summary = fake.summary["milestones/steps_000026"]                                       # in the summary
+    assert milestone_summary["train_env_steps"] == 26 and milestone_summary["member_index"] == 0
+    assert milestone_summary["identity"] == trainer.milestone.manifest["identity"] and milestone_summary["status"] == "trained"
+    assert milestone_summary["member_sha256"] == OmegaConf.load(output / "summary.json").milestone.member_sha256
     assert provenance["controller"]["actor_objective"] == {"mode": "sign"} and provenance["evaluation"]["seeds"] == [3001, 3002, 3005]
-    assert json.loads((output / "wandb_run.json").read_text())["id"] == "dsrun1"
+    identity = json.loads((output / "wandb_run.json").read_text())
+    assert identity["id"] == record["identity"]["id"] and identity["shared_run"] == "../../../wandb_walk_seed_0.json"
+    assert record["milestones"]["steps_000026"]["first_step"] == 0 and record["next_step"] == 8
+    assert record["primary_protocol"] == dict(id=analysis_module.protocol_id(file), seeds=[3001, 3002, 3005], max_steps=3)
+    assert fake.summary["evaluation_protocols/primary"] == record["primary_protocol"]
+    assert init["config"]["provenance"]["evaluation"]["protocol"] == record["primary_protocol"]["id"]
+    assert record["evaluations"] == {f"steps_000026/walk/seed_0/evaluations/{file.name}": dict(
+        step=7, original_step=7, kind="after_training", status="unverified", attempted=True,
+        namespace="eval", protocol=record["primary_protocol"],
+        verification="unavailable (RuntimeError: this fake has no server history)")}
     assert fake.summary["status"] == "completed" and fake.finished == [0]
     assert fake.summary[f"evaluations/{file.stem}"]["kind"] == "after_training"
 
@@ -1030,25 +1096,134 @@ def test_reward_statistics_use_the_masked_transitions_and_task_rewards_pmpo_used
     assert row["task_reward_median"] == pytest.approx(torch.quantile(rew.flatten(), 0.5).item())
 
 
-def test_each_milestone_gets_its_own_run_and_the_folder_launcher_none(tmp_path, monkeypatch):
-    milestones = build_milestone(tmp_path, early=(2,)).parent
-    runs = []
+ONE_EVALUATION = ["evaluation.after_training=true", "evaluation.seeds=[3001]", "evaluation.max_steps=3"]
+
+
+class InProcessChildren:
+    """Runs the folder launcher's child commands in this process (their overrides composed as the child's Hydra
+    would), against one fake W&B server, as separate processes would reach the same W&B runs in turn."""
+
+    def __init__(self, monkeypatch, server, fail=None):
+        self.monkeypatch, self.server, self.fail, self.fakes, self.commands = monkeypatch, server, fail, [], []
+
+    def __call__(self, command, env=None):
+        self.commands.append(command)
+        overrides = [a for a in command[2:] if not a.startswith("--")]
+        fake = FakeWandb(server=self.server)
+        self.fakes.append(fake)
+        self.monkeypatch.setattr(downstream_module, "wandb", fake)
+        self.monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        cfg = compose("downstream", overrides)
+        try:
+            if self.fail is not None:
+                self.fail(len(self.commands))
+            DownstreamTrainer(cfg).run()
+        except Exception:  # a failed child process: nonzero exit
+            return subprocess.CompletedProcess(command, 1)
+        return subprocess.CompletedProcess(command, 0)
+
+
+def folder_launch(milestones, monkeypatch, server, *extra, fail=None):
+    """downstream_main.run_milestones with in-process children; the launcher itself must not start W&B."""
+    overrides = [f"initialization.milestones_dir={Path(milestones).as_posix()}", "downstream.task_name=walk",
+                 "common.devices=cpu", *TINY_DOWNSTREAM, *ONLINE, *ONE_EVALUATION, *extra]
+    cfg = compose("downstream", overrides)
+    folder, steps = downstream_main.pop_milestone_source(cfg)
+    base = downstream_main.child_command_base(fake_hydra(overrides))
+    parent = FakeWandb(server=server)
+    parent.init = lambda **kwargs: pytest.fail("the folder launcher started a W&B run")
+    monkeypatch.setattr(downstream_module, "wandb", parent)
+    children = InProcessChildren(monkeypatch, server, fail)
+    code = downstream_main.run_milestones(cfg, Path(folder), base, run=children, milestone_steps=steps)
+    return code, children
+
+
+def eval_points(rows):
+    """(train env steps, mean return) of every evaluation row of a run's history, in step order."""
+    return [(r["exploration/train_env_steps"], next(v for k, v in r.items() if k.endswith("/return_mean")))
+            for _, r in rows if any(k.startswith(("eval/", "eval_protocols/")) for k in r)]
+
+
+@pytest.mark.parametrize("selection", ["all", "subset", "single"])
+def test_selected_milestones_share_one_run_with_cumulative_axes(tmp_path, monkeypatch, selection):
+    """One W&B run for every milestone of one invocation (all of a folder, a milestone_steps subset, or one
+    milestone_path); each milestone's children attach in turn and none gets a run of its own. Each milestone
+    has its own block of steps, then one evaluation point at its training env steps."""
+    milestones = build_milestone(tmp_path, early=(1, 2)).parent  # 10, 20, 26 steps
+    server = {}
+    if selection == "single":
+        fake = FakeWandb(server=server)
+        logged_run(milestones / "steps_000020", monkeypatch, *ONE_EVALUATION, fake=fake)
+        fakes, expected = [fake], [20]
+    else:
+        extra = ["initialization.milestone_steps=[10,26]"] if selection == "subset" else []
+        code, children = folder_launch(milestones, monkeypatch, server, *extra)
+        assert code == 0
+        fakes, expected = children.fakes, [10, 26] if selection == "subset" else [10, 20, 26]
+    record = shared_record(tmp_path / "run")
+    run_id = record["identity"]["id"]
+    assert list(server) == [run_id]  # one run on the server, attached once per milestone
+    assert [f.inits[0]["id"] for f in fakes] == [run_id] * len(expected) and all(f.finished == [0] for f in fakes)
+    rows = server[run_id]["rows"]
+    assert [s for s, _ in rows] == list(range(8 * len(expected)))  # each block: 4 + 3 updates, then its evaluation
+    assert [steps for steps, _ in eval_points(rows)] == expected  # one point per selected milestone
+    assert sorted(e["collected_steps"] for e in record["milestones"].values()) == expected
+    reward = [r for _, r in rows if downstream_module.REWARD_AXIS in r]
+    policy = [r for _, r in rows if downstream_module.POLICY_AXIS in r]
+    # Cumulative axes across milestones; own counters restart (every milestone trains fresh models).
+    assert [r[downstream_module.REWARD_CUMULATIVE_AXIS] for r in reward] == list(range(1, 4 * len(expected) + 1))
+    assert [r[downstream_module.REWARD_AXIS] for r in reward] == [1, 2, 3, 4] * len(expected)
+    assert [r[downstream_module.POLICY_CUMULATIVE_AXIS] for r in policy] == list(range(1, 3 * len(expected) + 1))
+    assert [r["exploration/train_env_steps"] for r in policy] == [s for s in expected for _ in range(3)]
+    # Every adaptation keeps its own local outputs and counters.
+    for steps in expected:
+        output = tmp_path / f"run/downstream/steps_{steps:06d}/walk/seed_0"
+        assert json.loads((output / "summary.json").read_text())["num_updates"] == {"rew_end_model": 4, "actor_critic": 3}
+        assert [json.loads(line)["update"] for line in (output / "metrics.jsonl").read_text().splitlines()] == [1, 2, 3, 4, 1, 2, 3]
+        assert json.loads((output / "wandb_run.json").read_text())["id"] == run_id
+    assert sorted(p.name for p in (tmp_path / "run/downstream").iterdir()) == sorted(
+        [f"steps_{s:06d}" for s in expected] + ["wandb_walk_seed_0.json"])
+
+
+def test_explicit_run_names_are_used_exactly_and_a_different_one_is_refused(tmp_path, monkeypatch):
+    milestones = build_milestone(tmp_path, early=(1, 2)).parent
+    server = {}
+    names = ["wandb.name=lcg-walker--downstream-walk-es0-ds0", "wandb.group=lcg-walker--downstream-walk-es0-ds0"]
+    code, children = folder_launch(milestones, monkeypatch, server, *names, "initialization.milestone_steps=[10,20]")
+    assert code == 0
+    assert {(f.inits[0]["name"], f.inits[0]["group"]) for f in children.fakes} == {
+        ("lcg-walker--downstream-walk-es0-ds0", "lcg-walker--downstream-walk-es0-ds0")}  # no suffixes appended
+    record = shared_record(tmp_path / "run")
+    assert (record["identity"]["name"], record["identity"]["group"], record["identity"]["project"]) == (
+        "lcg-walker--downstream-walk-es0-ds0", "lcg-walker--downstream-walk-es0-ds0", "test-project")
+    # A later invocation for the same exploration run, task and seed joins that run; another explicit name is
+    # refused before anything is trained.
+    before = tree_hashes(tmp_path / "run")
+    with pytest.raises(ValueError, match="records the W&B run 'lcg-walker--downstream-walk-es0-ds0'.*wandb.name='other'"):
+        folder_launch(milestones, monkeypatch, server, "wandb.name=other", "initialization.milestone_steps=[26]")
+    assert tree_hashes(tmp_path / "run") == before
+    code, children = folder_launch(milestones, monkeypatch, server, *names, "initialization.milestone_steps=[26]")
+    assert code == 0 and children.fakes[0].inits[0]["id"] == record["identity"]["id"]
+    assert [steps for steps, _ in eval_points(server[record["identity"]["id"]]["rows"])] == [10, 20, 26]
+
+
+def test_shared_logging_changes_no_training(tmp_path, monkeypatch):
+    """Two milestones adapted into one shared run versus with W&B off: the later milestone's weights, metrics
+    and evaluation are identical (no warm start, no RNG draw by logging)."""
+    on = build_milestone(tmp_path / "on", early=(2,)).parent
+    off = build_milestone(tmp_path / "off", early=(2,)).parent
+    assert folder_launch(on, monkeypatch, {})[0] == 0
+    cfg, folder, base, _ = folder_cfg(off, *ONE_EVALUATION)
+    monkeypatch.setattr(downstream_module, "wandb", FakeWandb())
+    assert downstream_main.run_milestones(cfg, folder, base, run=InProcessChildren(monkeypatch, {})) == 0
+    assert not (tmp_path / "off/run/downstream/wandb_walk_seed_0.json").exists()
     for name in ("steps_000020", "steps_000026"):
-        fake = FakeWandb(run_id=f"id-{name}")
-        logged_run(milestones / name, monkeypatch, fake=fake)
-        runs.append((fake.inits[0]["name"], fake.inits[0]["group"], json.loads(
-            (tmp_path / f"run/downstream/{name}/walk/seed_0/wandb_run.json").read_text())["id"]))
-    group = "uniform-walker-exploration-seed-unrecorded-walk-adaptation-seed0"  # the manifest records no seed
-    assert runs == [("uniform-walker-exploration-seed-unrecorded-steps_000020-walk-adaptation-seed0", group, "id-steps_000020"),
-                    ("uniform-walker-exploration-seed-unrecorded-steps_000026-walk-adaptation-seed0", group, "id-steps_000026")]
-    # The launcher never touches W&B; its children keep the W&B settings (each starts its own run).
-    def no_parent_run(**kwargs):
-        raise AssertionError("the folder launcher started a W&B run")
-    monkeypatch.setattr(downstream_module.wandb, "init", no_parent_run)
-    cfg, folder, base, _ = folder_cfg(milestones, "downstream.seed=1", *ONLINE)
-    run = FakeRun()
-    assert downstream_main.run_milestones(cfg, folder, base, run=run) == 0
-    assert len(run.commands) == 2 and all({"wandb.mode=online", "wandb.project=test-project"} <= set(c) for c in run.commands)
+        a, b = (root / f"run/downstream/{name}/walk/seed_0" for root in (tmp_path / "on", tmp_path / "off"))
+        for weights in ("rew_end_model.pt", "actor_critic.pt"):
+            assert states_equal(torch.load(a / weights, weights_only=False), torch.load(b / weights, weights_only=False))
+        assert (a / "metrics.jsonl").read_bytes() == (b / "metrics.jsonl").read_bytes()
+        (x,), (y,) = (a / "evaluations").iterdir(), (b / "evaluations").iterdir()
+        assert x.name == y.name and x.read_bytes() == y.read_bytes()
 
 
 def test_evaluate_only_adds_to_the_adaptation_run_without_the_milestone(tmp_path, monkeypatch):
@@ -1063,24 +1238,36 @@ def test_evaluate_only_adds_to_the_adaptation_run_without_the_milestone(tmp_path
     fake = FakeWandb(starting_step=8)
     monkeypatch.setattr(downstream_module, "wandb", fake)
     path = downstream_module.evaluate_saved_output(cfg)
+    record = shared_record(tmp_path / "run")
     (init,) = fake.inits
-    assert init["id"] == "dsrun1" and init["resume"] == "allow"  # the adaptation run
+    assert init["id"] == record["identity"]["id"] and init["resume"] == "allow"  # the shared run
     ((step, row),) = fake.logged
     saved = OmegaConf.to_container(OmegaConf.load(path))
-    assert step == 8 and row["exploration/train_env_steps"] == 26 and row["eval/seed_9/return"] == saved["episodes"][1]["episode_return"]
+    first = "protocol-" + analysis_module.protocol_id(next(p for p in (output / "evaluations").iterdir() if p != path))
+    second = "protocol-" + analysis_module.protocol_id(path)
+    assert first != second  # another protocol: its own namespace, never the primary eval/ curves
+    assert step == 8 and row["exploration/train_env_steps"] == 26
+    assert row[f"eval_protocols/{second}/seed_9/return"] == saved["episodes"][1]["episode_return"]
+    assert not any(k.startswith("eval/") for k in row)
     assert fake.summary[f"evaluations/{path.stem}"]["kind"] == "evaluate_only" and fake.finished == [0]
+    assert fake.summary[f"evaluation_protocols/{second}"]["namespace"] == f"eval_protocols/{second}"
+    assert record["evaluations"][f"steps_000026/walk/seed_0/evaluations/{path.name}"] == dict(
+        step=8, original_step=8, kind="evaluate_only", status="unverified", attempted=True,
+        namespace=f"eval_protocols/{second}", protocol=downstream_module.configured_protocol(cfg),
+        verification="unavailable (RuntimeError: this fake has no server history)") and record["next_step"] == 9
     with pytest.raises(FileExistsError, match="not overwriting"):  # local overwrite protection unchanged
         downstream_module.evaluate_saved_output(cfg)
 
     # An output without a W&B identity (e.g. trained with W&B off): a new, labelled evaluate-only run.
     (output / "wandb_run.json").unlink()
+    (tmp_path / "run/downstream/wandb_walk_seed_0.json").unlink()
     cfg.evaluation.seeds = [7]
     fake = FakeWandb(run_id="evalonly")
     monkeypatch.setattr(downstream_module, "wandb", fake)
     downstream_module.evaluate_saved_output(cfg)
     (init,) = fake.inits
     assert "id" not in init and init["job_type"] == "evaluate-only" and init["name"] == (  # milestone and run configuration gone: only the saved domain is known
-        "unrecorded-walker-exploration-seed-unrecorded-steps_000026-walk-adaptation-seed0-evaluate-only")
+        "unrecorded-walker-exploration-seed-unrecorded-walk-adaptation-seed0-evaluate-only")
     assert init["config"]["provenance"]["exploration"]["method"] == "not recorded in the saved output"
     assert init["config"]["provenance"]["milestone"]["collected_steps"] == 26
     assert fake.logged[0][0] == 7 + 2  # after the training updates and the two earlier evaluation files
@@ -1128,7 +1315,8 @@ def test_evaluate_only_status_after_a_failed_final_evaluation_of_an_adaptation_r
     monkeypatch.setattr(downstream_module, "wandb", second)
     with pytest.raises(EvaluationFailure):
         downstream_module.evaluate_saved_output(evaluate_only_cfg(milestone, "evaluation.seeds=[3001,3002]"))
-    assert second.inits[0]["id"] == "dsrun1" and second.finished == [1] and not second.logged
+    run_id = shared_record(tmp_path / "run")["identity"]["id"]
+    assert second.inits[0]["id"] == run_id and second.finished == [1] and not second.logged
     assert (second.summary["status"], second.summary["activity"]) == ("failed", "evaluate_only")
     assert history(second.summary) == [dict(status="failed", activity="adaptation", error=first.summary["error"])]
 
@@ -1141,7 +1329,10 @@ def test_evaluate_only_status_after_a_failed_final_evaluation_of_an_adaptation_r
     assert "error" not in third.summary
     assert [h["activity"] for h in history(third.summary)] == ["adaptation", "evaluate_only"]
     ((step, row),) = third.logged
-    assert step == 7 and row["exploration/train_env_steps"] == 26 and set(row) >= {"eval/seed_3001/return", "eval/return_mean"}
+    # The next free step of the shared run (the failed after-training evaluation left its reserved step 7 unused);
+    # the same protocol as the run's primary one: under eval/.
+    assert step == 8 and row["exploration/train_env_steps"] == 26
+    assert set(row) >= {"eval/seed_3001/return", "eval/return_mean"}
     assert third.summary[f"evaluations/{path.stem}"]["kind"] == "evaluate_only"
 
     # The same policy and protocol again: refused before anything runs; W&B is not touched.
@@ -1708,9 +1899,10 @@ def test_default_wandb_names_identify_the_exploration_run(tmp_path):
         return downstream_module.run_names(cfg, run / "milestones" / milestone, member, members)
 
     lcg = synthetic_run(tmp_path, "lcg", steps=(300, 400))
-    assert names(lcg) == ("lcg-walker-exploration-seed0-steps_000300-walk-adaptation-seed0",
+    # One run for the milestones of one exploration run, task and seed: no milestone in the name; group = name.
+    assert names(lcg) == ("lcg-walker-exploration-seed0-walk-adaptation-seed0",
                           "lcg-walker-exploration-seed0-walk-adaptation-seed0")
-    assert names(lcg, "steps_000400")[1] == names(lcg)[1]  # milestones of one run, task and seed share the group
+    assert names(lcg, "steps_000400") == names(lcg)
     others = [synthetic_run(tmp_path, "uniform"), synthetic_run(tmp_path, "lcg", exploration_seed=1)]
     cheetah = synthetic_run(tmp_path / "c", "lcg")
     cfg = OmegaConf.load(cheetah / "config/exploration.yaml")
@@ -1720,8 +1912,10 @@ def test_default_wandb_names_identify_the_exploration_run(tmp_path):
     assert groups == {"lcg-walker-exploration-seed0-walk-adaptation-seed0", "uniform-walker-exploration-seed0-walk-adaptation-seed0",
                       "lcg-walker-exploration-seed1-walk-adaptation-seed0", "lcg-cheetah-exploration-seed0-walk-adaptation-seed0"}
     assert names(lcg, "steps_000300", 2, 5)[1] == "lcg-walker-exploration-seed0-walk-adaptation-seed0-member2"
-    assert names(lcg, "steps_000300", 0, None, "wandb.name=mine", "wandb.group=chosen") == (
-        "mine-steps_000300-walk-adaptation-seed0", "chosen")
+    # Explicit names are used exactly, nothing appended; an explicit name alone is also the group.
+    assert names(lcg, "steps_000300", 0, None, "wandb.name=mine", "wandb.group=chosen") == ("mine", "chosen")
+    assert names(lcg, "steps_000300", 0, None, "wandb.name=lcg-walker--downstream-walk-es0-ds0") == (
+        "lcg-walker--downstream-walk-es0-ds0", "lcg-walker--downstream-walk-es0-ds0")
     # Without the exploration run's saved configuration: what the manifest records, the rest labelled.
     (lcg / "config/exploration.yaml").unlink()
     assert downstream_module.exploration_label(lcg, dict(domain="walker", exploration=dict(method="lcg"))) == \

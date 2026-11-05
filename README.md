@@ -66,6 +66,28 @@ GPU=1 PYTHON=/home/bigking/anaconda3/envs/lcg/bin/python \
     bash scripts/smoke.sh
 ```
 
+### Downstream W&B logging
+
+All milestones adapted for one exploration run, task, adaptation seed and denoiser member share one W&B run: all milestones of a folder, a `milestone_steps` selection, or a single `milestone_path`. A later command for the same exploration run, task, seed and member joins that run.
+- **Record:** the run's identity and publication state are kept in `<run>/downstream/wandb_<task>_seed_<s>[_member_<k>].json`. The folder launcher prepares the record but starts no W&B run; each milestone's process attaches to the run in turn, so no milestone has a run of its own. An explicitly set `wandb.project`, `wandb.name` or `wandb.group` must equal the recorded one; otherwise the command is refused before training. To start a new run, move the record aside.
+- **Names:** `wandb.name` and `wandb.group` are used exactly as given. Without them the run is named `<method>-<domain>-exploration-seed<N>-<task>-adaptation-seed<s>`, and the group is the name.
+- **Independent adaptations:** every milestone is still adapted independently, with fresh models and its own outputs, `metrics.jsonl` and evaluation files. Logging changes no training.
+- **Charts:**
+  - training metrics are plotted against cumulative update axes (`reward_model/train/core/cumulative_updates`, `actor_critic/train/core/cumulative_updates`);
+  - the own counters of each adaptation (`reward_model/train/core/num_updates`, `actor_critic/train/core/num_batch_train_actor_critic`) are plotted too and restart at every milestone;
+  - every training row carries `exploration/train_env_steps`, which identifies its milestone;
+  - evaluations are logged against `exploration/train_env_steps`, one point per milestone. The run's primary protocol (its seeds and step limit, recorded in the shared-run record; normally the configured after-training protocol) publishes directly under `eval/` (`eval/return_{max,median,mean,min,std}`, `eval/seed_<s>/return`). Any other protocol, e.g. an evaluate-only with other seeds, publishes under `eval_protocols/protocol-<id>/…`, so incompatible protocols never share the `eval/` curves. The protocol identifier, seeds and step limit are in the W&B config (`provenance.evaluation`) and summary (`evaluation_protocols/…`) and in each local evaluation report (`protocol_id`).
+- **Steps:** each milestone has its own block of W&B steps, its updates followed by its after-training evaluation. Evaluate-only adds a point at the next free step.
+- **Resume:** a resume continues its block without duplicate rows.
+- **Evaluation publication:** before evaluation starts, the shared record saves its origin, protocol, step and publication namespace. New reports also retain `evaluation_kind`. Late primary selection is saved before logging; older records select their earliest recorded after-training protocol, including confirmed entries. Each point keeps its original namespace even if that protocol later becomes primary. An evaluation moves from `assigned` to `logged` (queued only), then `confirmed` when its server row matches:
+  - a point found there is confirmed and never logged again;
+  - history is checked up to three times, with 0.2 seconds between attempts; a missing point can retry its original step while appendable. Moving it to a new step requires repeated reads containing the indexed history tail, rather than an empty or lagging scan;
+  - neither a local `logged` state nor later server rows count as proof.
+
+  Offline, unavailable or unresolved history leaves an explicit `unverified` state and warning. A successful finish only verifies; it never republishes. Every attachment restores evaluation/protocol summaries, including already-confirmed points, without adding history rows. New appends use the live W&B watermark, including recovered evaluations.
+- **Limitation:** W&B steps only increase. If another process or evaluation recovery has closed an interrupted milestone's block, its remaining training rows stay in `metrics.jsonl` with an explicit warning; its evaluation uses an appendable step. Bounded verification relies on W&B's indexed history prefix; uncertain tails remain unverified for a later attachment. Offline synchronization and arbitrarily out-of-order service indexing are not covered by a local exactly-once guarantee.
+- **Older outputs:** work folders from before shared runs resume their own runs, and outputs without a record keep the earlier evaluate-only behaviour.
+
 Exploration (one method, one domain/task group, one seed):
 
 ```bash

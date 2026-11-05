@@ -13,9 +13,9 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 
 from data.milestone import (SUMMARY_FILE, discover_milestones, downstream_output_dir, downstream_summary, load_milestone,
-                            milestone_members, read_manifest)
+                            milestone_members, read_json, read_manifest, shared_run_path)
 from utils import device_lines
-from downstream_trainer import DownstreamTrainer, evaluate_saved_output, seed_span
+from downstream_trainer import DownstreamTrainer, evaluate_saved_output, open_shared_run, run_names, seed_span
 from utils import say, setup_visible_cuda_devices
 
 
@@ -141,6 +141,12 @@ def run_milestones(cfg: DictConfig, milestones_dir: Path, base: List[str],
     task, seed = cfg.downstream.task_name, cfg.downstream.seed
     member = OmegaConf.select(cfg, "initialization.member_index", default=0)
     selected, available = preflight(milestones_dir, task, seed, member, base, check_milestone_steps(milestone_steps))
+    if OmegaConf.select(cfg, "wandb.mode", default="disabled") != "disabled":
+        # The one W&B run of every selected milestone: its record is prepared here (the launcher starts no W&B
+        # run); each child attaches to it in turn, so no milestone gets a run of its own.
+        path, manifest, _ = selected[0]
+        name, group = run_names(cfg, path, member, milestone_members(manifest), manifest)
+        open_shared_run(cfg, shared_run_path(path, task, seed, member), name, group)
     announce(cfg, "Milestones folder", milestones_dir, [(path, manifest) for path, manifest, _ in selected],
              selection=None if milestone_steps is None else
              f"selected by initialization.milestone_steps from {plural(available, 'milestone')} in the folder")
@@ -213,7 +219,16 @@ def announce(cfg: DictConfig, label: str, source: Path, milestones: List[Tuple[P
     else:
         lines.append("  Evaluation: none after training (evaluation.after_training=false)")
     root = downstream_output_dir(milestones[0][0], task, seed, member).parents[2]  # <run>/downstream
-    lines += [f"  Output root: {root.resolve()}", "=" * 78, "",
+    lines.append(f"  Output root: {root.resolve()}")
+    if OmegaConf.select(cfg, "wandb.mode", default="disabled") != "disabled":
+        record = shared_run_path(milestones[0][0], task, seed, member)
+        if record.is_file():  # prepared by the folder launcher, or from an earlier command
+            r = read_json(record, "shared W&B run record")["identity"]
+            lines.append(f"  W&B run: {r['name']} (id {r['id']}, project {r['project']}), shared by every milestone")
+        else:
+            lines.append(f"  W&B run: {run_names(cfg, milestones[0][0], member, None)[0]} (project "
+                         f"{OmegaConf.select(cfg, 'wandb.project')}), shared by every milestone")
+    lines += ["=" * 78, "",
               f"Downstream batch: {plural(len(milestones), 'milestone')}" + (f" ({selection})" if selection else ""),
               f"  Domain: {', '.join(sorted({m['domain'] for _, m in milestones}))}; task: {task}",
               f"  Adaptation seed: {seed}"]
