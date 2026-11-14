@@ -1,4 +1,4 @@
-"""LCG preset: selected reference scaling and policy schedule, shared environment/model
+"""LCG preset: selected data scaling and policy schedule, shared environment/model
 settings, fixed and reference reward integration, and resume compatibility."""
 import pytest
 import torch
@@ -25,7 +25,8 @@ def test_lcg_100k_preset_resolves_the_agreed_settings():
     assert (lcg.theta_s.expected_num_tensors, lcg.theta_s.expected_dim) == (10, 217_664)
     assert (lcg.candidate_num_mc, lcg.candidate_chunk_size) == (5, 32)
     assert (lcg.precision_reference_size, lcg.precision_num_mc, lcg.damping, lcg.beta) == (320, 3, 1e-4, 1.0)
-    assert lcg.reward_scaling_settings() == dict(mode="reference", reference_num_prompts=32)
+    assert lcg.reward_scaling_settings() == dict(mode="data_scaled", fixed_divisor=100.0, data_reference_steps=5500)
+    assert (lcg.reference_num_prompts, lcg.rms_enabled) == (None, False)
     assert (cfg.actor_critic.training.steps_first_epoch, cfg.actor_critic.training.steps_per_epoch) == (200, 200)
     # The environment, replay budget, denoiser and PMPO schedules, milestones and models match
     # uniform (which never uses its PMPO schedule). LCG's exploration objective is the explicit difference.
@@ -50,9 +51,12 @@ def test_lcg_100k_preset_resolves_the_agreed_settings():
 
 def test_lcg_preset_rejects_a_mismatched_parameter_block_before_any_work(tmp_path, monkeypatch):
     # The tiny test denoiser has no u_blocks.3: the preset's R1 pattern must fail when the
-    # model is built, before any collection, checkpoint or training.
+    # model is built, before any collection, checkpoint or training. The shared tiny settings switch the
+    # scorer to RMS; restore the preset's data scaling (its divisor and anchor are inherited unchanged).
     with pytest.raises(ValueError, match="matched no parameters"):
         run_trainer(tmp_path, monkeypatch, ["+experiment=lcg_100k", "wandb.mode=disabled",
+                                            "intrinsic_reward.reward_scaling=data_scaled",
+                                            "intrinsic_reward.rms_enabled=false",
                                             "env.train.task_names=[stand,walk]",
                                             "intrinsic_reward.theta_s.include=[unet.u_blocks.3.resblocks.0.*]",
                                             *COLLECT], build_only=True)

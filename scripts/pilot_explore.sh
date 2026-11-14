@@ -32,16 +32,15 @@ ADAPTATION_SEED="${ADAPTATION_SEED:-0}"
 GPU="${GPU:?Set GPU, e.g. 0 or 1}"
 PYTHON="${PYTHON:-python}"
 
-EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-reward-free-exploration}"
+EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-reward-free-exploration-analysis}"
 # One downstream W&B project per task group and task, shared by methods and seeds:
-# <DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>.
-DOWNSTREAM_PROJECT_PREFIX="${DOWNSTREAM_PROJECT_PREFIX:-reward-free-downstream}"
+
 
 PRESET="${PRESET:?Set PRESET, e.g. lcg_100k}"
 LABEL="${LABEL:?Set LABEL, e.g. lcg}" # output label of the method (data/milestone.py OUTPUT_LABELS)
 
-OUTPUT_ROOT="$REPO_ROOT/outputs/$LABEL"
-LOG_ROOT="$REPO_ROOT/logs/$LABEL"
+OUTPUT_ROOT="$REPO_ROOT/outputs/exploration_analysis/$LABEL"
+LOG_ROOT="$REPO_ROOT/logs/exploration_analysis/$LABEL"
 
 # Computation and EGL rendering on the selected physical GPU.
 export CUDA_VISIBLE_DEVICES="$GPU"
@@ -56,11 +55,11 @@ export PYTHONUNBUFFERED=1
 TASK_GROUPS=(
     'walker|walker|stand,walk,run'
     'hopper|hopper|stand,hop'
-    'acrobot|acrobot|swingup,swingup_sparse'
-    'cartpole-balance|cartpole|balance,balance_sparse'
-    'cartpole-swingup|cartpole|swingup,swingup_sparse'
-    'humanoid|humanoid|stand,walk,run,run_pure_state'
-    'humanoid_CMU|humanoid_CMU|stand,walk,run'
+    #'acrobot|acrobot|swingup,swingup_sparse'
+    #'cartpole-balance|cartpole|balance,balance_sparse'
+    #'cartpole-swingup|cartpole|swingup,swingup_sparse'
+    #'humanoid|humanoid|stand,walk,run,run_pure_state'
+    #'humanoid_CMU|humanoid_CMU|stand,walk,run'
 )
 
 # -------------------------------------------------------------------

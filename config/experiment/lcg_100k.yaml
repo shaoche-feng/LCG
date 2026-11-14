@@ -1,8 +1,9 @@
 # @package _global_
 # LCG exploration: PMPO on the LCG score of imagined transitions (no task reward), the scorer refreshed
 # once per epoch on that epoch's denoiser and replay. Scoring settings (R1 selector and guards, probes,
-# historical precision, reference reward scaling): config/intrinsic_reward/lcg.yaml, the default group.
-# Schedule, milestones and diagnostics: config/exploration.yaml.
+# historical precision): config/intrinsic_reward/lcg.yaml, the default group; this preset replaces its
+# reference reward scaling with data scaling (below). Schedule, milestones and diagnostics:
+# config/exploration.yaml.
 #
 #   python src/exploration_main.py +experiment=lcg_100k env.train.domain_name=<domain> \
 #       "env.train.task_names=[<tasks>]" common.seed=<seed> common.devices=<gpu> [hydra.run.dir=<run folder>]
@@ -15,3 +16,12 @@ agent:
   actor_critic:
     actor_objective: advantage_weighted
     advantage_weight_cap: 5.0
+
+# Data scaling (docs/implement/REWARD_SCALING.md): policy reward = raw / d with
+# d = fixed_divisor * data_reference_steps / N, N the replay size at each refresh. Anchored at the
+# first refresh's replay (5,000 initial + 500 steps), where it equals raw / 100.
+intrinsic_reward:
+  reward_scaling: data_scaled
+  fixed_divisor: 100
+  data_reference_steps: 5500
+  reference_num_prompts: null

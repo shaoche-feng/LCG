@@ -12,7 +12,7 @@ This project studies task-agnostic exploration with DIAMOND-style diffusion worl
 - Inspect the actual checkout, resolved configuration and current code before making changes. Do not assume an old server path or worktree is the active repository.
 - Treat saved configurations and executable code as the description of existing behavior. Design documents describe intent; the notes record implementation changes and limitations. Report contradictions instead of silently choosing a historical description.
 - Historical Stage 3 Beta/H15 experiments are context, not this repository’s current controller specification. Do not copy their settings or results into the reward-free experiment as defaults.
-- Current software implementation and bounded validation are complete. Selected: the 100k schedule and milestones under "Environment and schedules", the method settings in `config/intrinsic_reward/` (LCG: R1, reference reward scaling with 32 prompts), and the downstream budgets (5,000 reward-predictor + 10,000 policy updates). Still open: the exploration evaluation reset seeds, the exploration-seed design, W&B identities and server-specific launch settings (see the launch checklist).
+- Current software implementation and bounded validation are complete. Selected: the 100k schedule and milestones under "Environment and schedules", the method settings in `config/intrinsic_reward/` (LCG: R1; the `lcg_100k` preset on branch `reward_free_experiment_analysis` selects data reward scaling, `fixed_divisor` 100 and `data_reference_steps` 5,500, over the group's reference scaling with 32 prompts, which the 100k pilot used), and the downstream budgets (5,000 reward-predictor + 10,000 policy updates). Still open: the exploration evaluation reset seeds, the exploration-seed design, W&B identities and server-specific launch settings (see the launch checklist).
 
 ## Working rules
 
@@ -105,7 +105,7 @@ The shared agent config’s actor objective remains sign-only (downstream uses i
 | Output label | Preset | Current distinguishing settings |
 | --- | --- | --- |
 | `uniform` | `uniform_100k` | Uniform actions throughout; denoiser only; no intrinsic reward or PMPO training |
-| `lcg` | `lcg_100k` | R1 selector, candidate MC 5, chunk 32, historical reference 320 with MC 3, damping 1e-4, beta 1; reference reward scaling (32 prompts; see `docs/implement/REWARD_SCALING.md`) |
+| `lcg` | `lcg_100k` | R1 selector, candidate MC 5, chunk 32, historical reference 320 with MC 3, damping 1e-4, beta 1; data reward scaling set by the preset (`fixed_divisor` 100, `data_reference_steps` 5,500; the group default `lcg.yaml` keeps reference scaling with 32 prompts; see `docs/implement/REWARD_SCALING.md`) |
 | `full-ensemble` | `ensemble_100k` | 5 independently initialized denoisers; episode bootstrap enabled; shared diffusion noise; pixel disagreement |
 | `plan2explore` | `plan2explore_100k` | One denoiser; 5 independent lightweight MLP predictors; replay-feature cache; bootstrap enabled; feature disagreement |
 | `laplace-ensemble` | `laplace_100k` | One denoiser; 5 sampled R1 parameter sets; shared LCG historical precision; temperature 1; pixel disagreement |
