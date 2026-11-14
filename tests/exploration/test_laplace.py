@@ -493,7 +493,8 @@ def test_milestones_hold_the_unperturbed_denoiser_and_load_downstream(tmp_path, 
     path = Path("milestones/steps_000024")
     milestone = load_milestone(path, "walk")
     manifest = milestone.manifest
-    assert sorted(manifest["files"]) == ["dataset", "denoiser"] and "ensemble" not in manifest
+    assert sorted(manifest["files"]) == ["dataset", "denoiser", "exploration_policy", "parameter_bank"]
+    assert "ensemble" not in manifest
     assert manifest["exploration"]["method"] == "laplace_disagreement" and manifest["laplace"]["num_members"] == 3
     assert same(milestone.denoiser_state, trainer.agent.denoiser.state_dict())  # base, not a sample
     monkeypatch.syspath_prepend(str(base.ROOT / "tests" / "downstream"))

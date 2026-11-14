@@ -818,7 +818,9 @@ def test_milestones_are_single_denoiser_with_provenance_and_load_downstream(tmp_
     path = Path("milestones/steps_000024")
     milestone = load_milestone(path, "walk")
     manifest = milestone.manifest
-    assert sorted(manifest["files"]) == ["dataset", "denoiser"] and "ensemble" not in manifest
+    assert sorted(manifest["files"]) == sorted(["dataset", "denoiser", "exploration_policy", "plan2explore_normalization",
+                                                 *(f"MLP_member_{k}" for k in (1, 2, 3))])
+    assert "ensemble" not in manifest
     assert manifest["exploration"]["method"] == "plan2explore_disagreement"
     assert manifest["plan2explore"]["num_members"] == 3 and manifest["plan2explore"]["feature_dim"] == 64
     assert same(milestone.denoiser_state, trainer.agent.denoiser.state_dict())

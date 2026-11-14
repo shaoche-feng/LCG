@@ -7,6 +7,12 @@ Layout inside a run folder:
     milestones/steps_NNNNNN/dataset.pt     replay index (episode versions, checksums, lengths, labels)
     milestones/steps_NNNNNN/manifest.json  what the milestone is, with file checksums
 
+Exploration runs also save, at each milestone, the frozen scorer and exploration policy that
+collect the next batch (docs/analysis/restore_scorer.md; ExplorationTrainer.scorer_files):
+exploration_policy.pt (learned methods), MLP_member_<k>.pt and plan2explore_normalization.pt
+(Plan2Explore), parameter_bank.pt (Laplace), historical_precision.pt, jvp_probe_bank.pt and
+lcg_scaling.pt (LCG). Downstream adaptation does not read them.
+
 All paths are relative to the milestone folder, so the whole run folder can be moved.
 Episode files are the dataset's immutable versions (`<id>_<length>.pt`), shared with
 checkpoints and other milestones rather than copied.
@@ -182,14 +188,21 @@ def publish_milestone(
     manifest: Dict[str, Any],
     member_states: Optional[List[Dict[str, torch.Tensor]]] = None,
     successor_physical_states: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+    scorer_files: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Publish a complete milestone folder atomically (written aside, then renamed). An
     existing milestone is kept if it holds the same training state, otherwise rejected.
     member_states: ensemble members 1..K-1 (member 0 is denoiser_state).
-    successor_physical_states: analysis only, the physical state of successor observations."""
+    successor_physical_states: analysis only, the physical state of successor observations.
+    scorer_files: exploration state saved beside the milestone, file name -> object (torch.save),
+    listed in the manifest's files under the file name's stem."""
     milestones_dir = Path(milestones_dir)
     final = milestones_dir / name
     member_states = member_states or []
+    scorer_files = scorer_files or {}
+    reserved = {DENOISER_FILE, DATASET_FILE, MANIFEST_FILE, *(member_file(k) for k in range(1, len(member_states) + 1))}
+    if reserved & set(scorer_files) or not all(f.endswith(".pt") and "/" not in f for f in scorer_files):
+        raise ValueError(f"Invalid milestone scorer file names: {sorted(scorer_files)}")
     identity = dict(denoiser_sha256=state_sha256(denoiser_state), dataset_sha256=index_sha256(dataset),
                     **{k: manifest[k] for k in ("epoch", "collected_steps", "counters")})
     if member_states:
@@ -228,6 +241,8 @@ def publish_milestone(
         saved["successor_physical_states"] = {k: {n: v.cpu().clone() for n, v in s.items()}
                                               for k, s in successor_physical_states.items()}
     torch.save(saved, tmp / DATASET_FILE)
+    for file_name, value in scorer_files.items():
+        torch.save(value, tmp / file_name)
     manifest = dict(
         schema_version=SCHEMA_VERSION,
         **manifest,
@@ -236,6 +251,7 @@ def publish_milestone(
             dataset=dict(path=DATASET_FILE, sha256=file_sha256(tmp / DATASET_FILE)),
             **{f"denoiser_member_{k}": dict(path=member_file(k), sha256=file_sha256(tmp / member_file(k)))
                for k in range(1, len(member_states) + 1)},
+            **{Path(f).stem: dict(path=f, sha256=file_sha256(tmp / f)) for f in scorer_files},
         ),
         identity=identity,
     )

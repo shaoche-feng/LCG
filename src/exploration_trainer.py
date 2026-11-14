@@ -1484,12 +1484,69 @@ class ExplorationTrainer(StateDictMixin):
                 selected_include=list(lap.cfg.theta_s.include), selected_dim=int(lap.dim),
                 refresh_epoch=lap.refresh_epoch, refreshes=int(lap.refreshes),
                 note="denoiser.pt is the unperturbed base model; sampled members are not part of the milestone")
+        scorer_files = self.scorer_files()
+        if self._method is not None:
+            manifest["scorer_checkpoint"] = dict(
+                files=sorted(scorer_files), spec="docs/analysis/restore_scorer.md",
+                note="the frozen scorer and exploration policy of this epoch's PMPO phase, which collect the next "
+                     "batch; ensemble members are the denoiser files" if scorer_files else
+                     "no scorer refresh or PMPO phase yet: nothing to save")
         path = publish_milestone(self._path_milestones, name, self.agent.denoiser.state_dict(),
                                  self.train_dataset, successors, manifest, member_states,
-                                 successor_physical_states=self.successor_physical_states())
+                                 successor_physical_states=self.successor_physical_states(),
+                                 scorer_files=scorer_files)
         say(f"Milestone {name} published: > {Path(path).resolve()}")
         self.milestone_summary(name)
         return path
+
+    def scorer_files(self) -> Dict[str, Any]:
+        """The milestone's scorer checkpoint (docs/analysis/restore_scorer.md), file name -> object:
+        the frozen scorer state and exploration policy of this epoch's PMPO phase (milestones are
+        published after it), i.e. what collects the next batch. Taken from the same state the
+        checkpoint saves; uniform and a learned method before its first refresh save nothing."""
+        if self._method is None or int(self.agent.actor_critic.updates.item()) == 0:
+            return {}
+        cpu = lambda state: {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in state.items()}
+        # The whole controller module (actor with its encoder, critic, buffers, extra state): the
+        # run's resolved actor_critic config loads it with load_state_dict.
+        files = {"exploration_policy.pt": cpu(self.agent.actor_critic.state_dict())}
+        if self._lcg_lifecycle is not None:
+            s = self._lcg_lifecycle.state_dict()
+            if s is not None:
+                files["historical_precision.pt"] = dict(
+                    h_D=s["h_D"], theta_s_names=s["theta_s_names"], theta_s_dim=s["theta_s_dim"], round_id=s["round_id"],
+                    representation="diagonal, the selected parameters flattened and concatenated in theta_s_names order "
+                                   "(names below denoiser.inner_model)")
+                files["jvp_probe_bank.pt"] = dict(**s["bank"], round_id=s["round_id"],
+                                                  order="candidate MC samples in bank order (JVPBank fields)")
+                files["lcg_scaling.pt"] = dict(reward_scaling=s["settings"]["reward_scaling"],
+                                               reward_divisor=s["reward_divisor"],
+                                               reference_raw_mean=s["reference_raw_mean"], rms_s2=s["rms_s2"],
+                                               round_id=s["round_id"], replay_steps=int(self.train_dataset.num_steps),
+                                               settings=s["settings"])
+        if self.plan2explore is not None and self.plan2explore.heads is not None:
+            p2e = self.plan2explore
+            for k, head in enumerate(p2e.heads, start=1):
+                files[f"MLP_member_{k}.pt"] = cpu(head.state_dict())
+            files["plan2explore_normalization.pt"] = dict(
+                mean=p2e.mean.cpu(), std=p2e.std.cpu(), raw_std=None if p2e.raw_std is None else p2e.raw_std.cpu(),
+                feature_std_floor=float(p2e.cfg.feature_std_floor), refresh_epoch=p2e.last_refresh_epoch,
+                use="standardize(features) = (features - mean) / std, std already floored; raw_std is monitoring only")
+        if self.laplace is not None and self.laplace.perturbations is not None:
+            lap = self.laplace
+            delta, members, offset = lap.perturbations.detach().cpu(), {}, 0
+            for name, shape in zip(lap.names, lap.shapes):
+                n = int(np.prod(shape))
+                members[name] = delta[:, offset:offset + n].reshape(delta.shape[0], *shape).clone()
+                offset += n
+            files["parameter_bank.pt"] = dict(
+                perturbations=members, names=list(lap.names), shapes=[list(s) for s in lap.shapes],
+                refresh_epoch=lap.refresh_epoch, bank_seed=lap.bank_seed(lap.refresh_epoch),
+                posterior_temperature=float(lap.cfg.posterior_temperature),
+                representation="additive: member k's parameter = base (denoiser.pt) + perturbations[name][k]; "
+                               "names below denoiser.inner_model; members in sample order")
+        # Full ensemble: its members are already the milestone's denoiser files.
+        return files
 
     def milestone_summary(self, name: str) -> None:
         """A published milestone's identity in the W&B summary (milestones/<name>)."""
