@@ -4,15 +4,15 @@ set -euo pipefail
 # Run inside tmux. Replace GPU=0 with GPU=1 to use the second GPU.
 #
 # Full ensemble:
-#   GPU=0 LABEL=full-ensemble bash scripts/run_100k_pilot_adapt.sh
+#   GPU=0 LABEL=full-ensemble bash scripts/pilot_downstream.sh
 # LCG:
-#   GPU=0 LABEL=lcg bash scripts/run_100k_pilot_adapt.sh
+#   GPU=0 LABEL=lcg bash scripts/pilot_downstream.sh
 # Laplace ensemble:
-#   GPU=0 LABEL=laplace-ensemble bash scripts/run_100k_pilot_adapt.sh
+#   GPU=0 LABEL=laplace-ensemble bash scripts/pilot_downstream.sh
 # Plan2Explore:
-#   GPU=0 LABEL=plan2explore bash scripts/run_100k_pilot_adapt.sh
+#   GPU=0 LABEL=plan2explore bash scripts/pilot_downstream.sh
 # Uniform:
-#   GPU=0 LABEL=uniform bash scripts/run_100k_pilot_adapt.sh
+#   GPU=0 LABEL=uniform bash scripts/pilot_downstream.sh
 #
 # Adapt each task at ten milestones, sequentially.
 # Seeds default to 0; override with EXPLORATION_SEED and ADAPTATION_SEED.

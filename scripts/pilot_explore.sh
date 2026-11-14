@@ -4,15 +4,15 @@ set -euo pipefail
 # Run inside tmux. Replace GPU=0 with GPU=1 to use the second GPU.
 #
 # Full ensemble:
-#   GPU=0 PRESET=ensemble_100k LABEL=full-ensemble bash scripts/run_100k_pilot.sh
+#   GPU=0 PRESET=ensemble_100k LABEL=full-ensemble bash scripts/pilot_explore.sh
 # LCG:
-#   GPU=0 PRESET=lcg_100k LABEL=lcg bash scripts/run_100k_pilot.sh
+#   GPU=0 PRESET=lcg_100k LABEL=lcg bash scripts/pilot_explore.sh
 # Laplace ensemble:
-#   GPU=0 PRESET=laplace_100k LABEL=laplace-ensemble bash scripts/run_100k_pilot.sh
+#   GPU=0 PRESET=laplace_100k LABEL=laplace-ensemble bash scripts/pilot_explore.sh
 # Plan2Explore:
-#   GPU=0 PRESET=plan2explore_100k LABEL=plan2explore bash scripts/run_100k_pilot.sh
+#   GPU=0 PRESET=plan2explore_100k LABEL=plan2explore bash scripts/pilot_explore.sh
 # Uniform:
-#   GPU=0 PRESET=uniform_100k LABEL=uniform bash scripts/run_100k_pilot.sh
+#   GPU=0 PRESET=uniform_100k LABEL=uniform bash scripts/pilot_explore.sh
 #
 # Phase 1: explore all six listed task groups.
 # Phase 2: adapt only 100k milestones.
