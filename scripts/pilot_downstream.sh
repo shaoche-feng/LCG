@@ -1,35 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Full-ensemble Walker adaptation, exploration seed 0 and adaptation seed 0, on one GPU, in the foreground
-# (run it inside tmux), with no exploration phase:
-#   GPU=1 PYTHON=/path/to/python bash scripts/walker_pilot_adapt/adapt_ensemble_100k_walker.sh
-# Needs outputs/full-ensemble/walker/seed_0/milestones from scripts/walker_pilot/run_ensemble_100k_walker.sh,
-# whose pilot downstream/ folder has been archived as downstream_pilot_<attempt>; the milestones, replay and
-# archived pilot outputs are only read.
-# Stand, walk and run, one task at a time: each adapts the ten selected milestones (10k-100k, including a
-# fresh 100k adaptation) independently (+experiment=downstream_10_milestones), with the production budgets
-# of config/downstream.yaml.
-# Online W&B: the normal task-specific downstream projects, one shared run per task.
+# Run inside tmux. Replace GPU=0 with GPU=1 to use the second GPU.
+#
+# Full ensemble:
+#   GPU=0 LABEL=full-ensemble bash scripts/run_100k_pilot_adapt.sh
+# LCG:
+#   GPU=0 LABEL=lcg bash scripts/run_100k_pilot_adapt.sh
+# Laplace ensemble:
+#   GPU=0 LABEL=laplace-ensemble bash scripts/run_100k_pilot_adapt.sh
+# Plan2Explore:
+#   GPU=0 LABEL=plan2explore bash scripts/run_100k_pilot_adapt.sh
+# Uniform:
+#   GPU=0 LABEL=uniform bash scripts/run_100k_pilot_adapt.sh
+#
+# Adapt each task at ten milestones, sequentially.
+# Seeds default to 0; override with EXPLORATION_SEED and ADAPTATION_SEED.
+# Resume interrupted exploration: bash scripts/resume.sh <run folder>
 
 # Run from the repository root.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # -------------------------------------------------------------------
 # Editable launch settings
 # -------------------------------------------------------------------
-EXPLORATION_SEED=0
-ADAPTATION_SEED=0
+EXPLORATION_SEED="${EXPLORATION_SEED:-0}"
+ADAPTATION_SEED="${ADAPTATION_SEED:-0}"
 
-GPU="${GPU:-0}"
+GPU="${GPU:?Set GPU, e.g. 0 or 1}"
 PYTHON="${PYTHON:-python}"
 
 # One downstream W&B project per task group and task, shared by methods and seeds:
 # <DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>.
 DOWNSTREAM_PROJECT_PREFIX="${DOWNSTREAM_PROJECT_PREFIX:-reward-free-downstream}"
 
-LABEL=full-ensemble  # output label of the method (data/milestone.py OUTPUT_LABELS)
+LABEL="${LABEL:?Set LABEL, e.g. lcg}"   # output label of the method (data/milestone.py OUTPUT_LABELS)
 
 OUTPUT_ROOT="$REPO_ROOT/outputs/$LABEL"
 LOG_ROOT="$REPO_ROOT/logs/$LABEL"
@@ -44,6 +50,12 @@ export PYTHONUNBUFFERED=1
 # Group label | actual dm_control domain | adapted tasks
 TASK_GROUPS=(
     'walker|walker|stand,walk,run'
+    'hopper|hopper|stand,hop'
+    'acrobot|acrobot|swingup,swingup_sparse'
+    'cartpole-balance|cartpole|balance,balance_sparse'
+    'cartpole-swingup|cartpole|swingup,swingup_sparse'
+    'humanoid|humanoid|stand,walk,run,run_pure_state'
+    'humanoid_CMU|humanoid_CMU|stand,walk,run'
 )
 
 # -------------------------------------------------------------------
@@ -123,8 +135,8 @@ ERROR_LOG="$ATTEMPT_DIR/launcher.stderr.log"
 exec > >(tee -a "$LAUNCH_LOG") \
      2> >(tee -a "$ERROR_LOG" >&2)
 
-printf 'Full-ensemble Walker adaptation | GPU %s | exploration seed %s | adaptation seed %s\n' \
-    "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
+printf '%s adaptation | GPU %s | exploration seed %s | adaptation seed %s\n' \
+    "$LABEL" "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
 printf 'Outputs: %s\nTerminal logs: %s\n' "$OUTPUT_ROOT" "$ATTEMPT_DIR"
 
 # -------------------------------------------------------------------
@@ -140,5 +152,5 @@ for entry in "${TASK_GROUPS[@]}"; do
     done
 done
 
-printf '\nAll Full-ensemble Walker adaptations completed.\n'
+printf '\nAll %s adaptations completed.\n' "$LABEL"
 printf 'Terminal logs: %s\n' "$ATTEMPT_DIR"

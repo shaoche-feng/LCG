@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Uniform, exploration seed 0 and adaptation seed 0, on one GPU, in the foreground (run it inside tmux):
-#   GPU=1 PYTHON=/path/to/python bash scripts/run_uniform_100k.sh
-# Phase 1 explores all seven task groups (+experiment=uniform_100k); phase 2 then adapts every task of every
-# group on the ten selected milestones (+experiment=downstream_10_milestones), one task at a time.
-# Training and evaluation budgets come from config/exploration.yaml and config/downstream.yaml.
-# Resume an interrupted exploration run with scripts/resume.sh <run folder>.
+# Run inside tmux. Replace GPU=0 with GPU=1 to use the second GPU.
+#
+# Full ensemble:
+#   GPU=0 PRESET=ensemble_100k LABEL=full-ensemble bash scripts/run_100k_pilot.sh
+# LCG:
+#   GPU=0 PRESET=lcg_100k LABEL=lcg bash scripts/run_100k_pilot.sh
+# Laplace ensemble:
+#   GPU=0 PRESET=laplace_100k LABEL=laplace-ensemble bash scripts/run_100k_pilot.sh
+# Plan2Explore:
+#   GPU=0 PRESET=plan2explore_100k LABEL=plan2explore bash scripts/run_100k_pilot.sh
+# Uniform:
+#   GPU=0 PRESET=uniform_100k LABEL=uniform bash scripts/run_100k_pilot.sh
+#
+# Phase 1: explore all six listed task groups.
+# Phase 2: adapt only 100k milestones.
+# Seeds default to 0; override with EXPLORATION_SEED and ADAPTATION_SEED.
+# Resume interrupted exploration: bash scripts/resume.sh <run folder>
 
 # Run from the repository root.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,10 +26,10 @@ cd "$REPO_ROOT"
 # -------------------------------------------------------------------
 # Editable launch settings
 # -------------------------------------------------------------------
-EXPLORATION_SEED=0
-ADAPTATION_SEED=0
+EXPLORATION_SEED="${EXPLORATION_SEED:-0}"
+ADAPTATION_SEED="${ADAPTATION_SEED:-0}"
 
-GPU="${GPU:-0}"
+GPU="${GPU:?Set GPU, e.g. 0 or 1}"
 PYTHON="${PYTHON:-python}"
 
 EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-reward-free-exploration}"
@@ -26,8 +37,8 @@ EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-reward-free-exploration}"
 # <DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>.
 DOWNSTREAM_PROJECT_PREFIX="${DOWNSTREAM_PROJECT_PREFIX:-reward-free-downstream}"
 
-PRESET=uniform_100k
-LABEL=uniform  # output label of the method (data/milestone.py OUTPUT_LABELS)
+PRESET="${PRESET:?Set PRESET, e.g. lcg_100k}"
+LABEL="${LABEL:?Set LABEL, e.g. lcg}" # output label of the method (data/milestone.py OUTPUT_LABELS)
 
 OUTPUT_ROOT="$REPO_ROOT/outputs/$LABEL"
 LOG_ROOT="$REPO_ROOT/logs/$LABEL"
@@ -43,6 +54,7 @@ export PYTHONUNBUFFERED=1
 #
 # Separate Cartpole labels prevent the two groups sharing an output.
 TASK_GROUPS=(
+    'walker|walker|stand,walk,run'
     'hopper|hopper|stand,hop'
     'acrobot|acrobot|swingup,swingup_sparse'
     'cartpole-balance|cartpole|balance,balance_sparse'
@@ -82,44 +94,6 @@ run_exploration() {
 }
 
 # -------------------------------------------------------------------
-# Downstream: one milestones folder and one task
-# The Python launcher processes the ten selected milestones sequentially.
-# -------------------------------------------------------------------
-run_downstream() {
-    local group="$1"
-    local task="$2"
-
-    local run_dir="$OUTPUT_ROOT/$group/seed_$EXPLORATION_SEED"
-    local milestones_dir="$run_dir/milestones"
-    local log_name="${group}--downstream-${task}-es${EXPLORATION_SEED}-ds${ADAPTATION_SEED}"
-    local log_file="$ATTEMPT_DIR/${log_name}.log"
-
-    if [[ ! -d "$milestones_dir" ]]; then
-        printf 'Missing milestones folder: %s\n' "$milestones_dir" >&2
-        return 1
-    fi
-
-    printf '\n=== Downstream: %s / %s ===\n' "$group" "$task"
-    printf 'Milestones: %s\nLog: %s\n' "$milestones_dir" "$log_file"
-
-    # One W&B run, named and grouped ${LABEL}-${log_name}, shared by the ten milestones; each milestone
-    # is still adapted independently, in its own child process and output folder.
-    "$PYTHON" -u src/downstream_main.py \
-        +experiment=downstream_10_milestones \
-        "initialization.milestones_dir=$milestones_dir" \
-        "downstream.task_name=$task" \
-        "downstream.seed=$ADAPTATION_SEED" \
-        downstream.mode=train \
-        "common.devices=$GPU" \
-        wandb.mode=online \
-        "wandb.project=${DOWNSTREAM_PROJECT_PREFIX}-${group}-${task}" \
-        "wandb.group=${LABEL}-${log_name}" \
-        "wandb.name=${LABEL}-${log_name}" \
-        > >(tee "$log_file") \
-        2> >(tee "${log_file%.log}.stderr.log" >&2)
-}
-
-# -------------------------------------------------------------------
 # Preflight: refuse existing exploration outputs before starting work.
 # Resume interrupted runs separately with scripts/resume.sh.
 # -------------------------------------------------------------------
@@ -148,8 +122,8 @@ ERROR_LOG="$ATTEMPT_DIR/launcher.stderr.log"
 exec > >(tee -a "$LAUNCH_LOG") \
      2> >(tee -a "$ERROR_LOG" >&2)
 
-printf 'Uniform experiment | GPU %s | exploration seed %s | adaptation seed %s\n' \
-    "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
+printf '%s experiment | GPU %s | exploration seed %s | adaptation seed %s\n' \
+    "$LABEL" "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
 printf 'Outputs: %s\nTerminal logs: %s\n' "$OUTPUT_ROOT" "$ATTEMPT_DIR"
 
 # -------------------------------------------------------------------
@@ -160,18 +134,5 @@ for entry in "${TASK_GROUPS[@]}"; do
     run_exploration "$group" "$domain" "$tasks"
 done
 
-# -------------------------------------------------------------------
-# Phase 2: adapt every task, one task at a time.
-# Each task adapts ten milestones before the next task starts.
-# -------------------------------------------------------------------
-for entry in "${TASK_GROUPS[@]}"; do
-    IFS='|' read -r group domain tasks <<< "$entry"
-    IFS=',' read -r -a task_list <<< "$tasks"
-
-    for task in "${task_list[@]}"; do
-        run_downstream "$group" "$task"
-    done
-done
-
-printf '\nAll Uniform exploration and downstream runs completed.\n'
+printf '\nAll %s exploration and downstream runs completed.\n' "$LABEL"
 printf 'Terminal logs: %s\n' "$ATTEMPT_DIR"
