@@ -1,6 +1,6 @@
 # LCG reward scaling
 
-How the LCG scorer's raw score becomes the PMPO policy reward. Implementation and selected configuration independently checked on 2026-11-04, from `7c1a383` on branch `lcg-reward-scaling`. This document is `docs/REWARD_SCALING.md`; there is no second repository-root copy.
+How the LCG scorer's raw score becomes the PMPO policy reward. Implementation and selected configuration independently checked on 2026-11-04, from `7c1a383` on branch `lcg-reward-scaling`. This document is `docs/implement/REWARD_SCALING.md`; there is no second repository-root copy.
 
 ## Raw score and policy reward
 

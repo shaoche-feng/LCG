@@ -105,7 +105,7 @@ The shared agent config’s actor objective remains sign-only (downstream uses i
 | Output label | Preset | Current distinguishing settings |
 | --- | --- | --- |
 | `uniform` | `uniform_100k` | Uniform actions throughout; denoiser only; no intrinsic reward or PMPO training |
-| `lcg` | `lcg_100k` | R1 selector, candidate MC 5, chunk 32, historical reference 320 with MC 3, damping 1e-4, beta 1; reference reward scaling (32 prompts; see `docs/REWARD_SCALING.md`) |
+| `lcg` | `lcg_100k` | R1 selector, candidate MC 5, chunk 32, historical reference 320 with MC 3, damping 1e-4, beta 1; reference reward scaling (32 prompts; see `docs/implement/REWARD_SCALING.md`) |
 | `full-ensemble` | `ensemble_100k` | 5 independently initialized denoisers; episode bootstrap enabled; shared diffusion noise; pixel disagreement |
 | `plan2explore` | `plan2explore_100k` | One denoiser; 5 independent lightweight MLP predictors; replay-feature cache; bootstrap enabled; feature disagreement |
 | `laplace-ensemble` | `laplace_100k` | One denoiser; 5 sampled R1 parameter sets; shared LCG historical precision; temperature 1; pixel disagreement |
@@ -193,7 +193,7 @@ outputs/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<N>/
 - Terminal losses, PMPO diagnostics, separate timing summaries and memory are hidden. Exploration displays intrinsic training statistics and per-seed intrinsic evaluation returns. Downstream displays only the evaluation aggregate summary and saved paths, not per-seed returns.
 - Do not log downstream task returns during exploration. Keep task reward columns in replay.
 - Exploration diagnostics are controlled by `evaluation.should`, `evaluation.every` and `evaluation.collect_test`. Fresh/reused metadata stays in artifacts/summary, not terminal noise.
-- Four-seed intrinsic evaluation is supported, but current defaults do NOT pin four reset seeds: periodic collection defaults to 4 episodes, final collection to 100, and both reset-seed lists are null. Set the protocol explicitly when required. Extra test interactions are counted separately, including final collection.
+- The exploration test protocol is pinned in `config/exploration.yaml` (also in the saved configs of the 100k pilot runs): 4 periodic episodes (`collection.test.num_episodes`) with `evaluation.reset_seeds` 3001–3004, and 30 final episodes (`collection.test.num_final_episodes`) with `evaluation.final_reset_seeds` 3001–3030, one environment (`collection.test.num_envs: 1`). The trainer requires each episode count to equal its seed list's length. A null seed list draws a random seed per collection (the earlier behaviour). Extra test interactions are counted separately, including final collection.
 - Preserve periodic diagnostics and one final diagnostic after exploration training. Evaluation must restore RNG and each submodule’s own mode and must not update frozen reward scaling.
 - W&B debug metrics are off by default. Current Walker schemas: exploration actor_critic 43 keys (148 with debug), downstream actor_critic 39 (132 with debug), downstream reward_model 4 (8 with debug), plus configured evaluation returns. Different action dimensions change per-dimension counts.
 - Exploration training curves use component update counters. Downstream: one W&B run per exploration run × task × adaptation seed × member, shared by the selected milestones (record `<run>/downstream/wandb_<task>_seed_<s>.json`; each milestone attaches in turn, adaptations stay independent); training curves on cumulative update axes with the own counters and `exploration/train_env_steps` per row; evaluations of the run's primary protocol (recorded in its shared-run record) under `eval/*`, other protocols under `eval_protocols/protocol-<id>/*`, against the milestone’s exploration training steps. Launchers use one downstream project per task group and task and pass `wandb.name`/`wandb.group` exactly. Preserve existing W&B identities on resume/evaluate-only.
@@ -226,7 +226,26 @@ outputs/comparisons/<domain>/exploration_seed_<N>/<task>/adaptation_seed_<N>/
 
 ## Documentation and review
 
-Read the existing documents relevant to the task: `docs/DM_CONTROL_TASK_COMPATIBILITY.md`, `docs/LAPLACE_ENSEMBLE_DESIGN.md`, `docs/LAPLACE_PRECISION_AUDIT.md`, `docs/PLAN2EXPLORE_DESIGN.md`, `docs/REWARD_SCALING.md`, `docs/REWARD_FREE_EXPERIMENT_NOTES.md` and `docs/REWARD_FREE_EXPERIMENT_PROGRESS.md`. They are tracked in Git; `docs/changes/` (review packages) is gitignored. Update existing files rather than adding parallel trackers.
+Read the existing documents relevant to the task. They are tracked in Git:
+
+```text
+docs/
+  AGENTS.md                                    this guide
+  implement/                                   design, implementation and launch records
+    DM_CONTROL_TASK_COMPATIBILITY.md           verified reward-label task groups
+    LAPLACE_ENSEMBLE_DESIGN.md                 Laplace-sampled ensemble design
+    LAPLACE_PRECISION_AUDIT.md                 what LCG's historical precision computes
+    PLAN2EXPLORE_DESIGN.md                     Plan2Explore adaptation design
+    REWARD_SCALING.md                          LCG policy-reward scaling modes
+    REWARD_FREE_EXPERIMENT_NOTES.md            as-built step notes and evidence
+    REWARD_FREE_EXPERIMENT_PROGRESS.md         to-do list and status
+    REWARD_FREE_EXPERIMENT_LAUNCH_CHECKLIST.md production launch checklist
+  analysis/
+    reward_free_experiment_analysis.md         checks for the pilot and later results
+  changes/                                     review packages (gitignored)
+```
+
+Update existing files rather than adding parallel trackers.
 
 Review packages should contain the requested complete current source/config/scripts/tests, a diff against the stated starting commit, exact commands/exit codes, evidence and SHA-256 manifest. Exclude credentials, caches, large weights and replay unless specifically requested. Codex performs independent review; do not describe an implementation as approved before that review.
 

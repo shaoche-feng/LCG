@@ -1,8 +1,8 @@
 # Plan2Explore Adapted to DIAMOND: Design and Research Basis
 
 Date: 2026-10-26\
-Status: implemented and verified by tests and a bounded local GPU smoke (2026-10-26, commit `cd78477`); implementation notes in `docs/REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6, "Plan2Explore-style lightweight ensemble disagreement". Not scientifically validated: no feature diagnostic, online pilot, downstream comparison or full run.\
-Canonical repository path: `docs/PLAN2EXPLORE_DESIGN.md`. This corrects the earlier filename typos.
+Status: implemented and verified by tests and a bounded local GPU smoke (2026-10-26, commit `cd78477`); implementation notes in `docs/implement/REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6, "Plan2Explore-style lightweight ensemble disagreement". Not scientifically validated: no feature diagnostic, online pilot, downstream comparison or full run.\
+Canonical repository path: `docs/implement/PLAN2EXPLORE_DESIGN.md`. This corrects the earlier filename typos.
 
 ## 1. Purpose and scope
 

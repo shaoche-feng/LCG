@@ -1,6 +1,6 @@
 # Precision audit for the Laplace-sampled ensemble
 
-Date: 2026-10-26. Code at base `cd78477` plus the Laplace change (committed as `9176c13`). Paths and line numbers are as of that code; `src/lcg/` is now `src/intrinsic_reward/lcg/` (`88bc7a2`). This audit records what LCG's historical precision actually computes before it is reused as an inverse covariance. Required by `docs/LAPLACE_ENSEMBLE_DESIGN.md`, Section 5.
+Date: 2026-10-26. Code at base `cd78477` plus the Laplace change (committed as `9176c13`). Paths and line numbers are as of that code; `src/lcg/` is now `src/intrinsic_reward/lcg/` (`88bc7a2`). This audit records what LCG's historical precision actually computes before it is reused as an inverse covariance. Required by `docs/implement/LAPLACE_ENSEMBLE_DESIGN.md`, Section 5.
 
 ## 1. Where it is computed
 
@@ -63,5 +63,5 @@ theta_not_S = theta_hat_not_S
   - Their std is therefore close to 1/sqrt(1e-4) = 100.
 - **Relative perturbation size.** Each sample's perturbation norm was ~2,500x, ~1,900x and ~1,160x the norm of the selected weights.
 - **Effect on images (corrected 2026-10-27).** The earlier statement here, that the effect was modest because members differ from the base by RMSE 0.14-0.18 with no saturated values, was wrong. It was inferred from those statistics without looking at images. The frozen-model diagnostic's image sheets show that at T = 1 every member's completed prediction is a nearly uniform grey frame with the walker gone, on both the final checkpoint and the epoch-2 milestone. The members agree with each other (spread RMS 0.017) but have all lost the content (99% of member-to-base deviation is common shift).
-- **Outside the local approximation.** The raw-output change at T = 1 bears little relation to the first-order (JVP) prediction (relative error ~1.0-1.5), so the curvature-based Gaussian is used far outside the region where it describes the network. See `docs/REWARD_FREE_EXPERIMENT_NOTES.md`, "Review corrections and frozen-model diagnostic".
+- **Outside the local approximation.** The raw-output change at T = 1 bears little relation to the first-order (JVP) prediction (relative error ~1.0-1.5), so the curvature-based Gaussian is used far outside the region where it describes the network. See `docs/implement/REWARD_FREE_EXPERIMENT_NOTES.md`, "Review corrections and frozen-model diagnostic".
 - **No tuning.** As the design requires, temperature, damping and sample norms were not changed in response to these results.

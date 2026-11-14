@@ -1,8 +1,8 @@
 # Reward-Free Experiment — Step Notes
 
 Implementation notes for each completed step. The checklist and next step are in
-`docs/REWARD_FREE_EXPERIMENT_PROGRESS.md`; task-group evidence is in
-`docs/DM_CONTROL_TASK_COMPATIBILITY.md`.
+`docs/implement/REWARD_FREE_EXPERIMENT_PROGRESS.md`; task-group evidence is in
+`docs/implement/DM_CONTROL_TASK_COMPATIBILITY.md`.
 
 ## Step 2 — Data collection
 
@@ -19,7 +19,7 @@ Commit `3ba08f3`; verified locally 2026-10-15, `lcg` env, 253 tests passed.
   (`REWARD_LABEL_TASK_GROUPS`): acrobot, cartpole (two groups), hopper, humanoid,
   humanoid_CMU, walker. Structure (task/physics class, MuJoCo model, timestep, time limit,
   action spec) is also checked at construction. Evidence, exclusions and source references
-  for all 19 installed domains: `docs/DM_CONTROL_TASK_COMPATIBILITY.md`.
+  for all 19 installed domains: `docs/implement/DM_CONTROL_TASK_COMPATIBILITY.md`.
 - Stored as `Episode.task_rew` (T x tasks) and `Episode.task_names`, sliced with segments
   (`Segment/Batch.task_rew`); `Dataset.task_names` rejects mixed labels.
 - Not yet reward-free: `Episode.rew` (first task) still trains the reward/end model and
@@ -243,7 +243,7 @@ After a crash past a checkpoint, the failed line reads `resumable work folder <.
   `walker_plan2explore_100k`). Implemented and verified (44 tests, full suite 462 passed after the review corrections;
   local-GPU smoke with bit-identical resume, exact refit reproduction, downstream milestone
   loading); done (`cd78477`). Settings are placeholders; no feature diagnostic, pilot or full run.
-  Notes: `REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6; design: `docs/PLAN2EXPLORE_DESIGN.md`.
+  Notes: `REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6; design: `docs/implement/PLAN2EXPLORE_DESIGN.md`.
 - [x] Laplace-sampled ensemble (one denoiser; 5 Gaussian samples of the LCG-selected R1
   parameters from LCG's own historical precision, T = 1; full-ensemble pixel disagreement and
   member selection; preset `walker_laplace_100k`). Implemented and verified as software (tests
@@ -561,7 +561,7 @@ behaviour, schedules or algorithms). Review: `docs/changes/step6_ensemble_config
 
 ### Plan2Explore-style lightweight ensemble disagreement (2026-10-26)
 
-Commit `cd78477` (base `ea3356d`); implemented and verified locally (`lcg` env). Review: `docs/changes/step6_plan2explore_review.zip`. Design and research basis: `docs/PLAN2EXPLORE_DESIGN.md` (Sections 1-12). An adaptation of Plan2Explore, not a reproduction; every numeric setting is a placeholder.
+Commit `cd78477` (base `ea3356d`); implemented and verified locally (`lcg` env). Review: `docs/changes/step6_plan2explore_review.zip`. Design and research basis: `docs/implement/PLAN2EXPLORE_DESIGN.md` (Sections 1-12). An adaptation of Plan2Explore, not a reproduction; every numeric setting is a placeholder.
 
 #### Files and commands
 
@@ -713,8 +713,8 @@ After each denoiser phase, inside the PMPO branch of `train_agent`:
 
 Not yet committed (base `cd78477`); implemented and verified locally (`lcg` env).
 - Review: `docs/changes/step6_laplace_ensemble_review.zip`.
-- Design: `docs/LAPLACE_ENSEMBLE_DESIGN.md`.
-- Precision audit: `docs/LAPLACE_PRECISION_AUDIT.md`.
+- Design: `docs/implement/LAPLACE_ENSEMBLE_DESIGN.md`.
+- Precision audit: `docs/implement/LAPLACE_PRECISION_AUDIT.md`.
 
 This is a Laplace-inspired, curvature-based subnetwork ensemble: not a calibrated posterior, not independently trained models, and not an information-gain reward.
 
@@ -2943,7 +2943,7 @@ Hydra targets in `config/intrinsic_reward/*.yaml` are now `intrinsic_reward.lcg.
 - **New runs:** they copy the new package; a test runs the copied trainer and checks it imports `intrinsic_reward` from the run folder.
 - **Intentional remaining old names:**
   - the Laplace settings label `precision.source = "lcg.lcg_historical_precision"`, recorded in checkpoints and W&B and compared on resume; changing it would change saved contents;
-  - `docs/LAPLACE_PRECISION_AUDIT.md` and earlier notes, evidence and review packages, historical records of the layout when written;
+  - `docs/implement/LAPLACE_PRECISION_AUDIT.md` and earlier notes, evidence and review packages, historical records of the layout when written;
   - historical run folders' copied sources.
 
 **Before/after equivalence** (`equivalence.py`):

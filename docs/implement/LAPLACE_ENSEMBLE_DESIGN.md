@@ -1,8 +1,8 @@
 # Laplace-sampled diffusion ensemble disagreement
 
 Date: 2026-10-26\
-Status: agreed initial design; implemented 2026-10-26/27 and committed in `9176c13` (modules later moved under `src/intrinsic_reward/`, `88bc7a2`; file paths below are as of the design). Tests pass. In the bounded local GPU smoke the training state (models, optimizers, sample bank, replay, collector/env incl. task RNG) matched across the uninterrupted and the resumed runs; the resumed run's final test episode diverged from step 260 (cause not isolated), so its two exact comparisons failed and the smoke driver's overall exit status was 1. Not experimentally validated. A frozen-model diagnostic (2026-10-27) found that at T = 1 every sampled member predicts a blank grey frame, a sampling-scale concern reported without tuning. Implementation notes: `docs/REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6, "Laplace-sampled diffusion ensemble"; precision audit: `docs/LAPLACE_PRECISION_AUDIT.md`.\
-Intended repository path: `docs/LAPLACE_ENSEMBLE_DESIGN.md`.
+Status: agreed initial design; implemented 2026-10-26/27 and committed in `9176c13` (modules later moved under `src/intrinsic_reward/`, `88bc7a2`; file paths below are as of the design). Tests pass. In the bounded local GPU smoke the training state (models, optimizers, sample bank, replay, collector/env incl. task RNG) matched across the uninterrupted and the resumed runs; the resumed run's final test episode diverged from step 260 (cause not isolated), so its two exact comparisons failed and the smoke driver's overall exit status was 1. Not experimentally validated. A frozen-model diagnostic (2026-10-27) found that at T = 1 every sampled member predicts a blank grey frame, a sampling-scale concern reported without tuning. Implementation notes: `docs/implement/REWARD_FREE_EXPERIMENT_NOTES.md`, Step 6, "Laplace-sampled diffusion ensemble"; precision audit: `docs/implement/LAPLACE_PRECISION_AUDIT.md`.\
+Intended repository path: `docs/implement/LAPLACE_ENSEMBLE_DESIGN.md`.
 
 ## 1. Goal and agreed choices
 

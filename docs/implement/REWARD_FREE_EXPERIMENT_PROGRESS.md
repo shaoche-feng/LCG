@@ -13,7 +13,7 @@ Starting commit: `b976a6e`
 
 Task rewards are recorded separately during exploration and used only for downstream training. Downstream training uses no additional real interactions; evaluation is counted separately.
 
-**Agreed design:** one exploration run per verified compatible task group: one dataset and one shared denoiser, with each task's reward recorded separately. At each selected milestone, the frozen denoiser and matching dataset train a fresh reward predictor and policy per task. Domain and task selection stay configurable. Start with Walker Stand/Walk/Run. Groups and evidence: `docs/DM_CONTROL_TASK_COMPATIBILITY.md`.
+**Agreed design:** one exploration run per verified compatible task group: one dataset and one shared denoiser, with each task's reward recorded separately. At each selected milestone, the frozen denoiser and matching dataset train a fresh reward predictor and policy per task. Domain and task selection stay configurable. Start with Walker Stand/Walk/Run. Groups and evidence: `docs/implement/DM_CONTROL_TASK_COMPATIBILITY.md`.
 
 ## Checklist
 
@@ -70,7 +70,7 @@ Task rewards are recorded separately during exploration and used only for downst
   Both keep the reward scale steady and prevent the critic's late overestimation (positive-advantage fraction at
   10k steps 0.70 / 0.79 vs 0.32). Downstream walk: data-scaled 60.8, reference 65.4 vs LCG-200 57.3 (+3.5 +- 4.0,
   +8.2 +- 5.3); within noise on one seed pair. Notes: "LCG policy-reward scaling". Later committed with reference
-  scaling selected in `walker_lcg_100k` (`e5b1e61`; `docs/REWARD_SCALING.md`).
+  scaling selected in `walker_lcg_100k` (`e5b1e61`; `docs/implement/REWARD_SCALING.md`).
   Continuation to 15,000 steps (2026-11-04; both scaling arms resumed from epoch 10 for 10 more epochs with the new
   ExplorationTrainer.extend_collection_budget, committed as `1c557b3`, 716 tests pass, 57/57 checks, 2.1 GPU-hours per arm). Downstream walk at
   15k: data-scaled 40.7, reference 50.6 (10k: 60.8, 65.4), both lower than at 10k (-20.1 +- 4.1, -14.8 +- 5.9);
