@@ -1,15 +1,19 @@
-"""Analysis of the collected exploration dataset at milestones (CPU only). Nothing is trained, collected or
+"""Analysis of the collected exploration dataset at milestones. Nothing is trained, collected or
 evaluated; milestones are only read, with the downstream loader data.milestone.load_milestone: every manifest
 file is checked against its checksum, and the replay is the exact episode versions the milestone refers to,
-each checked against its recorded checksum. Only the replay is analysed; the denoiser weights it also loads
-(on CPU) are not used.
+each checked against its recorded checksum.
 
 Tests (docs/analysis/reward_free_experiment_analysis.md, "Collected exploration dataset"); --test is repeatable:
 - task-reward-coverage: per task, the fraction of the replay's transitions whose reward exceeds the task's
   threshold and the fraction of episodes with at least one such transition.
 - task-reward-lasting: bouts of consecutive above-threshold transitions, kept within episode boundaries;
   per-bout lengths, per-episode counts (episodes with zero bouts included) and a summary.
-- follow-intrinsic-reward: not implemented here; it needs the restored scorer checkpoints.
+- follow-intrinsic-reward (run on its own): the frozen scorer saved at one milestone of a learned method
+  (docs/analysis/restore_scorer.md) scores the next recorded collection window of that run and the same step
+  range of a separate Uniform run; see "Follow intrinsic reward" below.
+
+The coverage and lasting tests read only the replay (CPU); the denoiser weights load_milestone also loads are
+not used.
 
 Rewards are the recorded native task rewards (Episode.task_rew) in their stored units: each environment step
 sums the reward of its executed action-repeat substeps (data.milestone.RETURN_CONVENTION). A transition is
@@ -25,7 +29,35 @@ Writes into --output (never overwriting): coverage.csv; lasting_summary.csv, las
 lasting_bouts.csv; analysis.json (sources, thresholds, tests). Episodes unfinished at the milestone cut are
 marked, and a bout reaching such an episode's last stored step is marked censored_at_cut.
 
-This module imports neither trainer nor envs: with MUJOCO_GL=egl, importing dm_control opens the GPU devices.
+Follow intrinsic reward
+-----------------------
+    python src/exploration_analysis.py --test follow-intrinsic-reward --method lcg \
+        --milestone <lcg run>/milestones/steps_N --uniform-run <uniform run> --output <folder> \
+        [--scoring-seed 0] [--device cpu|cuda]
+
+- Scorer: rebuilt from the milestone alone -- its denoiser file(s) and scorer checkpoint files (LCG:
+  historical_precision.pt, jvp_probe_bank.pt, lcg_scaling.pt; Plan2Explore: MLP_member_<k>.pt,
+  plan2explore_normalization.pt and the action bounds of exploration_policy.pt; Laplace: parameter_bank.pt;
+  full ensemble: denoiser_member_<k>.pt) -- with the run's saved config (config/exploration.yaml) and the
+  existing scorer classes. Nothing is refreshed, redrawn or refitted.
+- Window: the next recorded collection window, global steps [N, N + collection.train.steps_per_epoch) in
+  collection order, read from the run's replay (<run>/dataset/train, versions checked against their recorded
+  checksums), which must extend the milestone's replay exactly. The Uniform batch is the same step range of
+  the Uniform run's replay. One collection environment per run is required (episode order = collection order).
+- Each transition is scored as intrinsic_reward/intrinsic_eval.py scores real steps: the sampler window
+  o_{t-n+1..t}, a_{t-n+1..t} (earlier rows of the same episode; zero padding only before the episode start),
+  LCG with the real successor o_{t+1} (next row, the final observation, or the successor recorded by a later
+  milestone at that cut; a step without one is not scored), Plan2Explore with the feature of o_t in its context
+  and a_t. Randomness: the full ensemble's and Laplace's shared initial noise is one tensor drawn once from a
+  CPU generator seeded with --scoring-seed, so transition j of both batches gets the same draw; the global RNG
+  is seeded with it as well before each batch.
+- Writes follow_batches.csv (one row per batch), follow_summary.csv (difference learned - Uniform of the
+  mean raw and scaled score), follow_transitions.csv (every transition) and analysis.json. Scaled scores are
+  the scorer's own policy reward of the raw score, when the milestone holds what that needs.
+
+The coverage and lasting tests import neither trainer nor envs (with MUJOCO_GL=egl, importing dm_control opens
+the GPU devices). follow-intrinsic-reward imports the scorer modules (which import envs) only when it runs,
+and never the trainers.
 """
 import argparse
 import math
@@ -36,11 +68,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from data.milestone import RETURN_CONVENTION, load_milestone, method_label, read_manifest, write_json
+from data.milestone import (RETURN_CONVENTION, discover_milestones, exploration_identity, load_milestone, method_label,
+                            read_manifest, state_sha256, write_json)
 from downstream_analysis import write_csv
+from utils import file_sha256
 
-TESTS = ("task-reward-coverage", "task-reward-lasting", "follow-intrinsic-reward")
-IMPLEMENTED = ("task-reward-coverage", "task-reward-lasting")
+FOLLOW = "follow-intrinsic-reward"
+TESTS = ("task-reward-coverage", "task-reward-lasting", FOLLOW)
+# Output label -> intrinsic_reward.method of the learned methods (data.milestone.OUTPUT_LABELS).
+LEARNED = {"lcg": "lcg", "full-ensemble": "ensemble_disagreement", "laplace-ensemble": "laplace_disagreement",
+           "plan2explore": "plan2explore_disagreement"}
+FOLLOW_KEY = ["method", "domain", "milestone", "collected_steps", "window_start", "window_end"]
+FOLLOW_BATCH_COLUMNS = FOLLOW_KEY + ["batch", "run", "segments", "num_transitions", "num_scored", "raw_mean",
+                                     "scaled_mean"]
+FOLLOW_SUMMARY_COLUMNS = FOLLOW_KEY + ["scoring_seed", "num_transitions_learned", "num_transitions_uniform",
+                                       "num_scored_learned", "num_scored_uniform", "raw_mean_learned",
+                                       "raw_mean_uniform", "raw_difference", "scaled_mean_learned",
+                                       "scaled_mean_uniform", "scaled_difference"]
+FOLLOW_TRANSITION_COLUMNS = FOLLOW_KEY + ["batch", "position", "global_step", "episode", "row", "raw", "scaled"]
+FOLLOW_OUTPUTS = ["follow_batches.csv", "follow_summary.csv", "follow_transitions.csv"]
 KEY = ["method", "domain", "task", "milestone", "collected_steps", "threshold"]
 COVERAGE_COLUMNS = KEY + ["num_episodes", "num_transitions", "transitions_above", "fraction_transitions_above",
                           "episodes_with_above", "fraction_episodes_with_above"]
@@ -170,14 +216,13 @@ def check_replays(replays: List[Dict[str, Any]], thresholds: Dict[str, float]) -
 
 def run(tests: Sequence[str], milestones: Sequence[Path], thresholds: Dict[str, float], output: Path,
         argv: Optional[Sequence[str]] = None) -> Dict[str, Path]:
-    """Run the selected tests on every milestone; returns the written files by name."""
+    """Run the selected replay tests (coverage, lasting) on every milestone; returns the written files by name."""
     tests = list(dict.fromkeys(tests))
     unknown = [t for t in tests if t not in TESTS]
     if unknown or not tests:
         raise ValueError(f"--test takes {', '.join(TESTS)}; got {tests}")
-    if "follow-intrinsic-reward" in tests:
-        raise NotImplementedError("follow-intrinsic-reward needs the restored scorer checkpoints "
-                                  "(docs/analysis/restore_scorer.md); it is a separate follow-up")
+    if FOLLOW in tests:
+        raise ValueError(f"{FOLLOW} runs on its own (one milestone and a Uniform run); use follow_intrinsic_reward()")
     output = Path(output)
     files = [output / f for t in tests for f in OUTPUTS[t]] + [output / "analysis.json"]
     existing = [str(f) for f in files if f.exists()]
@@ -217,19 +262,484 @@ def run(tests: Sequence[str], milestones: Sequence[Path], thresholds: Dict[str, 
     return written
 
 
+# ---------------------------------------------------------------------------------------- follow intrinsic reward
+
+def run_config(run_dir: Path):
+    """The run's saved, resolved exploration config, normalized as the trainer does on load."""
+    from omegaconf import OmegaConf
+    from intrinsic_reward.ensemble import migrate_ensemble_layout
+    from utils import normalize_saved_config
+    path = Path(run_dir) / "config" / "exploration.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} is missing: {run_dir} is not an exploration run folder")
+    cfg = migrate_ensemble_layout(normalize_saved_config(OmegaConf.load(path)))
+    OmegaConf.resolve(cfg)
+    return cfg
+
+
+def run_replay(run_dir: Path):
+    """The run's training replay as last saved (<run>/dataset/train/info.pt), read only."""
+    from data import Dataset
+    directory = Path(run_dir) / "dataset" / "train"
+    if not (directory / "info.pt").is_file():
+        raise FileNotFoundError(f"{directory / 'info.pt'} is missing: no saved replay in run {run_dir}")
+    dataset = Dataset(directory, "run_replay", save_on_disk=False)
+    dataset.load_from_default_path()
+    dataset.is_static = True
+    if not dataset.versioned or dataset.file_sha256 is None or None in dataset.file_sha256:
+        raise ValueError(f"{directory}: the replay has no versioned episode files with checksums")
+    return dataset
+
+
+def window_segments(start_idx: Sequence[int], lengths: Sequence[int], start: int, end: int) -> List[Tuple[int, int, int]]:
+    """(episode, first row, end row) of the replay rows at global steps [start, end), in collection order."""
+    segments = []
+    for k, (s, n) in enumerate(zip(start_idx, lengths)):
+        a, b = max(start, int(s)), min(end, int(s) + int(n))
+        if a < b:
+            segments.append((k, a - int(s), b - int(s)))
+    return segments
+
+
+def load_checked_episode(dataset, episode_id: int):
+    """One episode version of a run replay, checked against the checksum recorded when it was written."""
+    path = dataset.episode_files()[episode_id]
+    if not path.is_file():
+        raise FileNotFoundError(f"{dataset.name}: episode file {path} is missing")
+    if file_sha256(path) != dataset.file_sha256[episode_id]:
+        raise ValueError(f"{dataset.name}: episode file {path} does not match its checksum")
+    return dataset.load_episode(episode_id)
+
+
+def recorded_successor(run_dir: Path, episode_id: int, length: int):
+    """The observation after row length-1 of an episode cut at a milestone (dataset.pt successor_observations
+    of a milestone of this run whose index holds the episode at exactly that length), else None."""
+    milestones = Path(run_dir) / "milestones"
+    if not milestones.is_dir():
+        return None, None
+    for path, manifest in discover_milestones(milestones):
+        entry = manifest["files"]["dataset"]
+        if file_sha256(path / entry["path"]) != entry["sha256"]:
+            raise ValueError(f"Milestone {path}: dataset file does not match its checksum")
+        saved = torch.load(path / entry["path"], weights_only=False)
+        lengths = saved["index"]["lengths"]
+        if episode_id < len(lengths) and int(lengths[episode_id]) == length and episode_id in saved["successor_observations"]:
+            return saved["successor_observations"][episode_id], f"successor_observations of {path.name}"
+    return None, None
+
+
+def as_stored(frame: torch.Tensor) -> torch.Tensor:
+    """A collector frame ([-1, 1] float) as the replay holds it: Episode.save's uint8 levels, read back by
+    Episode.load. Milestone successor observations are the collector's float frames, one float ulp from that."""
+    return frame.float().add(1).div(2).mul(255).round().byte().div(255).mul(2).sub(1)
+
+
+class _Rows:
+    """Rows [c, b) of an episode, shaped like an Episode for intrinsic_eval.sampler_windows."""
+
+    def __init__(self, obs, act, successor) -> None:
+        self.obs, self.act, self.info = obs, act, {"final_observation": successor}
+
+    def __len__(self) -> int:
+        return self.obs.shape[0]
+
+
+def window_batch(run_dir: Path, dataset, start: int, end: int, n: int) -> Dict[str, Any]:
+    """The transitions at global steps [start, end) of a run's replay, with everything every scorer reads:
+    sampler windows (obs, act), Plan2Explore context, frame and action, and the real successor (or None)."""
+    from intrinsic_reward.intrinsic_eval import sampler_windows
+    from intrinsic_reward.plan2explore import context_window
+    if int(dataset.num_steps) < end:
+        raise ValueError(f"The next window [{start}, {end}) is unavailable in {run_dir}: its replay ends at step "
+                         f"{int(dataset.num_steps)}")
+    segments = window_segments(dataset.start_idx, dataset.lengths, start, end)
+    fields = {k: [] for k in ("obs", "act", "frame", "action", "context", "context_act", "successor", "position")}
+    successor_sources = {}
+    for k, a, b in segments:
+        episode = load_checked_episode(dataset, k)
+        c = max(0, a - n)  # n earlier rows of the same episode give every window row its exact history
+        final = episode.info.get("final_observation") if isinstance(episode.info, dict) else None
+        if b < len(episode):
+            successor, source = episode.obs[b], "next row"
+        elif final is not None:
+            successor, source = final, "final_observation"
+        else:
+            successor, source = recorded_successor(run_dir, k, b)
+            successor = None if successor is None else as_stored(successor)
+        successor_sources[k] = source
+        rows = _Rows(episode.obs[c:b], episode.act[c:b],
+                     None if successor is None else successor.reshape(episode.obs.shape[1:]).to(episode.obs))
+        obs_w, act_w, nexts = sampler_windows(rows, n)
+        for i in range(a - c, b - c):
+            ctx, ctx_act, _ = context_window(rows.obs, rows.act, i, n)
+            fields["obs"].append(obs_w[i]), fields["act"].append(act_w[i])
+            fields["frame"].append(rows.obs[i]), fields["action"].append(rows.act[i])
+            fields["context"].append(ctx), fields["context_act"].append(ctx_act)
+            fields["successor"].append(nexts[i] if i < nexts.shape[0] else None)
+            fields["position"].append((int(dataset.start_idx[k]) + c + i, k, c + i))
+    batch = {k: torch.stack(v) for k, v in fields.items() if k not in ("successor", "position")}
+    batch.update(successor=fields["successor"], position=fields["position"], segments=segments,
+                 successor_sources=successor_sources)
+    return batch
+
+
+def check_extends(milestone, replay) -> None:
+    """The run's replay continues the milestone's exactly: same earlier episodes, and every episode cut at the
+    milestone continues from its recorded successor observation."""
+    m = milestone.dataset
+    if replay.task_names != m.task_names or int(replay.num_episodes) < int(m.num_episodes):
+        raise ValueError(f"The run's replay ({replay.num_episodes} episodes, labels {replay.task_names}) does not "
+                         f"extend milestone {milestone.path.name} ({m.num_episodes}, {m.task_names})")
+    for k in range(int(m.num_episodes)):
+        lm, lr = int(m.lengths[k]), int(replay.lengths[k])
+        cut = k in milestone.successor_observations
+        if lr < lm or (not cut and lr != lm):
+            raise ValueError(f"Episode {k}: {lm} rows at milestone {milestone.path.name}, {lr} in the run's replay "
+                             f"({'cut' if cut else 'complete'} at the milestone)")
+        if cut and lr > lm:
+            row = load_checked_episode(replay, k).obs[lm]
+            if not torch.equal(row, as_stored(milestone.successor_observations[k].reshape(row.shape))):
+                raise ValueError(f"Episode {k}: row {lm} of the run's replay differs from the successor observation "
+                                 f"recorded at milestone {milestone.path.name}")
+
+
+def scorer_requirements(method: str, manifest: Dict[str, Any], members: int) -> List[str]:
+    files = {"lcg": ["historical_precision.pt", "jvp_probe_bank.pt", "lcg_scaling.pt"],
+             "plan2explore": [f"MLP_member_{k}.pt" for k in range(1, members + 1)]
+                             + ["plan2explore_normalization.pt", "exploration_policy.pt"],
+             "laplace-ensemble": ["parameter_bank.pt"],
+             "full-ensemble": [f"denoiser_member_{k}.pt" for k in range(1, members)]}[method]
+    return files
+
+
+class FrozenScorer:
+    """One method's frozen scorer, rebuilt from saved state with the existing scorer classes (no trainer, no
+    environment). Construct, load the denoiser weights and the scorer state (load_milestone_files, or a
+    caller restoring a training checkpoint through the same objects), then score window batches."""
+
+    def __init__(self, method: str, cfg, action_low: Sequence[float], action_high: Sequence[float],
+                 device: torch.device) -> None:
+        from hydra.utils import instantiate
+        from omegaconf import OmegaConf
+        from models.diffusion import Denoiser, DiffusionSampler
+        if method not in LEARNED:
+            raise ValueError(f"{FOLLOW} needs a learned method ({', '.join(LEARNED)}), got {method!r}")
+        self.method, self.cfg, self.device = method, cfg, torch.device(device)
+        self.n = int(cfg.agent.denoiser.inner_model.num_steps_conditioning)
+        self.seed = cfg.common.seed
+        fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
+        sigma_cfg = instantiate(cfg.denoiser.sigma_distribution)
+        denoiser_cfg = instantiate(cfg.agent.denoiser)
+        denoiser_cfg.inner_model.continuous_action_dim = len(action_low)  # as AgentConfig sets it
+        members = 1
+        if method == "full-ensemble":
+            from intrinsic_reward.ensemble import EnsembleDisagreementConfig, EnsembleScorer
+            self.method_cfg = EnsembleDisagreementConfig(**fields)
+            members = self.method_cfg.num_members
+            self.scale_scorer = EnsembleScorer(self.method_cfg)
+        self.denoisers = [Denoiser(denoiser_cfg).to(self.device).eval() for _ in range(members)]
+        for d in self.denoisers:
+            d.setup_training(sigma_cfg)
+        sampler_cfg = instantiate(cfg.world_model_env).diffusion_sampler
+        self.samplers = [DiffusionSampler(d, sampler_cfg) for d in self.denoisers]
+        self.lcg = self.laplace = self.plan2explore = None
+        if method == "lcg":
+            from intrinsic_reward.lcg import LCGLifecycle
+            self.method_cfg = instantiate(cfg.intrinsic_reward)
+            self.lcg = LCGLifecycle(self.method_cfg, sigma_cfg, img_channels=cfg.agent.denoiser.inner_model.img_channels,
+                                    img_size=cfg.env.train.size, device=self.device)
+            self.lcg.verbose = False
+        elif method == "laplace-ensemble":
+            from intrinsic_reward.laplace import LaplaceConfig, LaplaceEnsemble, LaplaceScorer
+            self.method_cfg = LaplaceConfig(**fields)
+            self.laplace = LaplaceEnsemble(self.method_cfg, self.denoisers[0], sigma_cfg,
+                                           0 if self.seed is None else self.seed, self.device)
+            self.scale_scorer = LaplaceScorer(self.method_cfg)
+        elif method == "plan2explore":
+            from intrinsic_reward.plan2explore import Plan2Explore, Plan2ExploreConfig
+            self.method_cfg = Plan2ExploreConfig(**fields)
+            self.plan2explore = Plan2Explore(self.method_cfg, self.denoisers[0], cfg.env.train.size, list(action_low),
+                                             list(action_high), 0 if self.seed is None else self.seed, self.device)
+        self.noise_samples = int(getattr(self.method_cfg, "num_noise_samples", 1))
+
+    # ------------------------------------------------------------------ restore from a milestone
+
+    def load_milestone_files(self, milestone_path: Path, manifest: Dict[str, Any], denoiser_state) -> None:
+        """Denoiser weights (member 0 already loaded and checked by load_milestone; members 1.. against the
+        manifest identity) and the method's scorer checkpoint files (checksums checked by load_milestone)."""
+        path = Path(milestone_path)
+        load = lambda name: torch.load(path / name, map_location="cpu", weights_only=False)
+        states = [denoiser_state]
+        for k in range(1, len(self.denoisers)):
+            state = torch.load(path / f"denoiser_member_{k}.pt", map_location="cpu", weights_only=True)
+            if state_sha256(state) != manifest["identity"]["member_sha256"][k]:
+                raise ValueError(f"Milestone {path}: member {k} weights do not match the recorded identity")
+            states.append(state)
+        for d, state in zip(self.denoisers, states):
+            d.load_state_dict(state)
+        if self.method == "lcg":
+            hp, bank, sc = load("historical_precision.pt"), load("jvp_probe_bank.pt"), load("lcg_scaling.pt")
+            if not hp["round_id"] == bank["round_id"] == sc["round_id"]:
+                raise ValueError(f"Milestone {path}: LCG scorer files of different rounds "
+                                 f"({hp['round_id']}, {bank['round_id']}, {sc['round_id']})")
+            self.lcg.load_state_dict(dict(
+                settings=sc["settings"], round_id=hp["round_id"], theta_s_names=hp["theta_s_names"],
+                theta_s_dim=hp["theta_s_dim"], h_D=hp["h_D"],
+                bank={k: bank[k] for k in ("sigmas", "epsilons", "epsilons_offset", "etas")},
+                rms_s2=sc["rms_s2"], reward_divisor=sc["reward_divisor"], reference_raw_mean=sc["reference_raw_mean"]),
+                self.denoisers[0])
+        elif self.method == "laplace-ensemble":
+            bank, lap = load("parameter_bank.pt"), self.laplace
+            if bank["names"] != lap.names or [tuple(s) for s in bank["shapes"]] != lap.shapes:
+                raise ValueError(f"Milestone {path}: parameter_bank.pt selects other parameters than the config")
+            if float(bank["posterior_temperature"]) != float(lap.cfg.posterior_temperature):
+                raise ValueError(f"Milestone {path}: parameter_bank.pt temperature differs from the config")
+            if self.seed is not None and bank["bank_seed"] != lap.bank_seed(bank["refresh_epoch"]):
+                raise ValueError(f"Milestone {path}: parameter_bank.pt bank seed differs from the run's seed")
+            delta = torch.cat([bank["perturbations"][name].reshape(lap.cfg.num_members, -1) for name in lap.names], 1)
+            lap.perturbations, lap.refresh_epoch = delta.to(self.device), int(bank["refresh_epoch"])
+        elif self.method == "plan2explore":
+            p2e, norm = self.plan2explore, load("plan2explore_normalization.pt")
+            if float(norm["feature_std_floor"]) != float(p2e.cfg.feature_std_floor):
+                raise ValueError(f"Milestone {path}: plan2explore_normalization.pt floor differs from the config")
+            recorded = (manifest.get("plan2explore") or {}).get("probe_sha256")
+            if recorded is not None and recorded != p2e.extractor.probe_sha256:
+                raise ValueError(f"Milestone {path}: the feature probe differs from the one the run recorded")
+            heads = {f"{k - 1}.{name}": v for k in range(1, p2e.cfg.num_members + 1)
+                     for name, v in load(f"MLP_member_{k}.pt").items()}
+            p2e.load_state_dict(dict(settings=p2e.settings(), seed=p2e.seed, heads=heads, mean=norm["mean"],
+                                     std=norm["std"], refreshes=None, last_refresh_epoch=norm["refresh_epoch"],
+                                     fit_updates=[None] * p2e.cfg.num_members,
+                                     empty_bootstrap_fallbacks=[None] * p2e.cfg.num_members, cache_identity=None))
+
+    # ------------------------------------------------------------------ scoring
+
+    @torch.no_grad()
+    def score(self, batch: Dict[str, Any], seed: int, chunk: int = 64) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """(raw (W,) with NaN for unscored steps, scaled (W,) or None when the saved state cannot give the
+        policy reward), float64 on CPU."""
+        from envs.world_model_env import ensemble_disagreement
+        from intrinsic_reward.intrinsic_eval import preserved
+        W = batch["obs"].shape[0]
+        raw = torch.full((W,), float("nan"), dtype=torch.float64)
+        with torch.random.fork_rng(devices=[self.device] if self.device.type == "cuda" else []):
+            torch.manual_seed(seed)
+            if self.method == "lcg":
+                scored = [j for j in range(W) if batch["successor"][j] is not None]
+                candidates = []
+                for j in scored:
+                    o = batch["obs"][j:j + 1].to(self.device)
+                    candidates.append((o.reshape(1, -1, *o.shape[-2:]), batch["act"][j:j + 1].to(self.device),
+                                       batch["successor"][j].unsqueeze(0).to(self.device)))
+                if candidates:
+                    raw[scored] = self.lcg.score_candidates(candidates).double().cpu()
+            elif self.method == "plan2explore":
+                p2e = self.plan2explore
+                with preserved(p2e.extractor, ("seconds",)):
+                    for i in range(0, W, chunk):
+                        s = slice(i, min(i + chunk, W))
+                        features = p2e.extractor(batch["frame"][s], batch["context"][s], batch["context_act"][s])
+                        raw[s] = p2e.disagreement(features, batch["action"][s].to(features.device)).double().cpu()
+            else:
+                c, h, w = batch["obs"].shape[2:]
+                # One draw for the whole window: transition j gets the same noise in every batch of this seed.
+                noise = torch.randn(self.noise_samples, W, c, h, w, generator=torch.Generator().manual_seed(seed))
+                for i in range(0, W, chunk):
+                    s = slice(i, min(i + chunk, W))
+                    o, a = batch["obs"][s].to(self.device), batch["act"][s].to(self.device)
+                    per_noise = []
+                    for z in noise[:, s].to(self.device):
+                        if self.laplace is not None:
+                            with preserved(self.laplace, ("prediction_seconds", "prediction_calls", "prefix_evaluations")):
+                                predictions = self.laplace.predict_members(self.samplers[0], o, a, z)
+                        else:
+                            predictions = torch.stack([sm.sample(o, a, z)[0] for sm in self.samplers])
+                        per_noise.append(ensemble_disagreement(predictions))
+                    raw[s] = torch.stack(per_noise).mean(dim=0).double().cpu()
+        return raw, self.scale(raw)
+
+    def scale(self, raw: torch.Tensor) -> Optional[torch.Tensor]:
+        """The policy reward of raw scores with the frozen scale (no running statistics updated)."""
+        x = raw.float().to(self.device)
+        if self.method == "lcg":
+            scaled = self.lcg.scale_frozen(x)
+        elif self.method == "plan2explore":
+            scaled = self.plan2explore.scale(x)
+        else:
+            scaled = self.scale_scorer.scale_frozen(x)
+        return None if scaled is None else scaled.double().cpu()
+
+    def describe(self) -> Dict[str, Any]:
+        d = dict(method=self.method, num_conditioning=self.n, members=len(self.denoisers), noise_samples=self.noise_samples,
+                 reward_scaling=getattr(self.method_cfg, "reward_scaling", None))
+        if self.lcg is not None:
+            d.update(round=self.lcg.round_id, reward_divisor=self.lcg.reward_divisor,
+                     candidate_num_mc=self.lcg.cfg.candidate_num_mc)
+        if self.laplace is not None:
+            d.update(refresh_epoch=self.laplace.refresh_epoch, laplace_members=self.laplace.cfg.num_members)
+        if self.plan2explore is not None:
+            d.update(refresh_epoch=self.plan2explore.last_refresh_epoch, heads=self.plan2explore.cfg.num_members)
+        return d
+
+
+def restore_milestone_scorer(method: str, milestone_path: Path, device: torch.device) -> Tuple[FrozenScorer, Any, Any]:
+    """(scorer, loaded milestone, run config) of a learned method's milestone; refuses a milestone of another
+    method or one without the required scorer files."""
+    path = Path(milestone_path)
+    manifest = read_manifest(path)
+    exploration = manifest.get("exploration", {})
+    label = method_label(bool(exploration.get("intrinsic_reward_enabled")), exploration.get("method"))
+    if label != method:
+        raise ValueError(f"Milestone {path} belongs to a {label} run, not {method}")
+    from omegaconf import OmegaConf
+    run_dir = path.parent.parent
+    cfg = run_config(run_dir)
+    members = int(OmegaConf.select(cfg, "intrinsic_reward.num_members", default=1) or 1)
+    required = scorer_requirements(method, manifest, members)
+    listed = {entry["path"] for entry in manifest["files"].values()}
+    missing = [f for f in required if f not in listed or not (path / f).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Milestone {path} lacks the {method} scorer file(s) {missing} "
+                                "(docs/analysis/restore_scorer.md; milestones saved before scorer checkpoints have none)")
+    milestone = load_milestone(path, manifest["task_names"][0], map_location=torch.device("cpu"))
+    if method == "plan2explore":
+        policy = torch.load(path / "exploration_policy.pt", map_location="cpu", weights_only=False)
+        low, high = policy["action_low"].tolist(), policy["action_high"].tolist()
+    else:  # bounds are not read by these scorers; the action dimension is the replay's
+        dim = milestone.dataset.load_episode(0).act.shape[-1]
+        low, high = [-1.0] * dim, [1.0] * dim
+    scorer = FrozenScorer(method, cfg, low, high, device)
+    scorer.load_milestone_files(path, milestone.manifest, milestone.denoiser_state)
+    return scorer, milestone, cfg
+
+
+def check_uniform_run(uniform_run: Path, cfg, ucfg) -> None:
+    """A Uniform run of the same environment (domain, tasks, image size, action repeat)."""
+    from omegaconf import OmegaConf
+    identity = exploration_identity(uniform_run)
+    if identity["method"] != "uniform":
+        raise ValueError(f"--uniform-run {uniform_run} is a {identity['method']} run, not Uniform")
+    env, uenv = OmegaConf.to_container(cfg.env.train), OmegaConf.to_container(ucfg.env.train)
+    for key in ("domain_name", "task_names", "size", "action_repeat"):
+        if env.get(key) != uenv.get(key):
+            raise ValueError(f"--uniform-run {uniform_run} has env.train.{key}={uenv.get(key)}, the learned run "
+                             f"{env.get(key)}")
+
+
+def follow_intrinsic_reward(method: str, milestone_path: Path, uniform_run: Path, output: Path, scoring_seed: int = 0,
+                            device: Optional[str] = None, argv: Optional[Sequence[str]] = None) -> Dict[str, Path]:
+    """Score the next recorded collection window of the learned run and the same step range of the Uniform run
+    with the milestone's frozen scorer; returns the written files by name."""
+    output, milestone_path, uniform_run = Path(output), Path(milestone_path), Path(uniform_run)
+    files = [output / f for f in FOLLOW_OUTPUTS] + [output / "analysis.json"]
+    existing = [str(f) for f in files if f.exists()]
+    if existing:
+        raise FileExistsError(f"Not overwriting existing results: {existing}")
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True  # as during exploration training
+    run_dir = milestone_path.parent.parent
+    cfg = run_config(run_dir)
+    ucfg = run_config(uniform_run)
+    check_uniform_run(uniform_run, cfg, ucfg)
+    for name, c in (("learned", cfg), ("Uniform", ucfg)):
+        if int(c.collection.train.num_envs) != 1:
+            raise ValueError(f"The {name} run collected with {c.collection.train.num_envs} environments; the window "
+                             "is defined in collection order, which needs one")
+    # Checked before the scorer is built: a missing window fails fast.
+    manifest = read_manifest(milestone_path)
+    start = int(manifest["collected_steps"])
+    end = start + int(cfg.collection.train.steps_per_epoch)
+    replay, ureplay = run_replay(run_dir), run_replay(uniform_run)
+    for name, r, where in (("learned", replay, run_dir), ("Uniform", ureplay, uniform_run)):
+        if int(r.num_steps) < end:
+            raise ValueError(f"The next window [{start}, {end}) after {milestone_path.name} is unavailable in the "
+                             f"{name} run {where}: its replay ends at step {int(r.num_steps)}")
+    scorer, milestone, _ = restore_milestone_scorer(method, milestone_path, device)
+    check_extends(milestone, replay)
+    batches = {"learned": window_batch(run_dir, replay, start, end, scorer.n),
+               "uniform": window_batch(uniform_run, ureplay, start, end, scorer.n)}
+    key = dict(method=method, domain=manifest["domain"], milestone=milestone_path.name, collected_steps=start,
+               window_start=start, window_end=end)
+    batch_rows, transition_rows, means = [], [], {}
+    for name, batch in batches.items():
+        raw, scaled = scorer.score(batch, scoring_seed)
+        ok = ~torch.isnan(raw)
+        means[name] = dict(n=int(raw.numel()), scored=int(ok.sum()),
+                           raw=float(raw[ok].mean()) if ok.any() else float("nan"),
+                           scaled=None if scaled is None else (float(scaled[ok].mean()) if ok.any() else float("nan")))
+        batch_rows.append(dict(**key, batch=name, run=str((run_dir if name == "learned" else uniform_run).resolve()),
+                               segments=" ".join(f"{k}:{a}-{b}" for k, a, b in batch["segments"]),
+                               num_transitions=means[name]["n"], num_scored=means[name]["scored"],
+                               raw_mean=means[name]["raw"], scaled_mean="" if scaled is None else means[name]["scaled"]))
+        for j, (step, episode, row) in enumerate(batch["position"]):
+            transition_rows.append(dict(**key, batch=name, position=j, global_step=step, episode=episode, row=row,
+                                        raw="" if not ok[j] else float(raw[j]),
+                                        scaled="" if scaled is None or not ok[j] else float(scaled[j])))
+    learned, uniform = means["learned"], means["uniform"]
+    scaled_known = learned["scaled"] is not None and uniform["scaled"] is not None
+    summary = dict(**key, scoring_seed=scoring_seed, num_transitions_learned=learned["n"],
+                   num_transitions_uniform=uniform["n"], num_scored_learned=learned["scored"],
+                   num_scored_uniform=uniform["scored"], raw_mean_learned=learned["raw"], raw_mean_uniform=uniform["raw"],
+                   raw_difference=learned["raw"] - uniform["raw"],
+                   scaled_mean_learned=learned["scaled"] if scaled_known else "",
+                   scaled_mean_uniform=uniform["scaled"] if scaled_known else "",
+                   scaled_difference=learned["scaled"] - uniform["scaled"] if scaled_known else "")
+    write_csv(output / "follow_batches.csv", batch_rows, FOLLOW_BATCH_COLUMNS)
+    write_csv(output / "follow_summary.csv", [summary], FOLLOW_SUMMARY_COLUMNS)
+    write_csv(output / "follow_transitions.csv", transition_rows, FOLLOW_TRANSITION_COLUMNS)
+    finite = lambda v: v if isinstance(v, (int, float)) and math.isfinite(v) else None
+    write_json(output / "analysis.json", dict(
+        tests=[FOLLOW], method=method, domain=manifest["domain"], milestone=str(milestone_path.resolve()),
+        epoch=manifest.get("epoch"), window=[start, end], window_rule="global steps [collected_steps, collected_steps "
+        "+ collection.train.steps_per_epoch) in collection order (one environment)", scoring_seed=scoring_seed,
+        device=str(device), scorer=scorer.describe(),
+        batches={name: dict(run=str((run_dir if name == "learned" else uniform_run).resolve()),
+                            segments=[list(s) for s in b["segments"]], num_transitions=means[name]["n"],
+                            num_scored=means[name]["scored"], raw_mean=finite(means[name]["raw"]),
+                            scaled_mean=finite(means[name]["scaled"]),
+                            successor_of_last_rows={str(k): v for k, v in b["successor_sources"].items()})
+                 for name, b in batches.items()},
+        raw_difference=finite(summary["raw_difference"]),
+        scaled_difference=finite(summary["scaled_difference"]) if scaled_known else None,
+        scaled_note=None if scaled_known else "the milestone does not hold the scale state needed for the policy reward",
+        milestone_files={k: v["sha256"] for k, v in manifest["files"].items()},
+        source=manifest.get("source"), command=list(argv) if argv is not None else None))
+    return {name: output / name for name in [*FOLLOW_OUTPUTS, "analysis.json"]}
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--test", action="append", required=True, choices=TESTS,
                         help="analysis to run; repeat to combine")
     parser.add_argument("--milestone", action="append", required=True, type=Path,
-                        help="milestone folder <run>/milestones/steps_N; repeat for several methods")
-    parser.add_argument("--threshold", action="append", required=True, metavar="TASK=VALUE",
-                        help="reward threshold of one task in stored units; repeat per task")
+                        help="milestone folder <run>/milestones/steps_N; repeat for several methods (coverage, "
+                             f"lasting); exactly one for {FOLLOW}")
+    parser.add_argument("--threshold", action="append", default=[], metavar="TASK=VALUE",
+                        help="coverage, lasting: reward threshold of one task in stored units; repeat per task")
+    parser.add_argument("--method", choices=sorted(LEARNED), help=f"{FOLLOW}: the milestone's learned method")
+    parser.add_argument("--uniform-run", type=Path, help=f"{FOLLOW}: the Uniform run folder to compare with")
+    parser.add_argument("--scoring-seed", type=int, default=0,
+                        help=f"{FOLLOW}: seed of the scoring randomness, the same for both batches (default 0)")
+    parser.add_argument("--device", default=None, help=f"{FOLLOW}: torch device (default: cuda if available, else cpu)")
     parser.add_argument("--output", required=True, type=Path, help="folder for the CSV results and analysis.json")
     args = parser.parse_args(argv)
-    written = run(args.test, args.milestone, parse_thresholds(args.threshold), args.output,
-                  argv=sys.argv if argv is None else ["exploration_analysis.py", *argv])
+    command = sys.argv if argv is None else ["exploration_analysis.py", *argv]
+    tests = list(dict.fromkeys(args.test))
+    if FOLLOW in tests:
+        if len(tests) > 1:
+            parser.error(f"{FOLLOW} runs on its own; run the replay tests in a separate invocation")
+        if args.method is None or args.uniform_run is None or len(args.milestone) != 1:
+            parser.error(f"{FOLLOW} needs --method, exactly one --milestone and --uniform-run")
+        if args.threshold:
+            parser.error(f"{FOLLOW} takes no --threshold")
+        written = follow_intrinsic_reward(args.method, args.milestone[0], args.uniform_run, args.output,
+                                          args.scoring_seed, args.device, argv=command)
+    else:
+        if args.method or args.uniform_run:
+            parser.error(f"--method and --uniform-run belong to {FOLLOW}")
+        written = run(tests, args.milestone, parse_thresholds(args.threshold), args.output, argv=command)
     for name, path in written.items():
         print(f"{name}: {path.resolve()}")
 

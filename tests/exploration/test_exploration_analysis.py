@@ -140,8 +140,8 @@ def test_refusals(milestone, tmp_path):
     with pytest.raises(ValueError, match="No recorded reward"):
         ea.main(["--test", "task-reward-coverage", "--milestone", str(milestone), "--threshold", "walk=1",
                  "--output", str(tmp_path / "a")])
-    with pytest.raises(NotImplementedError, match="restored scorer checkpoints"):
-        ea.main(["--test", "follow-intrinsic-reward", *base, "--output", str(tmp_path / "b")])
+    with pytest.raises(ValueError, match="runs on its own"):
+        ea.run(["follow-intrinsic-reward"], [milestone], {"stand": 1.0}, tmp_path / "b")
     walker = make_milestone(tmp_path / "walker_run", [episode([2], [0])], domain="walker")
     with pytest.raises(ValueError, match="same domain"):
         ea.main(["--test", "task-reward-coverage", *base, "--milestone", str(walker), "--output", str(tmp_path / "c")])
@@ -154,6 +154,36 @@ def test_refusals(milestone, tmp_path):
         ea.main(["--test", "coverage", *base, "--output", str(tmp_path / "f")])
 
 
+def test_follow_window_segments_in_collection_order():
+    # Episodes of 500, 300 (cut at 800) and 200 rows: start_idx 0, 500, 800.
+    start_idx, lengths = [0, 500, 800], [500, 300, 200]
+    assert ea.window_segments(start_idx, lengths, 600, 700) == [(1, 100, 200)]  # inside one episode
+    assert ea.window_segments(start_idx, lengths, 700, 900) == [(1, 200, 300), (2, 0, 100)]  # across a boundary
+    assert ea.window_segments(start_idx, lengths, 0, 500) == [(0, 0, 500)]
+    assert ea.window_segments(start_idx, lengths, 1000, 1100) == []
+
+
+def test_follow_compares_successors_as_the_replay_stores_frames():
+    frame = torch.rand(3, 4, 4) * 2 - 1
+    stored = ea.as_stored(frame)
+    assert torch.equal(ea.as_stored(stored), stored)  # idempotent on the replay's uint8 grid
+    assert torch.equal(stored, frame.add(1).div(2).mul(255).round().byte().div(255).mul(2).sub(1))
+
+
+def test_follow_command_line_refusals(milestone, tmp_path):
+    follow = ["--test", "follow-intrinsic-reward", "--milestone", str(milestone), "--output", str(tmp_path / "f")]
+    for extra in ([], ["--method", "lcg"], ["--uniform-run", str(tmp_path)],  # method and Uniform run are required
+                  ["--method", "lcg", "--uniform-run", str(tmp_path), "--threshold", "stand=1"],
+                  ["--method", "lcg", "--uniform-run", str(tmp_path), "--milestone", str(milestone)],
+                  ["--method", "lcg", "--uniform-run", str(tmp_path), "--test", "task-reward-coverage"],
+                  ["--method", "uniform", "--uniform-run", str(tmp_path)]):
+        with pytest.raises(SystemExit):
+            ea.main(follow + extra)
+    with pytest.raises(SystemExit):  # --method belongs to the follow test
+        ea.main(["--test", "task-reward-coverage", "--milestone", str(milestone), "--threshold", "stand=1",
+                 "--method", "lcg", "--output", str(tmp_path / "g")])
+
+
 def test_a_corrupted_episode_file_is_refused_by_the_loader(milestone, tmp_path):
     episode_file = next((tmp_path / "lcg_run" / "dataset").rglob("0_5.pt"))
     episode_file.write_bytes(episode_file.read_bytes() + b"x")
@@ -163,6 +193,8 @@ def test_a_corrupted_episode_file_is_refused_by_the_loader(milestone, tmp_path):
 
 
 def test_the_module_imports_neither_trainer_nor_envs():
+    """At import (the coverage and lasting tests); follow-intrinsic-reward imports the scorer modules only
+    when it runs, and never a trainer."""
     import subprocess, sys
     code = ("import sys; sys.path.insert(0, 'src'); import exploration_analysis; "
             "bad = [m for m in ('exploration_trainer', 'downstream_trainer', 'envs', 'dm_control') if m in sys.modules]; "
