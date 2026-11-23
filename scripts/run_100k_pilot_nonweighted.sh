@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pilot with NON-WEIGHTED PMPO in exploration: the exploration actor uses the sign objective
+# (Dreamer 4 Eq. 11, agent.actor_critic.actor_objective=sign) instead of the presets'
+# advantage_weighted one. Walker only. Downstream training is sign PMPO as always.
+#
+# Run inside tmux. Replace GPU=0 with GPU=1 to use the second GPU.
+#
+# Plan2Explore:
+#   GPU=0 PRESET=plan2explore_100k LABEL=plan2explore-nonweighted bash scripts/run_100k_pilot_nonweighted.sh
+# Full ensemble:
+#   GPU=0 PRESET=ensemble_100k LABEL=full-ensemble-nonweighted bash scripts/run_100k_pilot_nonweighted.sh
+# LCG:
+#   GPU=0 PRESET=lcg_100k LABEL=lcg-nonweighted bash scripts/run_100k_pilot_nonweighted.sh
+# Laplace ensemble:
+#   GPU=0 PRESET=laplace_100k LABEL=laplace-ensemble-nonweighted bash scripts/run_100k_pilot_nonweighted.sh
+#
+# Use a LABEL different from the advantage-weighted runs' so the outputs do not collide.
+# Phase 1: explore the walker group.
+# Phase 2: adapt only 100k milestones.
+# Seeds default to 0; override with EXPLORATION_SEED and ADAPTATION_SEED.
+# Resume interrupted exploration: bash scripts/resume.sh <run folder>
+
+# Run from the repository root.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+# -------------------------------------------------------------------
+# Editable launch settings
+# -------------------------------------------------------------------
+EXPLORATION_SEED="${EXPLORATION_SEED:-0}"
+ADAPTATION_SEED="${ADAPTATION_SEED:-0}"
+
+GPU="${GPU:?Set GPU, e.g. 0 or 1}"
+PYTHON="${PYTHON:-python}"
+
+EXPLORATION_PROJECT="${EXPLORATION_PROJECT:-reward-free-exploration}"
+# One downstream W&B project per task group and task, shared by methods and seeds:
+# <DOWNSTREAM_PROJECT_PREFIX>-<group>-<task>.
+DOWNSTREAM_PROJECT_PREFIX="${DOWNSTREAM_PROJECT_PREFIX:-reward-free-downstream}"
+
+PRESET="${PRESET:?Set PRESET, e.g. lcg_100k}"
+LABEL="${LABEL:?Set LABEL, e.g. lcg}" # output label of the method (data/milestone.py OUTPUT_LABELS)
+
+OUTPUT_ROOT="$REPO_ROOT/outputs/$LABEL"
+LOG_ROOT="$REPO_ROOT/logs/$LABEL"
+
+# Computation and EGL rendering on the selected physical GPU.
+export CUDA_VISIBLE_DEVICES="$GPU"
+export MUJOCO_GL=egl
+export MUJOCO_EGL_DEVICE_ID="$GPU"
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+# Group label | actual dm_control domain | available tasks
+#
+# Separate Cartpole labels prevent the two groups sharing an output.
+TASK_GROUPS=(
+    'walker|walker|stand,walk,run'
+)
+
+# -------------------------------------------------------------------
+# Exploration: one task group
+# -------------------------------------------------------------------
+run_exploration() {
+    local group="$1"
+    local domain="$2"
+    local tasks="$3"
+
+    local run_dir="$OUTPUT_ROOT/$group/seed_$EXPLORATION_SEED"
+    local log_name="${group}--exploration-es${EXPLORATION_SEED}"
+    local log_file="$ATTEMPT_DIR/${log_name}.log"
+
+    printf '\n=== Exploration: %s ===\n' "$group"
+    printf 'Output: %s\nLog: %s\n' "$run_dir" "$log_file"
+
+    "$PYTHON" -u src/exploration_main.py \
+        "+experiment=$PRESET" \
+        agent.actor_critic.actor_objective=sign \
+        "env.train.domain_name=$domain" \
+        "env.train.task_names=[$tasks]" \
+        "common.seed=$EXPLORATION_SEED" \
+        "common.devices=$GPU" \
+        wandb.mode=online \
+        "wandb.project=$EXPLORATION_PROJECT-${LABEL}" \
+        "wandb.group=${LABEL}-${log_name}" \
+        "wandb.name=${LABEL}-${log_name}" \
+        "hydra.run.dir=$run_dir" \
+        > >(tee "$log_file") \
+        2> >(tee "${log_file%.log}.stderr.log" >&2)
+}
+
+# -------------------------------------------------------------------
+# Downstream: one milestones folder and one task
+# The Python launcher processes the ten selected milestones sequentially.
+# -------------------------------------------------------------------
+run_downstream() {
+    local group="$1"
+    local task="$2"
+
+    local run_dir="$OUTPUT_ROOT/$group/seed_$EXPLORATION_SEED"
+    local milestones_dir="$run_dir/milestones"
+    local log_name="${group}--downstream-${task}-es${EXPLORATION_SEED}-ds${ADAPTATION_SEED}"
+    local log_file="$ATTEMPT_DIR/${log_name}.log"
+
+    if [[ ! -d "$milestones_dir" ]]; then
+        printf 'Missing milestones folder: %s\n' "$milestones_dir" >&2
+        return 1
+    fi
+
+    printf '\n=== Downstream: %s / %s ===\n' "$group" "$task"
+    printf 'Milestones: %s\nLog: %s\n' "$milestones_dir" "$log_file"
+
+    # One W&B run, named and grouped ${LABEL}-${log_name}, shared by the ten milestones; each milestone
+    # is still adapted independently, in its own child process and output folder.
+    "$PYTHON" -u src/downstream_main.py \
+        +experiment=downstream_10_milestones \
+        "initialization.milestone_steps=[100000]" \
+        "initialization.milestones_dir=$milestones_dir" \
+        "downstream.task_name=$task" \
+        "downstream.seed=$ADAPTATION_SEED" \
+        downstream.mode=train \
+        "common.devices=$GPU" \
+        wandb.mode=online \
+        "wandb.project=${DOWNSTREAM_PROJECT_PREFIX}-${group}-${task}-pilot" \
+        "wandb.group=${LABEL}-${log_name}" \
+        "wandb.name=${LABEL}-${log_name}" \
+        > >(tee "$log_file") \
+        2> >(tee "${log_file%.log}.stderr.log" >&2)
+}
+
+# -------------------------------------------------------------------
+# Preflight: refuse existing exploration outputs before starting work.
+# Resume interrupted runs separately with scripts/resume.sh.
+# -------------------------------------------------------------------
+for entry in "${TASK_GROUPS[@]}"; do
+    IFS='|' read -r group domain tasks <<< "$entry"
+    run_dir="$OUTPUT_ROOT/$group/seed_$EXPLORATION_SEED"
+
+    if [[ -e "$run_dir" ]]; then
+        printf 'Output already exists: %s\n' "$run_dir" >&2
+        printf 'Use scripts/resume.sh for interrupted exploration.\n' >&2
+        exit 1
+    fi
+done
+
+mkdir -p "$LOG_ROOT"
+
+# Unique directory for this invocation's terminal logs.
+ATTEMPT_DIR="$(mktemp -d \
+    "$LOG_ROOT/$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+
+# Combined launcher logs: every message and every phase's output, stdout and stderr kept apart (both
+# still on the terminal); the per-phase logs below are kept as well.
+LAUNCH_LOG="$ATTEMPT_DIR/launcher.stdout.log"
+ERROR_LOG="$ATTEMPT_DIR/launcher.stderr.log"
+
+exec > >(tee -a "$LAUNCH_LOG") \
+     2> >(tee -a "$ERROR_LOG" >&2)
+
+printf '%s experiment (non-weighted PMPO exploration) | GPU %s | exploration seed %s | adaptation seed %s\n' \
+    "$LABEL" "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
+printf 'Outputs: %s\nTerminal logs: %s\n' "$OUTPUT_ROOT" "$ATTEMPT_DIR"
+
+# -------------------------------------------------------------------
+# Phase 1: finish exploration for every task group.
+# -------------------------------------------------------------------
+for entry in "${TASK_GROUPS[@]}"; do
+    IFS='|' read -r group domain tasks <<< "$entry"
+    run_exploration "$group" "$domain" "$tasks"
+done
+
+# -------------------------------------------------------------------
+# Phase 2: adapt every task, one task at a time.
+# Each task adapts ten milestones before the next task starts.
+# -------------------------------------------------------------------
+for entry in "${TASK_GROUPS[@]}"; do
+    IFS='|' read -r group domain tasks <<< "$entry"
+    IFS=',' read -r -a task_list <<< "$tasks"
+
+    for task in "${task_list[@]}"; do
+        run_downstream "$group" "$task"
+    done
+
+    # Archive this group's pilot adaptations after every task succeeds.
+    run_dir="$OUTPUT_ROOT/$group/seed_$EXPLORATION_SEED"
+    pilot_archive="$run_dir/downstream_pilot_$(basename "$ATTEMPT_DIR")"
+
+    if [[ -e "$pilot_archive" ]]; then
+        printf 'Pilot archive already exists: %s\n' "$pilot_archive" >&2
+        exit 1
+    fi
+
+    mv -- "$run_dir/downstream" "$pilot_archive"
+    printf 'Pilot outputs archived: %s\n' "$pilot_archive"
+done
+
+printf '\nAll %s exploration and downstream runs completed.\n' "$LABEL"
+printf 'Terminal logs: %s\n' "$ATTEMPT_DIR"
