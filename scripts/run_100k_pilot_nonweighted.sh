@@ -3,12 +3,15 @@ set -euo pipefail
 
 # Pilot with NON-WEIGHTED PMPO in exploration: the exploration actor uses the sign objective
 # (Dreamer 4 Eq. 11, agent.actor_critic.actor_objective=sign) instead of the presets'
-# advantage_weighted one. Walker only. Downstream training is sign PMPO as always.
+# advantage_weighted one. Walker and/or Hopper (RUN_GROUPS, default walker). Downstream training
+# is sign PMPO as always.
 #
 # Run inside tmux. Replace GPU=0 with GPU=1 to use the second GPU.
 #
 # Plan2Explore:
 #   GPU=0 PRESET=plan2explore_100k LABEL=plan2explore-nonweighted bash scripts/run_100k_pilot_nonweighted.sh
+# Plan2Explore, Hopper:
+#   GPU=0 RUN_GROUPS=hopper PRESET=plan2explore_100k LABEL=plan2explore-nonweighted bash scripts/run_100k_pilot_nonweighted.sh
 # Full ensemble:
 #   GPU=0 PRESET=ensemble_100k LABEL=full-ensemble-nonweighted bash scripts/run_100k_pilot_nonweighted.sh
 # LCG:
@@ -17,7 +20,7 @@ set -euo pipefail
 #   GPU=0 PRESET=laplace_100k LABEL=laplace-ensemble-nonweighted bash scripts/run_100k_pilot_nonweighted.sh
 #
 # Use a LABEL different from the advantage-weighted runs' so the outputs do not collide.
-# Phase 1: explore the walker group.
+# Phase 1: explore the selected groups.
 # Phase 2: adapt only 100k milestones.
 # Seeds default to 0; override with EXPLORATION_SEED and ADAPTATION_SEED.
 # Resume interrupted exploration: bash scripts/resume.sh <run folder>
@@ -56,9 +59,27 @@ export PYTHONUNBUFFERED=1
 # Group label | actual dm_control domain | available tasks
 #
 # Separate Cartpole labels prevent the two groups sharing an output.
-TASK_GROUPS=(
+ALL_TASK_GROUPS=(
     'walker|walker|stand,walk,run'
+    'hopper|hopper|stand,hop'
 )
+
+# Groups to run, space-separated (default walker), e.g. RUN_GROUPS=hopper or RUN_GROUPS="walker hopper".
+RUN_GROUPS="${RUN_GROUPS:-walker}"
+TASK_GROUPS=()
+for name in $RUN_GROUPS; do
+    found=0
+    for entry in "${ALL_TASK_GROUPS[@]}"; do
+        if [[ "${entry%%|*}" == "$name" ]]; then
+            TASK_GROUPS+=("$entry")
+            found=1
+        fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+        printf 'Unknown group in RUN_GROUPS: %s\n' "$name" >&2
+        exit 1
+    fi
+done
 
 # -------------------------------------------------------------------
 # Exploration: one task group
