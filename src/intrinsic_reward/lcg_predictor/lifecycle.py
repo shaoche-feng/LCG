@@ -12,9 +12,9 @@ Refresh is transactional. After every denoiser phase, with the denoiser frozen:
    identity, and refit the replay-only feature standardization.
 2. Fit ONE predictor f_psi(z_t, a_t) -> z_{t+1} by explicit MAP (training.py): Gaussian feature likelihood
    (variance tau^2), Gaussian prior (precision lambda), uniform minibatches, no bootstrap.
-3. Historical precision h_D = lambda + s * diag(sum_i J_i^T J_i) / tau^2 over a uniform without-replacement
-   subset of B_H valid transitions (s = N / B_H for full-replay scaling), exact GGN (curvature.py),
-   recomputed from scratch every refresh.
+3. Historical precision h_D = lambda + s * diag(sum_i J_i^T J_i) / tau^2, exact GGN (curvature.py), by default
+   over every valid replay transition (s = 1); optionally over a uniform without-replacement subset of B_H
+   transitions (s = N / B_H for full-replay scaling). Recomputed from scratch every refresh.
 4. The round's scoring bank v_m = h_D^{-1/2} * eta_m (jvp_bank backend only; the default exact_trace
    backend uses no bank).
 The new round is built in local state and installed only once every step succeeded; a failure leaves the
@@ -83,7 +83,8 @@ class LCGPredictorConfig:
     prior_precision: float = 1.0
     # Historical precision.
     curvature_backend: str = "closed_form"  # closed_form (MLP, exact) or autograd (generic per-sample VJPs, exact)
-    curvature_num_transitions: int = 320  # B_H
+    curvature_num_transitions: Optional[int] = None  # B_H; None: every valid transition (exact full-replay sum)
+    curvature_block_size: int = 8192  # transitions moved to the device per block (memory only)
     curvature_scaling: str = "full_replay"  # full_replay: N / B_H; none: the subset's plain sum
     curvature_chunk_size: int = 64  # closed form: samples per chunk (memory only)
     autograd_output_chunk: int = 128  # autograd: output basis vectors per vmap (memory only)
@@ -98,7 +99,7 @@ class LCGPredictorConfig:
     # Policy reward: data_scaled raw / (fixed_divisor * data_reference_steps / replay steps); fixed raw /
     # fixed_divisor; none raw. The divisor is frozen per round.
     reward_scaling: str = "data_scaled"
-    fixed_divisor: Optional[float] = 1.0
+    fixed_divisor: Optional[float] = 500.0
     data_reference_steps: Optional[int] = 5500
 
     def __post_init__(self) -> None:
@@ -109,7 +110,10 @@ class LCGPredictorConfig:
         if not self.feature_layers or not all(isinstance(x, str) and x for x in self.feature_layers) \
                 or len(set(self.feature_layers)) != len(self.feature_layers):
             raise ValueError(f"intrinsic_reward.feature_layers must be distinct module names, got {self.feature_layers!r}")
-        for name in ("pool_size", "encode_batch_size", "batch_size", "fit_updates", "curvature_num_transitions",
+        if self.curvature_num_transitions is not None and not is_int(self.curvature_num_transitions, minimum=1):
+            raise ValueError("intrinsic_reward.curvature_num_transitions must be null (full replay) or a positive "
+                             f"integer, got {self.curvature_num_transitions!r}")
+        for name in ("pool_size", "encode_batch_size", "batch_size", "fit_updates", "curvature_block_size",
                      "curvature_chunk_size", "autograd_output_chunk", "autograd_sample_chunk", "num_probes",
                      "candidate_chunk_size"):
             if not is_int(getattr(self, name), minimum=1):
@@ -429,22 +433,30 @@ class LCGPredictor:
         """h_D = lambda + s * sum_{i in subset} diag(J_i^T J_i) / tau^2, from scratch (no earlier round's
         curvature is reused, so no replay is counted twice)."""
         cfg = self.cfg
-        b_h = min(cfg.curvature_num_transitions, n)
-        seed = self.curvature_seed(round_id)
-        idx = torch.from_numpy(np.sort(np.random.default_rng(seed).choice(n, size=b_h, replace=False)))
-        z, a, _ = self.transition_batch(idx, features)
-        u = torch.cat((z, a), dim=-1)
-        if cfg.curvature_backend == "closed_form":
-            ggn = ggn_diagonal_closed_form(head, cfg.activation, u, cfg.curvature_chunk_size)
+        full = cfg.curvature_num_transitions is None or cfg.curvature_num_transitions >= n
+        if full:
+            b_h, seed, idx = n, None, torch.arange(n)
+            sampling = "every valid transition (full replay, no sampling)"
         else:
-            ggn = ggn_diagonal_autograd(head, u, cfg.autograd_output_chunk, cfg.autograd_sample_chunk)
+            b_h, seed = cfg.curvature_num_transitions, self.curvature_seed(round_id)
+            idx = torch.from_numpy(np.sort(np.random.default_rng(seed).choice(n, size=b_h, replace=False)))
+            sampling = "uniform without replacement over the N valid transitions (private generator)"
+        ggn = None
+        for start in range(0, b_h, cfg.curvature_block_size):  # float64 accumulation across blocks
+            z, a, _ = self.transition_batch(idx[start:start + cfg.curvature_block_size], features)
+            u = torch.cat((z, a), dim=-1)
+            if cfg.curvature_backend == "closed_form":
+                part = ggn_diagonal_closed_form(head, cfg.activation, u, cfg.curvature_chunk_size)
+            else:
+                part = ggn_diagonal_autograd(head, u, cfg.autograd_output_chunk, cfg.autograd_sample_chunk)
+            ggn = part if ggn is None else ggn + part
+            del z, a, u
         scale = n / b_h if cfg.curvature_scaling == "full_replay" else 1.0
         h_D = (cfg.prior_precision + scale * ggn / cfg.tau_squared).float()
         if not torch.isfinite(h_D).all() or (h_D <= 0).any():
             raise FloatingPointError("Non-finite or non-positive LCG-predictor precision")
         info = dict(round=round_id, backend=cfg.curvature_backend, replay_transitions=n, num_samples=b_h,
-                    sampling="uniform without replacement over the N valid transitions (private generator)",
-                    sample_seed=seed, scaling=cfg.curvature_scaling, scale_factor=float(scale),
+                    sampling=sampling, sample_seed=seed, scaling=cfg.curvature_scaling, scale_factor=float(scale),
                     tau_squared=float(cfg.tau_squared), prior_precision=float(cfg.prior_precision),
                     ggn_sum=float(ggn.sum()), h_min=float(h_D.min()), h_median=float(h_D.median()),
                     h_max=float(h_D.max()),

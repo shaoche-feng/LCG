@@ -82,9 +82,9 @@ def test_config_group_and_preset():
     assert (cfg.hidden_dims, cfg.activation, cfg.lr, cfg.batch_size, cfg.fit_updates, cfg.optimizer, cfg.init_policy) == (
         [256, 256], "silu", 1e-3, 256, 500, "adam", "reinitialize")  # Plan2Explore's per-head budget
     assert (cfg.tau_squared, cfg.prior_precision, cfg.curvature_backend, cfg.curvature_num_transitions,
-            cfg.curvature_scaling) == (1.0, 1.0, "closed_form", 320, "full_replay")
+            cfg.curvature_scaling) == (1.0, 1.0, "closed_form", None, "full_replay")
     assert (cfg.scorer_backend, cfg.num_probes, cfg.score_dtype, cfg.allow_tf32) == ("exact_trace", 5, "float32", False)
-    assert cfg.reward_scaling_settings() == dict(method="lcg_predictor", mode="data_scaled", fixed_divisor=1.0,
+    assert cfg.reward_scaling_settings() == dict(method="lcg_predictor", mode="data_scaled", fixed_divisor=500.0,
                                                  data_reference_steps=5500)
     preset = compose(["+experiment=lcg_predictor_100k"])
     OmegaConf.resolve(preset)
@@ -119,7 +119,8 @@ def test_resolved_dimensions_on_the_real_architecture():
     (dict(tau_squared=0.0), "tau_squared must be a finite positive"),
     (dict(prior_precision=-1.0), "prior_precision must be a finite positive"),
     (dict(prior_precision=float("inf")), "prior_precision must be a finite positive"),
-    (dict(curvature_num_transitions=0), "curvature_num_transitions must be a positive integer"),
+    (dict(curvature_num_transitions=0), "curvature_num_transitions must be null"),
+    (dict(curvature_block_size=0), "curvature_block_size must be a positive integer"),
     (dict(num_probes=0), "num_probes must be a positive integer"),
     (dict(curvature_backend="kfac"), "curvature_backend must be one of"),
     (dict(curvature_scaling="half"), "curvature_scaling must be one of"),
@@ -351,6 +352,18 @@ def test_a_replay_smaller_than_the_subset_uses_every_transition_unscaled(tmp_pat
     assert lp.curvature_info["num_samples"] == lp.num_transitions and lp.curvature_info["scale_factor"] == 1.0
 
 
+def test_full_replay_precision_sums_every_transition_in_blocks(tmp_path):
+    # null B_H: the exact sum over all N valid transitions, s = 1, no sampling; blocks only bound device memory.
+    lp, _ = refreshed(tmp_path, curvature_num_transitions=None, curvature_block_size=4, prior_precision=2.0,
+                      tau_squared=0.5)
+    n, info = lp.num_transitions, lp.curvature_info
+    assert n > 4 and info["num_samples"] == n and info["scale_factor"] == 1.0 and info["sample_seed"] is None
+    assert "full replay" in info["sampling"]
+    z, a, _ = lp.transition_batch(torch.arange(n))
+    ggn = ggn_diagonal_closed_form(lp.predictor, "silu", torch.cat((z, a), -1))
+    torch.testing.assert_close(lp.h_D, (2.0 + ggn / 0.5).float(), rtol=1e-6, atol=0)
+
+
 def test_precision_backends_agree_and_are_recomputed_each_round(tmp_path):
     closed, dataset = refreshed(tmp_path, curvature_backend="closed_form")
     auto = make_lcgp(curvature_backend="autograd", autograd_output_chunk=7)
@@ -421,6 +434,15 @@ def test_float64_scoring_agrees_with_float32(tmp_path, backend):
     assert torch.equal(lp32.h_D, lp64.h_D) and same(lp32.bank, lp64.bank)
     f, a = candidates(lp32)
     torch.testing.assert_close(lp64.score_features(f, a), lp32.score_features(f, a), rtol=1e-4, atol=1e-7)
+
+
+def test_default_data_scaled_divisor_values():
+    # Defaults: divisor = 500 * 5500 / replay_steps.
+    lp = make_lcgp(curvature_num_transitions=None)
+    assert (lp.cfg.reward_scaling, lp.cfg.fixed_divisor, lp.cfg.data_reference_steps) == ("data_scaled", 500.0, 5500)
+    assert lp.divisor(5_500) == 500.0
+    assert lp.divisor(6_000) == pytest.approx(458.3333333333333, rel=1e-12)
+    assert lp.divisor(100_000) == pytest.approx(27.5, rel=1e-12)
 
 
 @pytest.mark.parametrize("mode,divisor", [("data_scaled", 2.0 * 50 / 21), ("fixed", 2.0), ("none", None)])

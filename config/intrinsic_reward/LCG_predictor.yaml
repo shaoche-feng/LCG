@@ -45,10 +45,12 @@ fit_updates: 500  # per refresh
 tau_squared: 1.0  # feature-likelihood variance, standardized-feature units
 prior_precision: 1.0  # lambda: Gaussian prior N(0, I / lambda) on every predictor parameter
 
-# ---- Historical precision h_D = lambda + s * diag(sum_{i in subset} J_i^T J_i) / tau^2 (exact GGN diagonal).
+# ---- Historical precision h_D = lambda + s * diag(sum_i J_i^T J_i) / tau^2 (exact GGN diagonal).
 curvature_backend: closed_form  # closed_form (exact, MLP) or autograd (exact, generic per-sample VJPs; slow)
-curvature_num_transitions: 320  # B_H, uniform without replacement over the N valid transitions
-curvature_scaling: full_replay  # full_replay: s = N / B_H; none: s = 1 (the subset's plain sum)
+curvature_num_transitions: null  # null: every valid replay transition (exact sum, s = 1); an integer B_H: a uniform
+                                 # without-replacement subset of B_H transitions, scaled as below
+curvature_scaling: full_replay  # subset only: full_replay: s = N / B_H; none: s = 1 (the subset's plain sum)
+curvature_block_size: 8192  # transitions moved to the device per block (memory only)
 curvature_chunk_size: 64  # memory only
 autograd_output_chunk: 128  # memory only
 autograd_sample_chunk: 4  # memory only
@@ -65,9 +67,10 @@ allow_tf32: false  # TF32 float32 matmuls in fitting, curvature and scoring (the
 candidate_chunk_size: 1024  # candidates per scoring call (memory only)
 
 # ---- Policy reward from raw scores (frozen per round). data_scaled: raw / (fixed_divisor * data_reference_steps / N_steps),
-# N_steps the replay size at the refresh (h_D grows about linearly with N under full_replay scaling); fixed: raw /
-# fixed_divisor; none: raw (set fixed_divisor and data_reference_steps to null). Provisional: equals raw at the
-# first 100k-schedule refresh (5,500 steps).
+# N_steps the replay size at the refresh (h_D, a sum over the replay, grows about linearly with N); fixed: raw /
+# fixed_divisor; none: raw (set fixed_divisor and data_reference_steps to null). fixed_divisor 500 (2026-11-26):
+# divisor 500 at 5,500 steps, 458.3 at 6,000 and 27.5 at 100,000. With divisor 1 the scaled reward was ~170-250 per
+# step and the critic could not follow (6,000-step pilot, 2026-11-25).
 reward_scaling: data_scaled
-fixed_divisor: 1.0
+fixed_divisor: 500.0
 data_reference_steps: 5500

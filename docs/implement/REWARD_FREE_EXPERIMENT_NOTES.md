@@ -1194,6 +1194,47 @@ Changes after the first review. Still uncommitted on base `f1366e1`; review pack
   - It needs one bounded pilot to confirm the critic catches up; no tuning sweep is proposed.
 - **Not established.** Exploration benefit, calibration of the Laplace variance, multi-seed behaviour, and the controller under the proposed scale.
 
+#### Full-replay precision (2026-11-26)
+
+- **Change.** The historical precision now sums the exact GGN diagonal over every valid replay transition (`curvature_num_transitions: null`, the new default; s = 1, no sampling, seed None). Before, it used a uniform 320-transition subset scaled by N/320. An integer still selects that subset rule.
+- **Memory.** The replay is moved to the device in blocks (`curvature_block_size: 8192`, memory only) and accumulated in float64.
+- **Cost.** At 100,000 transitions on kingplus0 GPU 1 (RTX 5090; random inputs of the real shape): 0.78 s with chunk 64 (peak 180 MiB), 0.36 s with chunk 1024 (1.1 GB). The chunk size stays 64. Replay encoding remains the dominant refresh cost (about 23 s at 100k).
+- **Tests.** `test_lcg_predictor.py`: 74 passed, including a check that the blockwise full-replay h_D equals one sum over all transitions, and that an invalid block size is refused.
+- **Not rerun.** The fitting-budget comparison used the 320 subset. Checkpoints from the 2026-11-25 pilot no longer resume under the new settings (the settings check refuses).
+- **Reward.** `fixed_divisor` 1 → 500, keeping `data_scaled` and `data_reference_steps` 5,500: divisor = 500 · 5,500 / replay_steps, i.e. 500 at 5,500, 458.33 at 6,000 and 27.5 at 100,000 (unit test). λ = 1, τ² = 1 and every other setting unchanged.
+
+**Pilot r3 (2026-11-26)** (`outputs/lcg_predictor_review/r3/`; kingplus0 physical GPU 1; working-tree snapshot, the server clone unchanged). Same 6,000-step Walker pilot as 2026-11-25 with full-replay precision and divisor 500; exit 0; 10,805 history rows, none non-finite.
+- **Files and restoration.**
+  - Both milestones record a full-replay precision: 5,500 and 6,000 transitions used of 5,500 and 6,000, scale 1, seed None. They record the reward settings and the resolved divisors 500 and 458.333, which equal the formula.
+  - The checkpoint's round equals the 6,000 milestone's, bitwise in h_D, predictor, standardization, divisor and raw and scaled scores. Separate-process refits reproduce both rounds exactly.
+  - Curvature took 0.05 s per refresh.
+- **Comparison with the 2026-11-25 pilot** (epoch 1 → epoch 2, medians over PMPO updates unless stated):
+
+  | | 2026-11-25 (B_H 320, divisor 1) | r3 (full replay, divisor 500) |
+  | --- | --- | --- |
+  | Raw reward per step | 204 → 176 | 205 → 169 |
+  | Scaled reward per step | 204 → 192 | 0.41 → 0.37 |
+  | λ-return mean (last) | 1,676 → 3,613 | 6.4 → 9.0 |
+  | Relative value error \|bias\|/\|return\| (last) | 0.56 → 0.16 | 0.22 → 0.085 |
+  | Value-target correlation | 0.21 → 0.54 | 0.47 → 0.76 (last 0.86) |
+  | Value loss | 1.2e6 → 1.3e6 | 5.7 → 2.6 |
+  | Value gradient norm (median; clip 10) | 2.7e5 → 5.6e5 | 7.8 → 15.6 |
+  | Updates with value gradient clipped | 100% → 100% | 36% → 68% |
+  | positive_fraction (median) | 1.0 → 1.0 | 1.0 → 0.98 (last 0.93) |
+  | Advantage p10 / median / p90 (epoch 2) | 199 / 647 / 1,295 | 0.22 / 0.91 / 1.81 |
+  | Policy entropy | 3.33 → 3.34 | 3.33 → 3.35 |
+  | KL to prior (median) | 0.002 → 0.002 | 0.002 → 0.046 |
+  | Actor gradient norm (median), clipped | 0.21 → 0.19, 0% | 0.22 → 1.96, 0% |
+  | Actor distance from init (last) | 0.024 → 0.035 | 0.028 → 0.068 |
+
+- **Reading.**
+  - **Critic.** It tracks its targets within two epochs: 8.5% relative error, correlation 0.86 at the end, and losses of order 1.
+  - **Clipping.** Value gradients are clipped moderately (norms 1–77), not by factors of 1e5.
+  - **Advantages.** Negative advantages appear in epoch 2.
+  - **Actor.** It moves more: higher KL and actor gradient norms, and twice the distance from its initialization.
+  - **Raw scores.** The full-replay and subset precisions give the same raw-score scale, consistent with the subset being an unbiased estimate.
+- **Not established.** Exploration quality, and multi-seed or 100k behaviour.
+
 ## Step 7 — Logging and analysis
 
 ### Status history (moved from the progress file, 2026-10-29)

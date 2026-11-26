@@ -13,8 +13,12 @@ set -euo pipefail
 #   GPU=0 PRESET=plan2explore_100k LABEL=plan2explore bash scripts/run_100k_pilot.sh
 # Uniform:
 #   GPU=0 PRESET=uniform_100k LABEL=uniform bash scripts/run_100k_pilot.sh
+# Predictor-based LCG, one group per GPU:
+#   GPU=0 RUN_GROUPS=walker PRESET=lcg_predictor_100k LABEL=lcg-predictor bash scripts/run_100k_pilot.sh
+#   GPU=1 RUN_GROUPS=cartpole-balance PRESET=lcg_predictor_100k LABEL=lcg-predictor bash scripts/run_100k_pilot.sh
 #
-# Phase 1: explore all six listed task groups.
+# RUN_GROUPS (optional, space-separated group labels) selects groups; default: every listed group.
+# Phase 1: explore the selected task groups.
 # Phase 2: adapt only 100k milestones.
 # Seeds default to 0; override with EXPLORATION_SEED and ADAPTATION_SEED.
 # Resume interrupted exploration: bash scripts/resume.sh <run folder>
@@ -53,7 +57,7 @@ export PYTHONUNBUFFERED=1
 # Group label | actual dm_control domain | available tasks
 #
 # Separate Cartpole labels prevent the two groups sharing an output.
-TASK_GROUPS=(
+ALL_TASK_GROUPS=(
     'walker|walker|stand,walk,run'
     'hopper|hopper|stand,hop'
     'acrobot|acrobot|swingup,swingup_sparse'
@@ -62,6 +66,23 @@ TASK_GROUPS=(
     'humanoid|humanoid|stand,walk,run,run_pure_state'
     'humanoid_CMU|humanoid_CMU|stand,walk,run'
 )
+
+# Groups to run, space-separated, e.g. RUN_GROUPS=walker or RUN_GROUPS="walker cartpole-balance".
+RUN_GROUPS="${RUN_GROUPS:-$(for entry in "${ALL_TASK_GROUPS[@]}"; do printf '%s ' "${entry%%|*}"; done)}"
+TASK_GROUPS=()
+for name in $RUN_GROUPS; do
+    found=0
+    for entry in "${ALL_TASK_GROUPS[@]}"; do
+        if [[ "${entry%%|*}" == "$name" ]]; then
+            TASK_GROUPS+=("$entry")
+            found=1
+        fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+        printf 'Unknown group in RUN_GROUPS: %s\n' "$name" >&2
+        exit 1
+    fi
+done
 
 # -------------------------------------------------------------------
 # Exploration: one task group
@@ -161,8 +182,8 @@ ERROR_LOG="$ATTEMPT_DIR/launcher.stderr.log"
 exec > >(tee -a "$LAUNCH_LOG") \
      2> >(tee -a "$ERROR_LOG" >&2)
 
-printf '%s experiment | GPU %s | exploration seed %s | adaptation seed %s\n' \
-    "$LABEL" "$GPU" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
+printf '%s experiment | GPU %s | groups %s | exploration seed %s | adaptation seed %s\n' \
+    "$LABEL" "$GPU" "$RUN_GROUPS" "$EXPLORATION_SEED" "$ADAPTATION_SEED"
 printf 'Outputs: %s\nTerminal logs: %s\n' "$OUTPUT_ROOT" "$ATTEMPT_DIR"
 
 # -------------------------------------------------------------------

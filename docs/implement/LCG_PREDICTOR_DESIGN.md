@@ -42,8 +42,9 @@ Plan2Explore scores a candidate transition by how much five independently fitted
 
 h_D = λ·1 + s · diag(Σ_{i∈H} J_iᵀ J_i) / τ², with J_i = ∂f_ψ(u_i)/∂ψ ∈ R^{D×P}.
 
-- **Subset H.** B_H = 320 transitions, drawn uniformly without replacement from the N valid transitions with a private generator. If N < B_H, every transition is used.
-- **Scaling.** s = N / B_H (`curvature_scaling: full_replay`, the default; consistent with the MAP objective's full-replay likelihood) or s = 1 (`none`). The scale factor, N, B_H, the seed and the sampling rule are recorded.
+- **Set H (default: the full replay).** `curvature_num_transitions: null` uses every one of the N valid transitions, so the sum is exact and s = 1. The replay is moved to the device in blocks of `curvature_block_size` (8,192) and accumulated in float64. At 100k transitions this takes about 0.8 s on the RTX 5090 (peak 180 MiB), against about 23 s for replay encoding. Changed from a 320-transition subset on 2026-11-26.
+- **Optional subset.** An integer B_H draws B_H transitions uniformly without replacement with a private generator (if N ≤ B_H, every transition is used, unscaled). Scaling: s = N / B_H (`curvature_scaling: full_replay`; consistent with the MAP objective's full-replay likelihood) or s = 1 (`none`).
+- **Record.** N, the number of transitions used, the sampling rule, the seed (None for the full replay) and the scale factor are recorded.
 - **Backends.** Both are exact GGN diagonals; neither uses squared loss gradients.
   - `closed_form` (default): with layer inputs h_l, pre-activations a_l and column norms c_l[p] = ‖∂f/∂a_l[p]‖²:
     - hidden layers: W_l[p, q] gets c_l[p]·h_{l−1}[q]² and b_l[p] gets c_l[p];
@@ -77,7 +78,7 @@ The divisor is frozen per round, and raw and scaled values are logged separately
 | `none` | raw |
 
 - Under `full_replay` scaling, h_D grows roughly linearly with N, so raw scores shrink as about 1/N. Data scaling is LCG's existing correction for this (`REWARD_SCALING.md`).
-- The defaults (fixed_divisor 1, data_reference_steps 5,500) make reward = raw at the first 100k-schedule refresh. They are provisional.
+- The defaults (fixed_divisor 500, data_reference_steps 5,500; 2026-11-26) give a divisor of 500 at the first 100k-schedule refresh and 27.5 at 100k, about 0.4 per step in the bounded pilot. With fixed_divisor 1 (the earlier default) the scaled reward was about 200 per step and the critic could not follow.
 
 ## Lifecycle (per epoch)
 
@@ -144,8 +145,8 @@ Refreshes are atomic within an epoch, and checkpoints are written at epoch bound
 | Features | `feature_layers` [d_blocks.2, d_blocks.3], `pool_size` 4, `feature_sigma` 0.1, `probe_seed` 0, `feature_std_floor` 1e-3, `encode_batch_size` 256 |
 | Predictor and fit | `hidden_dims` [256, 256], `activation` silu, `init_policy` reinitialize, `optimizer` adam, `lr` 1e-3, `adam_betas` [0.9, 0.999], `adam_eps` 1e-8, `grad_clip_norm` null, `batch_size` 256, `fit_updates` 500 |
 | Bayesian model | `tau_squared` 1.0, `prior_precision` 1.0 |
-| Curvature | `curvature_backend` closed_form, `curvature_num_transitions` 320, `curvature_scaling` full_replay, `curvature_chunk_size` 64, `autograd_output_chunk` 128, `autograd_sample_chunk` 4 |
+| Curvature | `curvature_backend` closed_form, `curvature_num_transitions` null (full replay), `curvature_block_size` 8192, `curvature_scaling` full_replay (subset only), `curvature_chunk_size` 64, `autograd_output_chunk` 128, `autograd_sample_chunk` 4 |
 | Scoring | `scorer_backend` exact_trace, `num_probes` 5 and `bank_seed` 0 (both `jvp_bank` only), `score_dtype` float32, `allow_tf32` false, `candidate_chunk_size` 1024 |
-| Reward | `reward_scaling` data_scaled, `fixed_divisor` 1.0, `data_reference_steps` 5500 |
+| Reward | `reward_scaling` data_scaled, `fixed_divisor` 500.0, `data_reference_steps` 5500 |
 
 All values are working placeholders. The training budget follows Plan2Explore, and τ², λ and the reward scale are untuned.

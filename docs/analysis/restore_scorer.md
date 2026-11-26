@@ -50,7 +50,7 @@ Use the **existing scaling config** to select the mode. Set it to **data scaling
 | What | Where it is saved |
 | --- | --- |
 | The MAP predictor's `state_dict()`, its architecture, its SHA-256 and the flat parameter order (names, shapes, offsets) used by every tensor below. | `milestones/steps_005500/lcg_predictor.pt` |
-| The historical diagonal precision `h_D` (flat, in that order), `tau_squared`, `prior_precision` and the curvature record (replay size, sampling rule, subset size and seed, scaling factor). | `milestones/steps_005500/lcg_predictor_precision.pt` |
+| The historical diagonal precision `h_D` (flat, in that order), `tau_squared`, `prior_precision` and the curvature record (replay size, sampling rule, number of transitions used and seed, scaling factor; by default the full replay, seed None). | `milestones/steps_005500/lcg_predictor_precision.pt` |
 | With the default `scorer_backend: exact_trace`: an explicit record that no bank is used (`tangents` and `bank_seed` are None). With `jvp_bank`: the actual JVP bank used for scoring, `v_m = h_D^{-1/2} * eta_m` (rows in probe order), with its seed. | `milestones/steps_005500/lcg_predictor_bank.pt` |
 | The feature standardization (mean, floored std) and the feature-extraction settings, including the probe SHA-256. | `milestones/steps_005500/lcg_predictor_normalization.pt` |
 | The resolved settings, the run seed, the round id, the denoiser/replay/extraction identity, the frozen reward divisor and its replay size, and the fit record. | `milestones/steps_005500/lcg_predictor_scorer.pt` |
