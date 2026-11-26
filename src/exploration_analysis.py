@@ -77,7 +77,7 @@ FOLLOW = "follow-intrinsic-reward"
 TESTS = ("task-reward-coverage", "task-reward-lasting", FOLLOW)
 # Output label -> intrinsic_reward.method of the learned methods (data.milestone.OUTPUT_LABELS).
 LEARNED = {"lcg": "lcg", "full-ensemble": "ensemble_disagreement", "laplace-ensemble": "laplace_disagreement",
-           "plan2explore": "plan2explore_disagreement"}
+           "plan2explore": "plan2explore_disagreement", "lcg-predictor": "lcg_predictor"}
 FOLLOW_KEY = ["method", "domain", "milestone", "collected_steps", "window_start", "window_end"]
 FOLLOW_BATCH_COLUMNS = FOLLOW_KEY + ["batch", "run", "segments", "num_transitions", "num_scored", "raw_mean",
                                      "scaled_mean"]
@@ -404,6 +404,9 @@ def check_extends(milestone, replay) -> None:
 
 
 def scorer_requirements(method: str, manifest: Dict[str, Any], members: int) -> List[str]:
+    if method == "lcg-predictor":  # imported only here: the method's package imports the feature extractor
+        from intrinsic_reward.lcg_predictor import MILESTONE_FILES
+        return list(MILESTONE_FILES) + ["exploration_policy.pt"]
     files = {"lcg": ["historical_precision.pt", "jvp_probe_bank.pt", "lcg_scaling.pt"],
              "plan2explore": [f"MLP_member_{k}.pt" for k in range(1, members + 1)]
                              + ["plan2explore_normalization.pt", "exploration_policy.pt"],
@@ -442,7 +445,7 @@ class FrozenScorer:
             d.setup_training(sigma_cfg)
         sampler_cfg = instantiate(cfg.world_model_env).diffusion_sampler
         self.samplers = [DiffusionSampler(d, sampler_cfg) for d in self.denoisers]
-        self.lcg = self.laplace = self.plan2explore = None
+        self.lcg = self.laplace = self.plan2explore = self.lcg_predictor = None
         if method == "lcg":
             from intrinsic_reward.lcg import LCGLifecycle
             self.method_cfg = instantiate(cfg.intrinsic_reward)
@@ -460,6 +463,11 @@ class FrozenScorer:
             self.method_cfg = Plan2ExploreConfig(**fields)
             self.plan2explore = Plan2Explore(self.method_cfg, self.denoisers[0], cfg.env.train.size, list(action_low),
                                              list(action_high), 0 if self.seed is None else self.seed, self.device)
+        elif method == "lcg-predictor":
+            from intrinsic_reward.lcg_predictor import LCGPredictor, LCGPredictorConfig
+            self.method_cfg = LCGPredictorConfig(**fields)
+            self.lcg_predictor = LCGPredictor(self.method_cfg, self.denoisers[0], cfg.env.train.size, list(action_low),
+                                              list(action_high), 0 if self.seed is None else self.seed, self.device)
         self.noise_samples = int(getattr(self.method_cfg, "num_noise_samples", 1))
 
     # ------------------------------------------------------------------ restore from a milestone
@@ -511,6 +519,11 @@ class FrozenScorer:
                                      std=norm["std"], refreshes=None, last_refresh_epoch=norm["refresh_epoch"],
                                      fit_updates=[None] * p2e.cfg.num_members,
                                      empty_bootstrap_fallbacks=[None] * p2e.cfg.num_members, cache_identity=None))
+        elif self.method == "lcg-predictor":
+            recorded = (manifest.get("lcg_predictor") or {}).get("probe_sha256")
+            if recorded is not None and recorded != self.lcg_predictor.extractor.probe_sha256:
+                raise ValueError(f"Milestone {path}: the feature probe differs from the one the run recorded")
+            self.lcg_predictor.load_milestone_files(path)  # also checks the denoiser identity
 
     # ------------------------------------------------------------------ scoring
 
@@ -533,13 +546,14 @@ class FrozenScorer:
                                        batch["successor"][j].unsqueeze(0).to(self.device)))
                 if candidates:
                     raw[scored] = self.lcg.score_candidates(candidates).double().cpu()
-            elif self.method == "plan2explore":
-                p2e = self.plan2explore
-                with preserved(p2e.extractor, ("seconds",)):
+            elif self.method in ("plan2explore", "lcg-predictor"):
+                model = self.plan2explore or self.lcg_predictor
+                score = model.disagreement if self.plan2explore is not None else model.score_features
+                with preserved(model.extractor, ("seconds",)):
                     for i in range(0, W, chunk):
                         s = slice(i, min(i + chunk, W))
-                        features = p2e.extractor(batch["frame"][s], batch["context"][s], batch["context_act"][s])
-                        raw[s] = p2e.disagreement(features, batch["action"][s].to(features.device)).double().cpu()
+                        features = model.extractor(batch["frame"][s], batch["context"][s], batch["context_act"][s])
+                        raw[s] = score(features, batch["action"][s].to(features.device)).double().cpu()
             else:
                 c, h, w = batch["obs"].shape[2:]
                 # One draw for the whole window: transition j gets the same noise in every batch of this seed.
@@ -565,6 +579,8 @@ class FrozenScorer:
             scaled = self.lcg.scale_frozen(x)
         elif self.method == "plan2explore":
             scaled = self.plan2explore.scale(x)
+        elif self.method == "lcg-predictor":
+            scaled = self.lcg_predictor.scale(x)
         else:
             scaled = self.scale_scorer.scale_frozen(x)
         return None if scaled is None else scaled.double().cpu()
@@ -579,6 +595,10 @@ class FrozenScorer:
             d.update(refresh_epoch=self.laplace.refresh_epoch, laplace_members=self.laplace.cfg.num_members)
         if self.plan2explore is not None:
             d.update(refresh_epoch=self.plan2explore.last_refresh_epoch, heads=self.plan2explore.cfg.num_members)
+        if self.lcg_predictor is not None:
+            lp = self.lcg_predictor
+            d.update(round=lp.round_id, reward_divisor=lp.reward_divisor, scorer_backend=lp.cfg.scorer_backend,
+                     num_probes=lp.cfg.num_probes, predictor_parameters=lp.num_parameters)
         return d
 
 
@@ -602,7 +622,7 @@ def restore_milestone_scorer(method: str, milestone_path: Path, device: torch.de
         raise FileNotFoundError(f"Milestone {path} lacks the {method} scorer file(s) {missing} "
                                 "(docs/analysis/restore_scorer.md; milestones saved before scorer checkpoints have none)")
     milestone = load_milestone(path, manifest["task_names"][0], map_location=torch.device("cpu"))
-    if method == "plan2explore":
+    if method in ("plan2explore", "lcg-predictor"):  # canonical actions need the policy's bounds
         policy = torch.load(path / "exploration_policy.pt", map_location="cpu", weights_only=False)
         low, high = policy["action_low"].tolist(), policy["action_high"].tolist()
     else:  # bounds are not read by these scorers; the action dimension is the replay's

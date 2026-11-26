@@ -1,5 +1,5 @@
 """Step 6: the uniform-random exploration preset, the collection-budget check, and the selected
-100k schedule shared by all five method presets for every accepted task group."""
+100k schedule shared by all six method presets for every accepted task group."""
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +11,7 @@ from exploration_trainer import check_collection_budget, ExplorationTrainer
 from models.pmpo_beta import PMPOBeta
 from test_exploration_trainer import COLLECT, compose, run_trainer, TASKS
 
-PRESETS = {"uniform": 1, "lcg": 1, "ensemble": 5, "plan2explore": 1, "laplace": 1}  # denoisers trained
+PRESETS = {"uniform": 1, "lcg": 1, "ensemble": 5, "plan2explore": 1, "laplace": 1, "lcg_predictor": 1}  # denoisers trained
 
 
 GROUPS = [(domain, list(group)) for domain, groups in REWARD_LABEL_TASK_GROUPS.items() for group in groups]

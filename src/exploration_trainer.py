@@ -28,6 +28,7 @@ from intrinsic_reward.lcg import (imagined_candidates_from_batch, LCGLifecycle, 
 from models.pmpo_beta import (PMPOOptimizers, check_controller_state, controller_settings, metric_path,
                               reward_statistics)
 from intrinsic_reward.plan2explore import check_feature_layers, Plan2Explore, Plan2ExploreConfig
+from intrinsic_reward.lcg_predictor import LCGPredictor, LCGPredictorConfig
 from intrinsic_reward.laplace import LaplaceConfig, LaplaceEnsemble, LaplaceScorer
 from intrinsic_reward.intrinsic_eval import aggregate, episode_record, IntrinsicEvaluator
 from pmpo_diagnostic import PMPORunDiagnostic
@@ -74,7 +75,9 @@ class ExplorationTrainer(StateDictMixin):
     "ensemble_disagreement" (intrinsic_reward.num_members denoisers, see ensemble.py) or
     "plan2explore_disagreement" (one denoiser plus intrinsic_reward.num_members lightweight
     feature predictors, see plan2explore.py) or "laplace_disagreement" (one denoiser and
-    intrinsic_reward.num_members Gaussian samples of its LCG-selected parameters, see laplace.py).
+    intrinsic_reward.num_members Gaussian samples of its LCG-selected parameters, see laplace.py) or
+    "lcg_predictor" (one denoiser plus one MAP feature predictor scored by its diagonal-Laplace LCG
+    score, see intrinsic_reward/lcg_predictor/).
     """
 
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
@@ -146,10 +149,12 @@ class ExplorationTrainer(StateDictMixin):
         # Intrinsic-reward method; configs without `method` are LCG. Only the ensemble method
         # trains more than one denoiser (intrinsic_reward.num_members).
         self._method = OmegaConf.select(cfg, "intrinsic_reward.method", default="lcg") if self._learned_exploration else None
-        if self._method not in (None, "lcg", "ensemble_disagreement", "plan2explore_disagreement", "laplace_disagreement"):
-            raise ValueError(f"intrinsic_reward.method must be lcg, ensemble_disagreement, plan2explore_disagreement or "
-                             f"laplace_disagreement, got {self._method!r}")
+        if self._method not in (None, "lcg", "ensemble_disagreement", "plan2explore_disagreement", "laplace_disagreement",
+                                "lcg_predictor"):
+            raise ValueError(f"intrinsic_reward.method must be lcg, ensemble_disagreement, plan2explore_disagreement, "
+                             f"laplace_disagreement or lcg_predictor, got {self._method!r}")
         self._ensemble_members, self._ensemble_cfg, self._p2e_cfg, self._laplace_cfg = 1, None, None, None
+        self._lcgp_cfg = None
         if self._method == "laplace_disagreement":
             fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
             self._laplace_cfg = LaplaceConfig(**fields)  # plain ValueError on bad settings
@@ -163,6 +168,12 @@ class ExplorationTrainer(StateDictMixin):
             if cfg.training.compile_wm:
                 raise ValueError("Plan2Explore imagination is validated uncompiled; set training.compile_wm=false")
             check_feature_layers(self._p2e_cfg, instantiate(cfg.agent.denoiser), cfg.env.train.size)
+        if self._method == "lcg_predictor":
+            fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
+            self._lcgp_cfg = LCGPredictorConfig(**fields)  # plain ValueError on bad settings
+            if cfg.training.compile_wm:
+                raise ValueError("LCG-predictor imagination is validated uncompiled; set training.compile_wm=false")
+            check_feature_layers(self._lcgp_cfg, instantiate(cfg.agent.denoiser), cfg.env.train.size)
         if self._method == "ensemble_disagreement":
             fields = {k: v for k, v in OmegaConf.to_container(cfg.intrinsic_reward).items() if k != "_target_"}
             self._ensemble_cfg = EnsembleDisagreementConfig(**fields)  # plain ValueError on bad settings
@@ -257,6 +268,13 @@ class ExplorationTrainer(StateDictMixin):
         if self._p2e_cfg is not None:
             self.plan2explore = Plan2Explore(self._p2e_cfg, self.agent.denoiser, cfg.env.train.size,
                                              action_kwargs["action_low"], action_kwargs["action_high"], seed, self._device)
+        # LCG predictor: the same feature extractor on the single denoiser, one MAP predictor, its
+        # precision and bank (built at each refresh).
+        self.lcg_predictor = None
+        if self._lcgp_cfg is not None:
+            self.lcg_predictor = LCGPredictor(self._lcgp_cfg, self.agent.denoiser, cfg.env.train.size,
+                                              action_kwargs["action_low"], action_kwargs["action_high"], seed, self._device)
+        self._feature_scorer = self.plan2explore or self.lcg_predictor  # imagination reports features for these
 
         # Laplace: LCG's selection (and its guards) on the single denoiser; samples are drawn at
         # each refresh. The agent holds one denoiser; members exist only as a sample bank.
@@ -348,7 +366,7 @@ class ExplorationTrainer(StateDictMixin):
                                    return_imagined_candidate=self._method == "lcg", ensemble=ensemble,
                                    ensemble_noise_samples=(self._ensemble_cfg.num_noise_samples if ensemble else
                                                            self._laplace_cfg.num_noise_samples if self.laplace else 1),
-                                   feature_encoder=self.plan2explore.extractor if self.plan2explore else None,
+                                   feature_encoder=self._feature_scorer.extractor if self._feature_scorer else None,
                                    member_predictor=self.laplace.predict_members if self.laplace else None)
             if cfg.training.compile_wm:
                 rl_env.predict_next_obs = torch.compile(rl_env.predict_next_obs, mode="reduce-overhead")
@@ -387,6 +405,8 @@ class ExplorationTrainer(StateDictMixin):
             self._ensemble_scorer = EnsembleScorer(self._ensemble_cfg)
         elif self._method == "plan2explore_disagreement":
             self._lcg_reward_scaling = self._p2e_cfg.reward_scaling_settings()
+        elif self._method == "lcg_predictor":
+            self._lcg_reward_scaling = self._lcgp_cfg.reward_scaling_settings()
         elif self._method == "laplace_disagreement":
             self._lcg_reward_scaling = self._laplace_cfg.reward_scaling_settings()
             self._ensemble_scorer = LaplaceScorer(self._laplace_cfg)
@@ -412,7 +432,8 @@ class ExplorationTrainer(StateDictMixin):
             self._intrinsic = IntrinsicEvaluator(
                 self._method, cfg.agent.denoiser.inner_model.num_steps_conditioning, self._device,
                 lcg=self._lcg_lifecycle, ensemble_samplers=rl_env.ensemble_samplers, ensemble_scorer=self._ensemble_scorer,
-                laplace=self.laplace, sampler=rl_env.sampler, plan2explore=self.plan2explore, noise_samples=noise)
+                laplace=self.laplace, sampler=rl_env.sampler, plan2explore=self.plan2explore, noise_samples=noise,
+                lcg_predictor=self.lcg_predictor)
 
         # Training state (things to be saved/restored)
         self.epoch = 0
@@ -671,6 +692,13 @@ class ExplorationTrainer(StateDictMixin):
                                                   self.successor_observations(), epoch=self.epoch)
                         self.agent.denoiser.eval()
                         self.agent.actor_critic.set_intrinsic_reward_fn(self.plan2explore)
+                    elif self.lcg_predictor is not None:
+                        # Encode the replay with this epoch's (frozen) denoiser, fit the MAP predictor, build its
+                        # precision and this round's bank, all frozen for PMPO; the denoiser is only read.
+                        self.lcg_predictor.refresh(self.agent.denoiser, self.train_dataset,
+                                                   self.successor_observations(), epoch=self.epoch)
+                        self.agent.denoiser.eval()
+                        self.agent.actor_critic.set_intrinsic_reward_fn(self.lcg_predictor)
                     elif self.laplace is not None:
                         # LCG's precision on this epoch's denoiser, then a fresh sample bank, frozen
                         # for the PMPO phase; the base denoiser is only read (eval mode).
@@ -767,7 +795,7 @@ class ExplorationTrainer(StateDictMixin):
         """Per imagined step of the last PMPO update: the scorer's raw intrinsic reward and the
         scaled policy reward, under the same names for every method (units differ by method).
         Mean and max always; with debug metrics also std, min, p10, median, p90, p99."""
-        scorer = self._lcg_lifecycle or self._ensemble_scorer or self.plan2explore
+        scorer = self._lcg_lifecycle or self._ensemble_scorer or self.plan2explore or self.lcg_predictor
         if scorer is None or scorer.last_raw is None:
             return {}
         metrics = {}
@@ -953,6 +981,11 @@ class ExplorationTrainer(StateDictMixin):
                         cache_identity=p2e.cache_identity)
         if self.laplace is not None:
             info.update(refreshes=int(self.laplace.refreshes))
+        if self.lcg_predictor is not None:
+            lp = self.lcg_predictor
+            info.update(refreshes=int(lp.refreshes), round=lp.round_id, fit_updates=int(lp.fit_updates_total),
+                        reward_divisor=lp.reward_divisor, curvature=lp.curvature_info, cache_identity=lp.cache_identity,
+                        fit={k: v for k, v in (lp.fit_info or {}).items() if k.startswith(("after_", "loss_"))})
         wandb.summary["scorer"] = info
 
     def announce_start(self) -> None:
@@ -1012,6 +1045,8 @@ class ExplorationTrainer(StateDictMixin):
             if self.plan2explore is not None:  # extractor settings include the feature dimension
                 settings["plan2explore"] = dict(self.plan2explore.settings(),
                                                 head_parameters=int(self.plan2explore.num_head_parameters))
+            if self.lcg_predictor is not None:  # includes the parameter layout and resolved dimensions
+                settings["lcg_predictor"] = self.lcg_predictor.settings()
             if self.ensemble is not None:
                 settings["ensemble"] = self.ensemble.settings()
         controller = None
@@ -1283,6 +1318,12 @@ class ExplorationTrainer(StateDictMixin):
         elif state_dict["plan2explore"] is not None:
             raise ValueError("Checkpoint was trained with Plan2Explore feature predictors, the config selects "
                              f"intrinsic_reward method {self._method!r}; a resume must not change it")
+        state_dict.setdefault("lcg_predictor", None)  # checkpoints from before the LCG predictor
+        if self.lcg_predictor is not None:
+            self.lcg_predictor.check_settings(state_dict["lcg_predictor"])  # before any weights are loaded
+        elif state_dict["lcg_predictor"] is not None:
+            raise ValueError("Checkpoint was trained with an LCG feature predictor, the config selects "
+                             f"intrinsic_reward method {self._method!r}; a resume must not change it")
         # The controller (Beta/Gaussian, slow critic, frame-history convention, horizon) before any
         # weights are loaded: a mismatch is refused, never reinterpreted.
         check_controller_state(state_dict["agent"].get("actor_critic._extra_state"), self.agent.actor_critic.cfg,
@@ -1325,6 +1366,9 @@ class ExplorationTrainer(StateDictMixin):
                 actor_critic.set_intrinsic_reward_fn(self._ensemble_scorer)
         if self.plan2explore is not None and self.plan2explore.heads is not None:
             actor_critic.set_intrinsic_reward_fn(self.plan2explore)
+        if self.lcg_predictor is not None and self.lcg_predictor.predictor is not None:
+            self.lcg_predictor.check_denoiser()  # the restored round belongs to the restored denoiser
+            actor_critic.set_intrinsic_reward_fn(self.lcg_predictor)
 
     def collection_state(self) -> Optional[Dict[str, Any]]:
         """The train collector at this epoch boundary: unfinished episode ids, the current
@@ -1475,6 +1519,16 @@ class ExplorationTrainer(StateDictMixin):
                 pool_size=int(p2e.cfg.pool_size), probe_sha256=p2e.extractor.probe_sha256,
                 last_refresh_epoch=p2e.last_refresh_epoch, refreshes=int(p2e.refreshes),
                 note="single denoiser; feature predictors are not part of the milestone")
+        if self.lcg_predictor is not None:
+            lp = self.lcg_predictor
+            manifest["lcg_predictor"] = dict(
+                feature_layers=list(lp.cfg.feature_layers), feature_dim=int(lp.feature_dim),
+                feature_sigma=float(lp.cfg.feature_sigma), pool_size=int(lp.cfg.pool_size),
+                probe_sha256=lp.extractor.probe_sha256, num_parameters=int(lp.num_parameters),
+                hidden_dims=list(lp.cfg.hidden_dims), scorer_backend=lp.cfg.scorer_backend,
+                num_probes=int(lp.cfg.num_probes), tau_squared=float(lp.cfg.tau_squared),
+                prior_precision=float(lp.cfg.prior_precision), round_id=lp.round_id, refreshes=int(lp.refreshes),
+                note="single denoiser; the frozen predictor round is in the lcg_predictor*.pt scorer files")
         if self.laplace is not None:
             # Provenance only: denoiser.pt is the unperturbed trained model; the sample bank is
             # exploration state (checkpoints/state.pt), not used downstream.
@@ -1532,6 +1586,8 @@ class ExplorationTrainer(StateDictMixin):
                 mean=p2e.mean.cpu(), std=p2e.std.cpu(), raw_std=None if p2e.raw_std is None else p2e.raw_std.cpu(),
                 feature_std_floor=float(p2e.cfg.feature_std_floor), refresh_epoch=p2e.last_refresh_epoch,
                 use="standardize(features) = (features - mean) / std, std already floored; raw_std is monitoring only")
+        if self.lcg_predictor is not None:
+            files.update(self.lcg_predictor.milestone_files())  # checks the predictor is still the fitted one
         if self.laplace is not None and self.laplace.perturbations is not None:
             lap = self.laplace
             delta, members, offset = lap.perturbations.detach().cpu(), {}, 0
@@ -1569,11 +1625,13 @@ class ExplorationTrainer(StateDictMixin):
 RESUME_FORMAT = 3
 
 METHOD_NAMES = {None: "uniform random", "lcg": "LCG", "ensemble_disagreement": "full diffusion ensemble",
-                "plan2explore_disagreement": "Plan2Explore-style ensemble", "laplace_disagreement": "Laplace ensemble"}
+                "plan2explore_disagreement": "Plan2Explore-style ensemble", "laplace_disagreement": "Laplace ensemble",
+                "lcg_predictor": "LCG predictor"}
 REFRESH_WORK = {"lcg": "historical precision and candidate bank on this epoch's denoiser",
                 "ensemble_disagreement": "freezing the trained members (no refresh computation)",
                 "plan2explore_disagreement": "replay feature encoding and fresh predictor heads",
-                "laplace_disagreement": "historical precision and a new posterior sample bank"}
+                "laplace_disagreement": "historical precision and a new posterior sample bank",
+                "lcg_predictor": "replay feature encoding, fitted predictor and its precision (probe bank with jvp_bank)"}
 PMPO_UPDATE_AXIS = "actor_critic/train/core/num_batch_train_actor_critic"
 # W&B metrics plotted against epoch (setup_wandb): every logged key outside the per-update
 # denoiser/actor_critic train rows. epoch itself is a hidden x-axis.

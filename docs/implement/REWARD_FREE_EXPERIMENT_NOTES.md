@@ -1028,6 +1028,172 @@ Review: `docs/changes/step6_laplace_first_refresh_review.zip`. A configuration c
 **Recommendation.** Retain T = 1 provisionally for a later bounded online pilot. Temperature, prior, damping, subset and divisor are unchanged.
 
 
+### Predictor-based LCG (2026-11-25)
+
+Uncommitted working-tree change on branch `reward_free_experiment_analysis`, base `f1366e1`. Review package: `docs/changes/lcg_predictor_review.zip`. Design, equations and checkpoint schema: `docs/implement/LCG_PREDICTOR_DESIGN.md`. Integration and numerical tests only; no exploration experiment has been run.
+
+#### Files and commands
+
+- `src/intrinsic_reward/lcg_predictor/`:
+  - `lifecycle.py`: `LCGPredictorConfig`, `LCGPredictor` (refresh, PMPO hook, state, milestone files and their restore).
+  - `training.py`: the explicit MAP objective and its loop.
+  - `curvature.py`: the exact GGN diagonal (closed form, generic autograd) and the exact trace.
+  - `scoring.py`: the parameter layout, the JVP bank and forward-mode scoring.
+- `config/intrinsic_reward/LCG_predictor.yaml` and `config/experiment/lcg_predictor_100k.yaml`. The preset is advantage-weighted PMPO with cap 5 and `training.compile_wm=false`; its schedules equal the Plan2Explore preset's.
+- Wiring:
+  - `exploration_trainer.py`: method `lcg_predictor`, refresh, checkpoint checks, restore, milestone files, W&B summary and provenance.
+  - `intrinsic_eval.py`: real-episode scoring. Plan2Explore's path is shared, and its behaviour is unchanged.
+  - `exploration_analysis.py`: `restore_milestone_scorer("lcg-predictor", ...)` and follow-test scoring.
+  - `data/milestone.py`: output label `lcg-predictor`.
+  - `downstream_analysis.py`: a plot colour and marker.
+- `plan2explore.py`: `build_feature_cache` gains an optional progress label. Plan2Explore's calls and output are unchanged.
+
+```bash
+python src/exploration_main.py +experiment=lcg_predictor_100k env.train.domain_name=walker \
+    "env.train.task_names=[stand,walk,run]" common.seed=0 common.devices=0
+```
+
+#### Behaviour
+
+- **Features.** Plan2Explore's extractor, replay cache and identity, and standardization, unchanged (2,048 features for the default layers).
+- **Predictor.** One MLP, 2054 → 256 → 256 → 2048 with SiLU for Walker (1,118,208 parameters, all used for curvature). It is fitted by explicit MAP with τ² = 1 and λ = 1: Adam with lr 1e-3, batch 256, 500 updates per refresh, uniform with-replacement minibatches, no bootstrap and no weight decay.
+- **Precision.** h_D = λ + (N/320) · diag(Σ JᵀJ)/τ², the exact closed-form GGN on 320 transitions drawn uniformly without replacement. It is recomputed from scratch at every refresh.
+- **Scorer and reward.** Originally a 5-probe JVP bank, frozen per round; since the review revision (below) the default is the exact trace, with no bank. Data reward scaling: divisor 1 at 5,500 steps, frozen per round.
+- **Seeds.** All private: predictor 31, curvature subset 32, bank 33, then the round.
+- **Checkpoint.** `state.pt["lcg_predictor"]` holds the complete frozen round. A resume refuses any changed setting before loading weights, and checks the restored round against the restored denoiser's SHA-256. There is no mid-fit resume: an interrupted epoch refits identically.
+- **Milestones.** Each one saves the five `lcg_predictor*.pt` files (`docs/analysis/restore_scorer.md`), about 31 MB at Walker size.
+
+#### Verification
+
+- **Tests** (local, CPU, `PYTHONHASHSEED=0`):
+  - `tests/exploration/test_lcg_predictor.py`: 62 tests, covering:
+    - closed-form GGN equals generic autograd and the explicit Jacobian (silu/elu/relu, 1–3 hidden layers, 1e-12);
+    - the GGN does not depend on targets;
+    - exact trace equals the explicit Jacobian;
+    - JVP equals the explicit Jacobian and central finite differences (< 1e-8);
+    - the bank is unbiased for the trace (20,000 probes, < 5%);
+    - MAP reductions and no weight decay;
+    - precision scaling and subset, and backend agreement;
+    - bank construction;
+    - finite, nonnegative, repeatable scores; float32 vs float64;
+    - reward modes;
+    - RNG isolation and determinism;
+    - transition, history and action alignment;
+    - evaluation alignment;
+    - state and milestone parity, with tampering and wrong-denoiser refusals;
+    - a trainer smoke with analysis restore;
+    - the exact backend in the trainer;
+    - freezing through PMPO;
+    - task-reward isolation;
+    - crash/resume identity and refusals;
+    - cross-method refusals;
+    - older checkpoints.
+  - New and affected existing suites: 217 passed (`tests_affected_suites.txt`).
+  - Full suite: 923 passed, exit 0 (base commit f1366e1: 853 passed; the 70 additional tests are the 62 new ones plus the new preset in the schedule and run-folder tests).
+- **Bounded real-environment smoke** (`outputs/lcg_predictor_review/smoke/`; local RTX 5060 Laptop GPU; not an experiment):
+  - Setup: the `lcg_predictor_100k` preset with the real architecture, Walker, 500 + 3 × 100 steps, 20/10/10 denoiser and 10/10/10 PMPO updates, one test episode per epoch, milestones at 600 and 800 steps, W&B disabled. Exit 0. 3 refreshes; every logged value is finite.
+  - A fresh-process restore of `steps_000800` (through `exploration_analysis`) and of the checkpoint's round gives identical predictor, h_D, bank and standardization. With the same extraction and scoring chunks, raw and scaled scores are bitwise identical on replay steps 600–800.
+  - A separate-process refit of round 3 from the milestone's denoiser and replay reproduced the predictor, h_D and bank exactly.
+  - Full-size numerical checks:
+
+    | Check | Result |
+    | --- | --- |
+    | Closed-form vs autograd GGN (8 transitions) | relative norm 1.2e-7 |
+    | JVP vs finite differences | 1.2e-9 (float64), 2.0e-7 (float32) |
+    | 5-probe bank vs exact trace (256 candidates) | median relative error 2.5%, p90 6.3%, Spearman 0.983 |
+    | 200 probes vs exact trace | median 0.38% |
+
+  - Laptop cost: a refresh at 800 transitions took 6.8 s (fit 6.0 s, curvature 0.06 s, bank 0.04 s), with a peak increment of 2.2 GB. Scoring a 320-candidate PMPO hook batch took 11 ms (bank) and 5.5 ms (exact).
+- **Magnitudes (untuned).**
+  - Imagined raw reward was about 9e3–2e4 per step on average, scaled 1.3e3–2.7e3.
+  - On real replay, raw scores ranged 660–1,800 at round 3.
+  - h_D ranged 3.2 to 1.5e5, median 889.
+  - The MAP objective per transition fell from 914 to 68, an MSE of 0.066 per feature on 800 transitions (memorization at this size).
+
+#### Limitations and open items
+
+- **GPU batch dependence.** On the GPU, Plan2Explore's extractor output depends on batch composition: features differ by up to 1.2e-3 between one call of 100 frames and chunks of 64, changing scores by up to 0.6%. Scoring itself contributes about 2e-7 relative. This is a property of the shared extractor and affects Plan2Explore the same way. "Identical inputs" in restore checks therefore means identical features or identical extraction chunks.
+- **Untuned values.** τ², λ, the MAP budget (500 updates is not a converged MAP at 100k), B_H, M and the reward scale are placeholders. The reward scale under data scaling has not been examined over a 100k schedule.
+- **Not implemented.** A bootstrap option and mid-fit resume. Only MLP predictors with linear output are supported: the closed forms check the structure, and the autograd backend is generic but slow.
+- **Not established.** Whether the score tracks predictor error, calibration of the Laplace variance, and any exploration or downstream benefit. The timing benchmark (`outputs/predictor_lcg_benchmark/`) and this smoke are integration and cost evidence only.
+- **Not run (as of this entry).** No server run, and no online or 100k pilot. The review revision below adds a frozen-replay fitting check and one bounded pilot.
+
+
+#### Review revision (2026-11-25)
+
+Changes after the first review. Still uncommitted on base `f1366e1`; review package `docs/changes/lcg_predictor_review_r2.zip`.
+
+- **Description.** The method is a diagonal GGN-based Laplace approximation around the fitted predictor. A fixed optimization budget does not guarantee convergence to the MAP. The trace score is an information-gain surrogate, not a calibrated uncertainty. Docstrings, the YAML and the design document now say so.
+- **Transactional refresh.**
+  - `LCGPredictor.refresh` builds the cache, standardization, predictor, h_D, bank, divisor and SHA-256 in local state (`RoundFeatures`, `standardization`). It installs them in one step only after every stage succeeded.
+  - Previously, a new cache and normalization were installed before fitting finished, so a failure could pair the old predictor with new normalization.
+  - Test: failure injection at encoding, fitting, curvature and bank, for both backends (7 cases). Each refreshes on a new replay. It checks that predictor, standardization, h_D, bank, identity, divisor, counters, records and scores are unchanged, and that the PMPO hook still scores with the previous round. A following successful refresh then gives exactly a fresh instance's round.
+- **`exact_trace` is the default** (`LCG_predictor.yaml` and the config dataclass).
+  - The milestone still writes `lcg_predictor_bank.pt` as an explicit record that no bank is used: backend `exact_trace`, `tangents` and `bank_seed` None.
+  - `jvp_bank` stays configurable, saved and restorable; tests cover both backends for scoring, float64, milestone round trips and the trainer.
+  - The refresh banner no longer mentions a probe bank.
+- **Tests.**
+  - `test_lcg_predictor.py`: 72 passed.
+  - Full suite: 933 passed, exit 0; run before the string-only banner change, after which `test_lcg_predictor.py` was re-run: 72 passed.
+
+**Frozen-replay fitting budget** (`outputs/lcg_predictor_review/fit_budget/`; kingplus0 GPU 1, RTX 5090; working-tree snapshot under the server's `outputs/lcg_predictor_review/code`; the server clone itself was not changed).
+- **Inputs.** The Plan2Explore Walker 100k run (`intrinsic_reward_following_test_relauch/plan2explore/walker/seed_0`): its frozen `steps_100000` denoiser and replay, 100,000 transitions in 200 episodes. Its 30 final test episodes (15,000 steps) are held out.
+- **Reproduction checks.** The LCG predictor's own extraction reproduced the run's saved Plan2Explore standardization exactly (max difference 0). The 500-update snapshot of one continuous 2,000-update fit equals a separate production `fit_updates=500` fit.
+- **Results** (precision on the same 320-transition subset; exact-trace scores on 4,096 fixed replay transitions and the held-out steps):
+
+  | Updates | L_D/N | MSE/feature | h_D vs 500 (rel. norm) | Mean score, replay / held-out |
+  | --- | --- | --- | --- | --- |
+  | 0 | 1,026 | 1.002 | | |
+  | 500 | 183.0 | 0.179 | | 11.30 / 14.05 |
+  | 1,000 | 157.6 | 0.154 | 0.21 | 11.36 / 14.18 |
+  | 2,000 | 137.3 | 0.134 | 0.41 | 11.38 / 14.14 |
+
+  | Comparison | Spearman (replay / held-out) | Top-10% overlap | Mean ratio |
+  | --- | --- | --- | --- |
+  | 500 vs 1,000 | 0.982 / 0.983 | 0.91 / 0.90 | 1.005 |
+  | 500 vs 2,000 | 0.966 / 0.972 | 0.86 / 0.84 | 1.007 |
+  | 1,000 vs 2,000 | 0.985 / 0.985 | 0.91 / 0.90 | 1.002 |
+
+- **Reading.** The fit is far from converged at 500 updates: the objective is still falling at 2,000. The exact-trace signal is nonetheless stable across budgets: the same scale, high rank agreement, and about 85–90% of the top decile shared. This is evidence about the sensitivity of the ranking to the budget only. It does not establish posterior calibration or exploration quality. The 500-update budget is unchanged.
+- **Cost on the 5090.** Replay encoding took 22.8 s (cache 783 MB; peak GPU 2.2 GB) and the replay identity 4.9 s. Fitting took 1.65 s for 500 updates and 4.25 s for 2,000 (peak 275 MB). Precision took 3–32 ms.
+
+**Bounded controller pilot** (`outputs/lcg_predictor_review/pilot/`; kingplus0 physical GPU 1, compute and EGL; `run_pilot.sh`).
+- **Settings.** The `lcg_predictor_100k` preset with `exact_trace` and advantage-weighted PMPO (cap 5), Walker, seed 0. The total was reduced to 6,000 steps:
+  - 5,000 initial uniform steps plus 2 epochs of 500;
+  - 10,000 + 400 denoiser updates and 200 + 200 PMPO updates, with 2 refreshes;
+  - milestones at 5,500 and 6,000 steps;
+  - tests every epoch (4 episodes) plus the final 30, i.e. 19,000 test steps;
+  - `debug_metrics=true` (logging only) and W&B disabled.
+
+  It exited 0, and the logged counters confirm the budget.
+- **Placement incident.** Two earlier attempts passed `common.devices=0`. `exploration_main` sets `CUDA_VISIBLE_DEVICES` from `common.devices`, overriding the exported value, so both ran on physical GPU 0, another user's device. Each was stopped within about 1.5 minutes (`pilot/aborted_on_gpu0*` on the server). The launcher now pairs `CUDA_VISIBLE_DEVICES=1` with `common.devices=1`, as the repository scripts do.
+- **Integrity and restoration.**
+  - 10,805 history rows, none with a non-finite value.
+  - The predictors of both milestones match their recorded SHA-256. Milestones are published after each PMPO phase, where `milestone_files()` re-checks the predictor.
+  - The checkpoint's round equals the 6,000 milestone's: predictor, h_D, standardization and divisor, with bitwise-identical raw and scaled scores on identical features and identical chunks.
+  - A separate-process refit reproduced both rounds exactly.
+  - Refresh took 2.8–3.0 s (encoding 1.6 s, fit 0.9 s, curvature 3 ms) and PMPO 0.39 s per update, of which scoring was 0.04 s. Peak GPU memory was 5.2 GB.
+- **Intrinsic reward and controller.** Imagined raw reward had a per-update mean of 154–249 per step (max 1,391). Scaled reward was 168–249 per step, with divisor 1.0 in epoch 1 and 0.917 in epoch 2. Real-episode raw scores were about 170–230 per step.
+
+  | Diagnostic | Epoch 1 | Epoch 2 |
+  | --- | --- | --- |
+  | λ-return mean | 920 → 1,680 | 1,530 → 3,610 |
+  | value_mean | 0.005 → 743 | 763 → 3,033 |
+  | value_bias | about −920 | about −580 |
+  | loss_value | about 1.2e6 | about 1.2e6 |
+  | value gradient norm | up to 2.6e6 (clip 10) | up to 2.6e6 (clip 10) |
+  | value_target_correlation | median 0.21 | median 0.54 |
+  | positive_fraction | 1.0 | median 1.0 |
+
+  - Actor entropy 3.31–3.35, KL to prior at most 0.009, actor gradient norm median 0.19–0.21 (max 4.4). Advantage weights were rarely clipped.
+  - Critic EMA regularization loss up to 7e5. Denoiser loss 1.09 → 0.011.
+- **Scale problem (concrete).** Early all-positive advantages are normal: the Plan2Explore and LCG data-scaled Walker runs also have positive_fraction ≈ 0.9–1.0 in epochs 1–2. Their scaled rewards, however, are 0.05–0.07 and 0.37–0.49 per step, with values of 0.5–10 and value losses of 0.07–4.5. Here the scaled reward is about 400 times LCG's: the critic must reach about 190/(1 − 0.985) ≈ 1.3e4 under a gradient clip of 10, and after 400 updates it still underestimates by 580–920.
+- **Proposed setting** (not applied, not tested). `fixed_divisor: 500`, keeping `data_scaled` and `data_reference_steps: 5500`.
+  - The scaled reward would then be about 190/500 ≈ 0.38 per step at the first refresh, matching the LCG data-scaled preset's 0.37–0.49.
+  - At 100k, the frozen-replay check's real-transition raw scores (11–14) under the divisor 500 × 5,500/100,000 = 27.5 would give about 0.4–0.5.
+  - It needs one bounded pilot to confirm the critic catches up; no tuning sweep is proposed.
+- **Not established.** Exploration benefit, calibration of the Laplace variance, multi-seed behaviour, and the controller under the proposed scale.
+
 ## Step 7 — Logging and analysis
 
 ### Status history (moved from the progress file, 2026-10-29)

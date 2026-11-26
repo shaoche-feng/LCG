@@ -326,11 +326,12 @@ def context_window(frames: Tensor, actions: Tensor, j: int, n: int) -> Tuple[Ten
 
 
 def build_feature_cache(extractor: FeatureExtractor, dataset: Dataset, successors: Dict[int, Tensor],
-                        batch_size: int, identity: Dict[str, str]) -> FeatureCache:
+                        batch_size: int, identity: Dict[str, str], desc: str = "P2E replay encoding") -> FeatureCache:
     """Encode every frame of the replay once (CPU result, batched extractor calls) and index the
     eligible transitions (o_t, a_t) -> o_{t+1}: t+1 inside the episode, or t the last stored
     step with a final observation / cut successor. Reads only obs, act and the final observation
-    of each episode; task rewards and other metadata are never read."""
+    of each episode; task rewards and other metadata are never read. desc: the progress label
+    (the LCG predictor reuses this cache)."""
     n = extractor.num_conditioning
     current, target, actions, episodes = [], [], [], []
     counts = dict(episodes=0, encoded_frames=0, eligible_transitions=0, excluded_no_successor=0,
@@ -345,7 +346,7 @@ def build_feature_cache(extractor: FeatureExtractor, dataset: Dataset, successor
             pending.clear()
 
     row = 0
-    for episode_id in Progress(range(dataset.num_episodes), desc="P2E replay encoding", unit="ep"):
+    for episode_id in Progress(range(dataset.num_episodes), desc=desc, unit="ep"):
         episode = dataset.load_episode(episode_id)
         frames, acts, has_next = episode_frames(episode, successors.get(episode_id))
         steps = len(episode)

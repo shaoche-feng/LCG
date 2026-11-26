@@ -1,0 +1,73 @@
+# Predictor-based LCG (design: docs/implement/LCG_PREDICTOR_DESIGN.md). All of this method's settings.
+# One denoiser generates every imagined frame; ONE MLP predictor f_psi(z_t, a_t) -> z_{t+1} is fitted by
+# a fixed budget of steps on the explicit MAP objective (no convergence guarantee) on Plan2Explore's frozen-denoiser
+# features after every denoiser phase; a diagonal GGN-based Laplace approximation around the fitted weights covers ALL
+# its parameters; a candidate (z_t, a_t) is scored by the approximate posterior's output-covariance trace relative to
+# tau^2, an information-gain surrogate. Extractor, standardization,
+# predictor, precision (and bank, jvp_bank only) stay frozen through PMPO and intrinsic evaluation. Every number below is
+# a working placeholder (the training budget is Plan2Explore's per-head budget), not a tuned value.
+#
+# Resolved dimensions (default 64x64 architecture, Walker action_dim 6): feature_dim D = 2 x 64 x 4 x 4 =
+# 2048; predictor 2054 -> 256 -> 256 -> 2048 with SiLU, 1,118,208 parameters (all used for curvature);
+# h_D: 1,118,208 floats; jvp bank (jvp_bank backend only): 5 x 1,118,208 floats. Other domains change only the action dimension
+# (input width D + action_dim); other feature selections change D.
+_target_: intrinsic_reward.lcg_predictor.LCGPredictorConfig
+
+method: lcg_predictor
+enabled: True
+
+# ---- Features: Plan2Explore's extractor and standardization (same meaning as plan2explore_disagreement.yaml).
+# Selected UNet block outputs of the frozen denoiser for o_t + feature_sigma * eps + sigma_offset_noise * eps_offset
+# (one fixed probe from probe_seed; effective conditioning sigma ~0.316 with offset noise 0.3), conditioned on
+# o_{t-n..t-1}, a_{t-n..t-1} (zero padding before an episode start), pooled to pool_size x pool_size, then
+# standardized with the refresh's replay mean/std (std >= feature_std_floor).
+feature_layers: [unet.d_blocks.2, unet.d_blocks.3]
+pool_size: 4
+feature_sigma: 0.1  # pixel-noise sigma of the extraction probe (NOT the feature-likelihood variance below)
+probe_seed: 0
+feature_std_floor: 1e-3
+encode_batch_size: 256  # frames per extractor call (replay encoding); part of the resume identity
+
+# ---- Predictor and MAP fitting (Plan2Explore's per-head budget: Adam 1e-3, batch 256, 500 updates).
+hidden_dims: [256, 256]
+activation: silu  # silu, elu or relu (closed-form derivatives exist for all three)
+init_policy: reinitialize  # reinitialize: fresh init from the round's seed; warm_start: previous round's weights
+optimizer: adam  # adam or sgd; weight decay is never used (the prior is an explicit penalty)
+lr: 1e-3
+adam_betas: [0.9, 0.999]
+adam_eps: 1e-8
+grad_clip_norm: null  # null: no clipping
+batch_size: 256  # uniform with-replacement minibatches over the N valid replay transitions (no bootstrap)
+fit_updates: 500  # per refresh
+
+# ---- Bayesian model. Objective L_D = sum_i ||y_i - f(u_i)||^2 / (2 tau^2) + lambda ||psi||^2 / 2, minimized as
+# L_D / N on minibatches (||.||^2 sums the D feature dimensions; the data term averages the B transitions).
+tau_squared: 1.0  # feature-likelihood variance, standardized-feature units
+prior_precision: 1.0  # lambda: Gaussian prior N(0, I / lambda) on every predictor parameter
+
+# ---- Historical precision h_D = lambda + s * diag(sum_{i in subset} J_i^T J_i) / tau^2 (exact GGN diagonal).
+curvature_backend: closed_form  # closed_form (exact, MLP) or autograd (exact, generic per-sample VJPs; slow)
+curvature_num_transitions: 320  # B_H, uniform without replacement over the N valid transitions
+curvature_scaling: full_replay  # full_replay: s = N / B_H; none: s = 1 (the subset's plain sum)
+curvature_chunk_size: 64  # memory only
+autograd_output_chunk: 128  # memory only
+autograd_sample_chunk: 4  # memory only
+
+# ---- Candidate scoring (current z_t and a_t only; no next-feature target, no diffusion-noise draws).
+# exact_trace (selected): sum_j ||J[:, j]||^2 / h_D[j] / tau^2 in closed form, no probes and no bank (faster than the
+# 5-probe bank for this MLP in the 2026-11-25 smoke: 5.5 vs 11 ms per 320 candidates). jvp_bank: sum_m ||J v_m||^2 /
+# (M tau^2), v_m = h_D^{-1/2} eta_m, an unbiased estimate of the same value (kept, configurable, saved and restorable).
+scorer_backend: exact_trace
+num_probes: 5  # M (jvp_bank only)
+bank_seed: 0  # jvp_bank only; combined with the run seed and the round: SeedSequence([seed, 33, bank_seed, round])
+score_dtype: float32  # float32 or float64
+allow_tf32: false  # TF32 float32 matmuls in fitting, curvature and scoring (the trainer enables TF32 globally)
+candidate_chunk_size: 1024  # candidates per scoring call (memory only)
+
+# ---- Policy reward from raw scores (frozen per round). data_scaled: raw / (fixed_divisor * data_reference_steps / N_steps),
+# N_steps the replay size at the refresh (h_D grows about linearly with N under full_replay scaling); fixed: raw /
+# fixed_divisor; none: raw (set fixed_divisor and data_reference_steps to null). Provisional: equals raw at the
+# first 100k-schedule refresh (5,500 steps).
+reward_scaling: data_scaled
+fixed_divisor: 1.0
+data_reference_steps: 5500

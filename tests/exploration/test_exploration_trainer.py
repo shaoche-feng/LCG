@@ -366,7 +366,8 @@ def test_pmpo_needs_a_reward_source_without_reward_end_model():
 # ---------------------------------------------------------------- default run folder and existing outputs
 
 @pytest.mark.parametrize("preset, label", [("uniform", "uniform"), ("lcg", "lcg"), ("ensemble", "full-ensemble"),
-                                           ("laplace", "laplace-ensemble"), ("plan2explore", "plan2explore")])
+                                           ("laplace", "laplace-ensemble"), ("plan2explore", "plan2explore"),
+                                           ("lcg_predictor", "lcg-predictor")])
 def test_default_run_folder_is_method_domain_and_seed(preset, label):
     import exploration_main  # noqa: F401  (registers the run-folder resolver, as the entry point does)
     from hydra import compose as hydra_compose, initialize_config_dir

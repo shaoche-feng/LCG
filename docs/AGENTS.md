@@ -43,6 +43,7 @@ src/
     ensemble.py             full diffusion-ensemble training and disagreement scorer
     plan2explore.py          frozen features, predictor fitting and feature disagreement
     laplace.py              sampled-parameter disagreement using shared LCG precision
+    lcg_predictor/          one MAP feature predictor on Plan2Explore features, its diagonal GGN precision and LCG score
     intrinsic_eval.py       real-episode scoring with frozen intrinsic scorers
   models/                   diffusion denoiser, reward/end predictor and PMPO controller
   data/                     replay, sampling, task-label batching, milestones and output/report identity helpers
@@ -86,7 +87,7 @@ The implementation retains the name `PMPOBeta`, but the current configured actor
 | Imagination horizon | 10 |
 | Imagined policy initialization | `repeat_anchor`: repeat the last replay-prompt frame |
 | World-model initialization | Preserve the real replay frames/actions; do not replace its context with repeated frames |
-| Exploration actor objective | `advantage_weighted` in all four learned-method Walker presets |
+| Exploration actor objective | `advantage_weighted` in all five learned-method presets |
 | Advantage weights | Detached; magnitude divided by its sign-group mean, capped at 5 |
 | Downstream actor objective | `sign`, explicitly enforced |
 | Discount / lambda | 0.985 / 0.95 |
@@ -98,7 +99,7 @@ The implementation retains the name `PMPOBeta`, but the current configured actor
 
 The EMA critic is a regularizer, not the bootstrap target network. The online critic supplies bootstraps and advantages. Preserve the reference implementation rather than substituting a conventional target-critic algorithm.
 
-The shared agent config’s actor objective remains sign-only (downstream uses it); all four learned exploration presets override it to advantage-weighted with cap 5. Resolve the selected preset before judging actual behavior.
+The shared agent config’s actor objective remains sign-only (downstream uses it); all five learned exploration presets override it to advantage-weighted with cap 5. Resolve the selected preset before judging actual behavior.
 
 ## Exploration methods and working settings
 
@@ -109,6 +110,7 @@ The shared agent config’s actor objective remains sign-only (downstream uses i
 | `full-ensemble` | `ensemble_100k` | 5 independently initialized denoisers; episode bootstrap enabled; shared diffusion noise; pixel disagreement |
 | `plan2explore` | `plan2explore_100k` | One denoiser; 5 independent lightweight MLP predictors; replay-feature cache; bootstrap enabled; feature disagreement |
 | `laplace-ensemble` | `laplace_100k` | One denoiser; 5 sampled R1 parameter sets; shared LCG historical precision; temperature 1; pixel disagreement |
+| `lcg-predictor` | `lcg_predictor_100k` | One denoiser; Plan2Explore's features; one MAP MLP predictor (all 1,118,208 parameters); diagonal GGN-based Laplace approximation around the fitted weights (exact GGN diagonal on 320 replay transitions, scaled by N/320); exact-trace score (no probe bank; the 5-probe JVP bank stays selectable); transactional refresh; data reward scaling (divisor 1 at 5,500 steps); implemented, tested and checked in one bounded 6,000-step pilot; no 100k run (`docs/implement/LCG_PREDICTOR_DESIGN.md`) |
 
 - Configuration layout: `exploration.yaml` / `downstream.yaml` hold shared settings; `intrinsic_reward/*.yaml` hold each method's scoring settings (the production LCG and Laplace settings, including the R1 guards, live there, not in the presets); `experiment/*.yaml` are domain-free method presets; launch scripts set the domain/task group, seed, device, run folder and W&B identity. The presets set no environment, schedule, seed or W&B values.
 - R1 is `unet.u_blocks.3.resblocks.0.*`, guarded as 10 tensors / 217,664 scalars for the current architecture.
@@ -117,8 +119,9 @@ The shared agent config’s actor objective remains sign-only (downstream uses i
 - Plan2Explore uses independent MLPs sharing frozen denoiser features, not multiple denoisers. Current layers are `unet.d_blocks.2` and `.3`, pooled to 4x4, yielding 2,048 features. Pixel sigma 0.1 plus offset noise 0.3 gives effective conditioning sigma about 0.316. Replay-only standardization, per-refresh episode bootstrap and fresh predictor fitting must remain reward-isolated. Defaults: hidden sizes `[256,256]`, Adam lr 1e-3, batch 256, 500 updates per predictor per refresh. The single denoiser generates imagined frames.
 - Laplace samples `theta_hat + sqrt(T) * epsilon / sqrt(h)`. Replay-size scaling and damping are already included in the shared precision; do not apply them twice. Samples stay fixed during the epoch’s PMPO phase and each denoising chain. Preserve the stored settings label `lcg.lcg_historical_precision`; it is an identity string, not an import path.
 - Temperature 1 is provisional. Extremely undertrained smoke models collapsed, while the tested first-refresh model under the actual pilot schedule retained coherent predictions. Neither observation establishes calibrated uncertainty or exploration benefit.
+- The LCG predictor reuses Plan2Explore's extractor, standardization and replay cache unchanged; its tau^2 = 1 and lambda = 1, the MAP budget (Plan2Explore's per-head 500 updates) and its reward scale are provisional.
 - Full ensemble, Plan2Explore and Laplace currently divide raw reward by 1.0; these are provisional scales. Raw intrinsic rewards are not comparable across methods.
-- World-model compilation is enabled by default (LCG, uniform); the full-ensemble, Plan2Explore and Laplace presets disable it. Record the resolved setting in timing comparisons; do not silently align it during a refactor.
+- World-model compilation is enabled by default (LCG, uniform); the full-ensemble, Plan2Explore, Laplace and LCG-predictor presets disable it. Record the resolved setting in timing comparisons; do not silently align it during a refactor.
 
 ## Downstream contract
 
@@ -140,7 +143,7 @@ One `DownstreamTrainer` handles exactly one milestone, task, adaptation seed and
 
 Environment (`config/env/dm_control.yaml`): RGB 64x64, camera 0, action repeat 2, four conditioning frames, `time_limit: null`; its Walker `[stand, walk, run]` group is only the default, overridden by launch scripts. Accepted groups are `REWARD_LABEL_TASK_GROUPS` (7 groups over acrobot, cartpole ×2, hopper, humanoid, humanoid_CMU, walker); do not claim others without the compatibility evidence. The two Cartpole groups share a domain and therefore the default run folder: their launchers must set distinct `hydra.run.dir` values.
 
-The selected 100k schedule, resolved by all five method presets for every accepted task group (`config/exploration.yaml`; pinned by `tests/exploration/test_uniform_preset.py`):
+The selected 100k schedule, resolved by all six method presets for every accepted task group (`config/exploration.yaml`; pinned by `tests/exploration/test_uniform_preset.py`):
 
 | Setting | Value |
 | --- | --- |
@@ -236,6 +239,7 @@ docs/
     LAPLACE_ENSEMBLE_DESIGN.md                 Laplace-sampled ensemble design
     LAPLACE_PRECISION_AUDIT.md                 what LCG's historical precision computes
     PLAN2EXPLORE_DESIGN.md                     Plan2Explore adaptation design
+    LCG_PREDICTOR_DESIGN.md                    predictor-based LCG design, equations and checkpoint schema
     REWARD_SCALING.md                          LCG policy-reward scaling modes
     REWARD_FREE_EXPERIMENT_NOTES.md            as-built step notes and evidence
     REWARD_FREE_EXPERIMENT_PROGRESS.md         to-do list and status

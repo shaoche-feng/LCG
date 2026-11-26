@@ -76,10 +76,10 @@ def analyze(cfg: DictConfig) -> None:
 
 THRESHOLDS = (200, 400, 500, 600)  # fractions of evaluation episodes with return strictly above each
 METHOD_COLORS = {"uniform": "#7f7f7f", "lcg": "#d62728", "full-ensemble": "#1f77b4", "laplace-ensemble": "#9467bd",
-                 "plan2explore": "#2ca02c"}
+                 "plan2explore": "#2ca02c", "lcg-predictor": "#8c564b"}
 # Marker and line style per method too, so curves that coincide (e.g. all at 0) stay distinguishable.
 METHOD_STYLES = {"uniform": ("o", "-"), "lcg": ("s", "--"), "full-ensemble": ("^", "-."),
-                 "laplace-ensemble": ("D", ":"), "plan2explore": ("v", "--")}
+                 "laplace-ensemble": ("D", ":"), "plan2explore": ("v", "--"), "lcg-predictor": ("P", "-")}
 RESULT_COLUMNS = ["method", "domain", "exploration_seed", "task", "adaptation_seed", "member_index", "milestone",
                   "train_env_steps", "num_eval_episodes", "return_mean", "return_median", "return_std", "return_min",
                   "return_max", *(f"frac_over_{t}" for t in THRESHOLDS), "protocol", "evaluation_max_steps",

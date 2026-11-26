@@ -14,6 +14,7 @@ observation o_T):
   RNG, the diagnostic stream); population pixel variance averaged over noise samples.
 - Plan2Explore: feature of o_t with context o_{t-n..t-1}, a_{t-n..t-1} (plan2explore.context_window)
   and the action a_t, scored by the frozen heads.
+- LCG predictor: the same feature and action, scored by the frozen predictor round (precision and bank).
 """
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -56,14 +57,15 @@ def preserved(obj, names):
 
 class IntrinsicEvaluator:
     """Scores real episodes with one method's frozen scorer. method: lcg, ensemble_disagreement,
-    laplace_disagreement or plan2explore_disagreement."""
+    laplace_disagreement, plan2explore_disagreement or lcg_predictor."""
 
     def __init__(self, method: str, num_conditioning: int, device: torch.device, chunk_size: int = 64,
                  lcg=None, ensemble_samplers=None, ensemble_scorer=None, laplace=None, sampler=None,
-                 plan2explore=None, noise_samples: int = 1) -> None:
+                 plan2explore=None, noise_samples: int = 1, lcg_predictor=None) -> None:
         self.method, self.n, self.device, self.chunk = method, num_conditioning, device, chunk_size
         self.lcg, self.ensemble_samplers, self.ensemble_scorer = lcg, ensemble_samplers, ensemble_scorer
         self.laplace, self.sampler, self.plan2explore, self.noise_samples = laplace, sampler, plan2explore, noise_samples
+        self.lcg_predictor = lcg_predictor
 
     def unavailable_reason(self) -> Optional[str]:
         """None when the frozen scorer exists; else why it cannot score (e.g. not refreshed yet)."""
@@ -73,6 +75,8 @@ class IntrinsicEvaluator:
             return "the Laplace sample bank has not been drawn"
         if self.method == "plan2explore_disagreement" and self.plan2explore.heads is None:
             return "the Plan2Explore heads are not fitted"
+        if self.method == "lcg_predictor" and self.lcg_predictor.predictor is None:
+            return "the LCG predictor is not fitted"
         return None
 
     def settings(self) -> Dict[str, Any]:
@@ -86,6 +90,10 @@ class IntrinsicEvaluator:
         elif self.method == "plan2explore_disagreement":
             s.update(refresh_epoch=self.plan2explore.last_refresh_epoch, heads=self.plan2explore.cfg.num_members,
                      scaling=self.plan2explore.cfg.reward_scaling)
+        elif self.method == "lcg_predictor":
+            lp = self.lcg_predictor
+            s.update(round=lp.round_id, scorer_backend=lp.cfg.scorer_backend, num_probes=lp.cfg.num_probes,
+                     scaling=lp.cfg.reward_scaling, reward_divisor=lp.reward_divisor)
         else:
             s.update(members=len(self.ensemble_samplers), scaling=self.ensemble_scorer.cfg.reward_scaling)
         return s
@@ -97,8 +105,11 @@ class IntrinsicEvaluator:
             raw = self._lcg(episode)
             scaled = self.lcg.scale_frozen(raw)
         elif self.method == "plan2explore_disagreement":
-            raw = self._plan2explore(episode)
+            raw = self._features(episode, self.plan2explore, self.plan2explore.disagreement)
             scaled = self.plan2explore.scale(raw)
+        elif self.method == "lcg_predictor":
+            raw = self._features(episode, self.lcg_predictor, self.lcg_predictor.score_features)
+            scaled = self.lcg_predictor.scale(raw)
         else:
             raw = self._members(episode)
             scaled = self.ensemble_scorer.scale_frozen(raw)
@@ -131,18 +142,18 @@ class IntrinsicEvaluator:
             scores.append(torch.stack(per_noise).mean(dim=0))
         return torch.cat(scores)
 
-    def _plan2explore(self, episode) -> Tensor:
-        p2e = self.plan2explore
+    def _features(self, episode, model, score) -> Tensor:
+        """Feature-based methods (Plan2Explore, LCG predictor): score(features, actions) of every step."""
         frames, acts = episode.obs, episode.act
         scores = []
-        with preserved(p2e.extractor, ("seconds",)):
+        with preserved(model.extractor, ("seconds",)):
             for i in range(0, len(episode), self.chunk):
                 steps = range(i, min(i + self.chunk, len(episode)))
                 context = [context_window(frames, acts, j, self.n) for j in steps]
                 ctx = torch.stack([c[0] for c in context])
                 ctx_act = torch.stack([c[1] for c in context])
-                features = p2e.extractor(frames[i:steps.stop], ctx, ctx_act)
-                scores.append(p2e.disagreement(features, acts[i:steps.stop].to(features.device)))
+                features = model.extractor(frames[i:steps.stop], ctx, ctx_act)
+                scores.append(score(features, acts[i:steps.stop].to(features.device)))
         return torch.cat(scores)
 
 

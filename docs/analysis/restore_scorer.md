@@ -45,6 +45,18 @@ Use the run’s resolved config for predictor architecture, feature extraction, 
 
 Use the **existing scaling config** to select the mode. Set it to **data scaling** for the Walker and Hopper reruns. The resolved config records the mode, and the milestone saves any fitted values needed to reproduce the scaled reward. Verify the config key and the exact tensors or scalars read by the scorer before implementing the save.
 
+## LCG predictor
+
+| What | Where it is saved |
+| --- | --- |
+| The MAP predictor's `state_dict()`, its architecture, its SHA-256 and the flat parameter order (names, shapes, offsets) used by every tensor below. | `milestones/steps_005500/lcg_predictor.pt` |
+| The historical diagonal precision `h_D` (flat, in that order), `tau_squared`, `prior_precision` and the curvature record (replay size, sampling rule, subset size and seed, scaling factor). | `milestones/steps_005500/lcg_predictor_precision.pt` |
+| With the default `scorer_backend: exact_trace`: an explicit record that no bank is used (`tangents` and `bank_seed` are None). With `jvp_bank`: the actual JVP bank used for scoring, `v_m = h_D^{-1/2} * eta_m` (rows in probe order), with its seed. | `milestones/steps_005500/lcg_predictor_bank.pt` |
+| The feature standardization (mean, floored std) and the feature-extraction settings, including the probe SHA-256. | `milestones/steps_005500/lcg_predictor_normalization.pt` |
+| The resolved settings, the run seed, the round id, the denoiser/replay/extraction identity, the frozen reward divisor and its replay size, and the fit record. | `milestones/steps_005500/lcg_predictor_scorer.pt` |
+
+`LCGPredictor.load_milestone_files` restores these files without refitting anything or drawing a new bank. It refuses files from different rounds, a different parameter order, probe or bank seed, and a denoiser whose weights differ from the recorded identity. The policy's action bounds (`exploration_policy.pt`) give the canonical actions. `exploration_analysis.restore_milestone_scorer("lcg-predictor", ...)` uses this path.
+
 ## Uniform
 
 Use the existing Uniform replay from the corresponding collection window. Uniform has no learned scorer or policy weights.

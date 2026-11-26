@@ -11,7 +11,7 @@ Exploration runs also save, at each milestone, the frozen scorer and exploration
 collect the next batch (docs/analysis/restore_scorer.md; ExplorationTrainer.scorer_files):
 exploration_policy.pt (learned methods), MLP_member_<k>.pt and plan2explore_normalization.pt
 (Plan2Explore), parameter_bank.pt (Laplace), historical_precision.pt, jvp_probe_bank.pt and
-lcg_scaling.pt (LCG). Downstream adaptation does not read them.
+lcg_scaling.pt (LCG), lcg_predictor*.pt (LCG predictor). Downstream adaptation does not read them.
 
 All paths are relative to the milestone folder, so the whole run folder can be moved.
 Episode files are the dataset's immutable versions (`<id>_<length>.pt`), shared with
@@ -45,7 +45,8 @@ RETURN_CONVENTION = ("sum over environment steps of the requested task's reward;
 # Output folder label of each exploration method (default run folder outputs/<label>/<domain>/seed_<seed>);
 # the keys are the intrinsic_reward.method identifiers (None: intrinsic reward disabled, uniform random).
 OUTPUT_LABELS = {None: "uniform", "lcg": "lcg", "ensemble_disagreement": "full-ensemble",
-                 "laplace_disagreement": "laplace-ensemble", "plan2explore_disagreement": "plan2explore"}
+                 "laplace_disagreement": "laplace-ensemble", "plan2explore_disagreement": "plan2explore",
+                 "lcg_predictor": "lcg-predictor"}
 
 
 def write_json(path: Path, data: Dict[str, Any]) -> None:
