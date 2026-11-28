@@ -1,0 +1,14 @@
+# @package _global_
+# Downstream controller tuning (scripts/control_downstream.sh, TUNING=<this file's name>).
+# Change: the advantage-weighted actor objective instead of sign-only (cap 5, as the learned exploration presets).
+# Why: with sign-only, advantages of noise size get full weight. Online DIAMOND hopper-hop and the downstream
+# acrobot runs show one-sided or near-zero advantage regimes (advantage std ~0.0005-0.005, KL to prior ~0.0003)
+# where the policy barely moves; weighting by |A| / mean |A| lets the informative samples dominate.
+control_tuning:
+  name: advantage_weighted
+  description: agent.actor_critic.actor_objective=advantage_weighted (cap 5)
+
+agent:
+  actor_critic:
+    actor_objective: advantage_weighted
+    advantage_weight_cap: 5.0

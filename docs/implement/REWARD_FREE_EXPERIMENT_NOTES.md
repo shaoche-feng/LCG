@@ -4617,3 +4617,31 @@ TV24, none in Clean; 0 object pixels under the panel on every active frame.
   value of ~110 / 20 ~ 5.5.
 - Tests: `tests/downstream/` (140 passed) incl. advantage-weighted training and publication, and the divisor (PMPO
   receives predicted reward / 20 on the same rollout; task units logged; validation; resume rules).
+
+## Downstream controller tuning launcher (2026-11-28)
+
+- `config/control_tuning/`: `baseline` (no change), `advantage_weighted`, `reward_div20`, `advantage_weighted_div20`.
+  Each file is `# @package _global_` with a `control_tuning: {name, description}` record and only its changed
+  settings, so every run's saved `config.yaml` and W&B config name the variant. Test: each file changes exactly the
+  settings it names (and adds the record); a trainer accepts it.
+- `scripts/control_downstream.sh` (structure of `pilot_downstream.sh`): `GPU`, `LABEL` (method), `TUNING`,
+  `RUN_GROUPS` (required), optional `TASKS` filter, `MILESTONE_STEPS` (default 100000), seeds. Runs
+  `downstream_main.py +control_tuning=<TUNING>` in folder mode with `initialization.milestone_steps`, W&B project
+  `control-tuning-<group>-<task>`, name/group `<LABEL>-<TUNING>-<group>-<task>-es<N>-ds<M>`.
+- Layout (never writes into the exploration run): `outputs/tuning/<LABEL>/<TUNING>/control_tuning.yaml` (copy; a
+  later invocation with a different file of the same name is refused) and `.../<group>/seed_<N>/` with `config` and
+  `dataset` symlinks to `outputs/<LABEL>/<group>/seed_<N>/`, `milestones/steps_<S>/` as hard links (`cp -al`) and the
+  adaptations in `downstream/`. Hard links, not a symlinked `milestones/`: `downstream_main.hydra_quote` resolves the
+  milestone path and the trainer writes at `<milestone>/../../downstream`, so a symlink would put the outputs into
+  the original run. Milestones reach their replay by `../../dataset/train` (relative, through the `dataset`
+  symlink). Each configuration has its own folder, so configurations run in parallel; preflight refuses existing
+  outputs of the selected tasks (as `pilot_downstream.sh`), a missing milestone or run, links to another run and a
+  replaced milestone.
+- `check_control_tuning` (trainer and launcher): a `control_tuning` that is not a mapping with a name is refused.
+  Without `config/control_tuning/` (an unsynced checkout) Hydra turns `+control_tuning=<name>` into the plain string
+  `<name>` and the run would train with the default controller under a tuning label (seen in the end-to-end check).
+- Validation: `tests/downstream/` and an end-to-end run on kingplus0 in a throwaway repo (tiny models, CPU, W&B off;
+  this working tree's src/config/script): `reward_div20` and `advantage_weighted` side by side; saved configs carry
+  the record and the changed setting (divisor 20; advantage_weighted); outputs only under `outputs/tuning/`; the
+  source run byte-identical; milestone files hard-linked (link count 3); refusals: existing output, changed tuning
+  file, missing milestone, missing run, unsynced checkout.

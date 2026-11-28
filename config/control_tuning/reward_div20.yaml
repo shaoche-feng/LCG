@@ -1,0 +1,14 @@
+# @package _global_
+# Downstream controller tuning (scripts/control_downstream.sh, TUNING=<this file's name>).
+# Change: PMPO's returns use predicted task reward / 20 (the reward model still trains on raw rewards).
+# Why (Plan2Explore hopper-stand, 100k milestone, sign objective): the critic was clipped (grad norm > 10) on 86% of
+# policy updates; its tenth-averaged gradient norm rose 23 -> 171 as the imagined return rose 0.9 -> 4.9. Stand
+# reward is ~1.65 per stored step when present (8.7% of replay steps), so a policy standing throughout has a value
+# of ~110 (gamma 0.985). Divided by 20: those norms ~1-9 and that value ~5.5. Both actor objectives ignore the scale.
+control_tuning:
+  name: reward_div20
+  description: actor_critic.training.reward_divisor=20
+
+actor_critic:
+  training:
+    reward_divisor: 20.0

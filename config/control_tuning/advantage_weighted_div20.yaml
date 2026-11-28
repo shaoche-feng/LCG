@@ -1,0 +1,16 @@
+# @package _global_
+# Downstream controller tuning (scripts/control_downstream.sh, TUNING=<this file's name>).
+# Change: both advantage_weighted.yaml and reward_div20.yaml (see those files for the reasons). Run after each has
+# been compared with the baseline on its own.
+control_tuning:
+  name: advantage_weighted_div20
+  description: actor_objective=advantage_weighted (cap 5) and reward_divisor=20
+
+agent:
+  actor_critic:
+    actor_objective: advantage_weighted
+    advantage_weight_cap: 5.0
+
+actor_critic:
+  training:
+    reward_divisor: 20.0

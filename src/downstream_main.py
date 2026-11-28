@@ -15,7 +15,8 @@ import torch
 from data.milestone import (SUMMARY_FILE, discover_milestones, downstream_output_dir, downstream_summary, load_milestone,
                             milestone_members, read_json, read_manifest, shared_run_path)
 from utils import device_lines
-from downstream_trainer import DownstreamTrainer, evaluate_saved_output, open_shared_run, run_names, seed_span
+from downstream_trainer import (DownstreamTrainer, check_control_tuning, evaluate_saved_output, open_shared_run,
+                                run_names, seed_span)
 from utils import say, setup_visible_cuda_devices
 
 
@@ -40,6 +41,7 @@ def main(cfg: DictConfig) -> None:
                          "downstream.task_name=<task> downstream.seed=<adaptation seed>\n"
                          "  python src/downstream_analysis.py downstream.mode=compare analysis.domain=<domain> "
                          "analysis.exploration_seed=<seed> downstream.task_name=<task> downstream.seed=<adaptation seed>")
+    check_control_tuning(cfg)  # before any child starts (each child checks it again)
     milestones_dir, milestone_steps = pop_milestone_source(cfg)
     setup_visible_cuda_devices(cfg.common.devices)  # children inherit it (and set the same value)
     if milestones_dir is not None:

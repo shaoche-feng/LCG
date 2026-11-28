@@ -1,0 +1,9 @@
+# @package _global_
+# Downstream controller tuning (scripts/control_downstream.sh, TUNING=<this file's name>): the reference.
+# No controller change: config/downstream.yaml as is (sign objective, reward divisor 1), so the tuned variants
+# have a baseline with the same launcher, monitoring evaluation and W&B project.
+#
+#   python src/downstream_main.py +control_tuning=baseline ...
+control_tuning:
+  name: baseline
+  description: config/downstream.yaml unchanged (sign objective, reward_divisor 1)

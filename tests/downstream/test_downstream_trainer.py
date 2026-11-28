@@ -2121,3 +2121,38 @@ def test_reward_divisor_divides_the_rewards_pmpo_uses_and_logs_task_units(tmp_pa
     assert downstream_module.changed_settings(downstream_module.normalized_saved_config(saved), current) == []
     current["actor_critic"]["training"]["reward_divisor"] = 20.0
     assert downstream_module.changed_settings(downstream_module.normalized_saved_config(saved), current) ==         ["actor_critic.training.reward_divisor"]
+
+
+# ---------------------------------------------------------------- control tuning configurations
+
+CONTROL_TUNING = {"baseline": ("sign", 1.0), "advantage_weighted": ("advantage_weighted", 1.0),
+                  "reward_div20": ("sign", 20.0), "advantage_weighted_div20": ("advantage_weighted", 20.0)}
+
+
+def test_control_tuning_configs_change_only_the_named_controller_settings(tmp_path, monkeypatch):
+    names = sorted(p.stem for p in (ROOT / "config/control_tuning").glob("*.yaml"))
+    assert names == sorted(CONTROL_TUNING)
+    base = ["initialization.milestone_path=x", "downstream.task_name=stand"]
+    reference = OmegaConf.to_container(compose("downstream", base))
+    for name, (objective, divisor) in CONTROL_TUNING.items():
+        cfg = compose("downstream", [*base, f"+control_tuning={name}"])
+        assert cfg.control_tuning.name == name and cfg.control_tuning.description
+        assert (cfg.agent.actor_critic.actor_objective, cfg.actor_critic.training.reward_divisor) == (objective, divisor)
+        changed = downstream_module.changed_settings(reference, OmegaConf.to_container(cfg))
+        expected = {"control_tuning"}
+        if objective != "sign":
+            expected.add("agent.actor_critic.actor_objective")
+        if divisor != 1.0:
+            expected.add("actor_critic.training.reward_divisor")
+        assert set(changed) == expected, (name, changed)
+    # A trainer takes the record: it is saved with the run's configuration.
+    trainer = make_trainer(build_milestone(tmp_path), monkeypatch, extra=["+control_tuning=advantage_weighted_div20"])
+    saved = OmegaConf.load(trainer._work_dir / "config.yaml")
+    assert saved.control_tuning.name == "advantage_weighted_div20" and trainer.reward_divisor == 20.0
+    assert trainer.agent.actor_critic.cfg.actor_objective == "advantage_weighted"
+    # A checkout without config/control_tuning/: Hydra makes +control_tuning=<name> the plain string <name> (a
+    # missing file in an existing group is Hydra's own error). Refused, never trained with the default controller.
+    with pytest.raises(ValueError, match="is not a loaded tuning configuration"):
+        downstream_module.check_control_tuning(OmegaConf.create({"control_tuning": "reward_div20"}))
+    downstream_module.check_control_tuning(OmegaConf.create({"control_tuning": {"name": "x", "description": "y"}}))
+    downstream_module.check_control_tuning(OmegaConf.create({}))  # no tuning: the usual downstream runs

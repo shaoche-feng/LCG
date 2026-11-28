@@ -109,6 +109,7 @@ class DownstreamTrainer:
             raise ValueError(f"checkpointing.every must be null or a positive integer, got {every!r}")
         check_evaluation_config(cfg.evaluation)
         check_training_evaluation(OmegaConf.select(cfg, "evaluation.during_training"))
+        check_control_tuning(cfg)
         if cfg.agent.actor_critic.actor_objective not in DOWNSTREAM_OBJECTIVES:
             raise ValueError(f"Downstream PMPO supports agent.actor_critic.actor_objective in {DOWNSTREAM_OBJECTIVES}, "
                              f"got {cfg.agent.actor_critic.actor_objective!r}")
@@ -689,6 +690,19 @@ def check_reward_divisor(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"actor_critic.training.reward_divisor must be a positive finite number, got {value!r}")
     return float(value)
+
+
+def check_control_tuning(cfg: DictConfig) -> None:
+    """A control_tuning entry must be a loaded config/control_tuning/<name>.yaml record (a mapping with its name).
+    Hydra turns +control_tuning=<name> into the plain string <name> when that group or file is not found (e.g. a
+    checkout without the file), and the run would train with the default controller under a tuning label."""
+    tuning = OmegaConf.select(cfg, "control_tuning")
+    if tuning is None:
+        return
+    if not isinstance(tuning, DictConfig) or not isinstance(tuning.get("name"), str):
+        raise ValueError(f"control_tuning={tuning!r} is not a loaded tuning configuration: select an existing "
+                         "config/control_tuning/<name>.yaml with +control_tuning=<name> (the file may be missing in "
+                         "this checkout)")
 
 
 def check_training_evaluation(c: Any) -> None:
