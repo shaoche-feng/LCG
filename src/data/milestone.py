@@ -164,15 +164,22 @@ def state_sha256(state_dict: Dict[str, torch.Tensor]) -> str:
     return digest.hexdigest()
 
 
-def physical_state_manifest(recording: bool) -> Dict[str, Any]:
+def physical_state_manifest(recording: bool, noisy_tv: bool = False) -> Dict[str, Any]:
     """Manifest entry describing the analysis-only physical states of the milestone's training
     episodes (data.episode.PHYSICAL_STATE_KEYS). recording: the run's collection.train setting
-    when the milestone was published; episodes from other settings say so themselves."""
+    when the milestone was published; episodes from other settings say so themselves. noisy_tv: the
+    episodes also hold the noisy-TV diagnostics (data.episode.TV_KEYS)."""
+    keys = dict(qpos="(T, nq) float64", qvel="(T, nv) float64", recorded="(T,) bool",
+                final_qpos="(nq,) float64, ended episodes only", final_qvel="(nv,) float64, ended episodes only")
+    if noisy_tv:
+        keys.update(tv_in_region="(T,) bool: cart inside the trigger interval", tv_active="(T,) bool: panel drawn",
+                    tv_panel_size="(T,) int16: panel size, 0 when inactive",
+                    final_tv_in_region="bool, ended episodes only", final_tv_active="bool, ended episodes only",
+                    final_tv_panel_size="int16, ended episodes only")
     return dict(
         recording=recording,
         episode_field="physical_state",
-        keys=dict(qpos="(T, nq) float64", qvel="(T, nv) float64", recorded="(T,) bool",
-                  final_qpos="(nq,) float64, ended episodes only", final_qvel="(nv,) float64, ended episodes only"),
+        keys=keys,
         alignment="row t is the MuJoCo state at which obs[t] was rendered (before act[t]); final_* belong to "
                   "info['final_observation']; dataset.pt successor_physical_states belong to successor_observations",
         missing="episode field absent (None): not recorded; recorded=False rows are NaN; no successor entry: unknown",

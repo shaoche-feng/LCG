@@ -55,11 +55,32 @@ Follow intrinsic reward
   mean raw and scaled score), follow_transitions.csv (every transition) and analysis.json. Scaled scores are
   the scorer's own policy reward of the raw score, when the milestone holds what that needs.
 
+Noisy TV
+--------
+    python src/exploration_analysis.py --test noisy-tv --condition clean=<clean run>/milestones/steps_100000 \
+        --condition tv16=<TV16 run>/milestones/steps_100000 --condition tv24=<TV24 run>/milestones/steps_100000 \
+        --output <folder> [--seeds 3001-3030] [--action-seed 0] [--intrinsic [--scoring-seed 0]] [--no-videos] \
+        [--device cpu|cuda]
+
+- One method (docs/implement/AlEATRORISTIC_EXPERIMENT_DESIGN.md): each condition's milestone comes from that
+  condition's run (saved env.train.noisy_tv: clean, tv16, tv24); method, task group, trigger, panel and milestone
+  step must agree.
+- Trajectories: <output>/trajectories/<condition>/ (evaluation.json and the episodes, with per-frame qpos/qvel and
+  TV membership/activation). Read when present and consistent; otherwise evaluated first by
+  evaluate_noisy_tv_milestone: the existing exploration test collector, one episode per reset seed in the run's
+  own env.test (its evaluation TV seed), with the milestone's exploration policy (sampled actions) or uniform
+  actions. Nothing is trained, refreshed or refitted; the policy weights are hashed before and after.
+- Writes noisy_tv_episodes.csv/.json, noisy_tv_summary.csv, noisy_tv_paired.csv and noisy_tv_paired_summary.csv
+  (TV - Clean per reset seed), with --intrinsic noisy_tv_intrinsic.csv and noisy_tv_transitions.csv (each
+  milestone's frozen scorer, as follow-intrinsic-reward restores it), occupancy/dwell/coverage plots (when
+  matplotlib is available), videos/ and analysis.json (metric and bin definitions, settings, provenance).
+
 The coverage and lasting tests import neither trainer nor envs (with MUJOCO_GL=egl, importing dm_control opens
 the GPU devices). follow-intrinsic-reward imports the scorer modules (which import envs) only when it runs,
 and never the trainers.
 """
 import argparse
+import json
 import math
 from pathlib import Path
 import sys
@@ -74,7 +95,9 @@ from downstream_analysis import write_csv
 from utils import file_sha256
 
 FOLLOW = "follow-intrinsic-reward"
-TESTS = ("task-reward-coverage", "task-reward-lasting", FOLLOW)
+NOISY_TV = "noisy-tv"
+TESTS = ("task-reward-coverage", "task-reward-lasting", FOLLOW, NOISY_TV)
+ALONE = (FOLLOW, NOISY_TV)  # tests that run on their own
 # Output label -> intrinsic_reward.method of the learned methods (data.milestone.OUTPUT_LABELS).
 LEARNED = {"lcg": "lcg", "full-ensemble": "ensemble_disagreement", "laplace-ensemble": "laplace_disagreement",
            "plan2explore": "plan2explore_disagreement", "lcg-predictor": "lcg_predictor"}
@@ -223,6 +246,8 @@ def run(tests: Sequence[str], milestones: Sequence[Path], thresholds: Dict[str, 
         raise ValueError(f"--test takes {', '.join(TESTS)}; got {tests}")
     if FOLLOW in tests:
         raise ValueError(f"{FOLLOW} runs on its own (one milestone and a Uniform run); use follow_intrinsic_reward()")
+    if NOISY_TV in tests:
+        raise ValueError(f"{NOISY_TV} runs on its own (one milestone per condition); use noisy_tv_analysis()")
     output = Path(output)
     files = [output / f for t in tests for f in OUTPUTS[t]] + [output / "analysis.json"]
     existing = [str(f) for f in files if f.exists()]
@@ -728,25 +753,609 @@ def follow_intrinsic_reward(method: str, milestone_path: Path, uniform_run: Path
     return {name: output / name for name in [*FOLLOW_OUTPUTS, "analysis.json"]}
 
 
+# ---------------------------------------------------------------------------------------- noisy TV
+
+# Cartpole noisy-TV analysis (docs/implement/AlEATRORISTIC_EXPERIMENT_DESIGN.md). Conditions are named by their
+# saved env.train.noisy_tv settings: clean (enabled false), tv16, tv24 (enabled, panel size).
+NOISY_TV_CONDITIONS = ("clean", "tv16", "tv24")
+# Physical-state coverage bins, shared by every method and condition (fixed from the clean calibration
+# trajectories, REWARD_FREE_EXPERIMENT_NOTES.md "Cartpole noisy TV"): cart position in 0.2 m bins over the slider
+# range [-1.8, 1.8] m plus one underflow and one overflow bin (the soft joint limit lets the cart pass +-1.8 m;
+# calibration reached +-2.05 m); pole angle wrapped to [-pi, pi) in 24 bins of 15 degrees (periodic).
+POSITION_EDGES = tuple(round(-1.8 + 0.2 * k, 10) for k in range(19))
+ANGLE_BINS = 24
+NOISY_TV_EPISODE_COLUMNS = [
+    "condition", "method", "reset_seed", "episode", "length", "num_observations", "final_observation_included",
+    "task_return", "occupancy", "tv_active_fraction", "initial_in_region", "region_entries", "visits", "reached",
+    "mean_dwell", "max_dwell", "position_angle_bins_visited", "position_angle_coverage", "position_bins_visited",
+    "angle_bins_visited", "cart_velocity_mean_abs", "cart_velocity_std", "cart_velocity_max_abs",
+    "pole_angular_velocity_mean_abs", "pole_angular_velocity_std", "pole_angular_velocity_max_abs"]
+NOISY_TV_SUMMARY_COLUMNS = [
+    "condition", "method", "num_episodes", "occupancy_mean", "occupancy_std", "occupancy_ci95_low",
+    "occupancy_ci95_high", "reach_rate", "initial_in_region_episodes", "episodes_without_visits",
+    "region_entries_mean", "mean_dwell_mean_given_visit", "max_dwell_mean_given_visit", "max_dwell_max",
+    "position_angle_coverage_mean", "position_angle_coverage_std", "union_position_angle_bins",
+    "union_position_angle_coverage", "cart_velocity_mean_abs_mean", "pole_angular_velocity_mean_abs_mean",
+    "task_return_mean"]
+NOISY_TV_PAIRED_COLUMNS = ["condition", "method", "reset_seed", "occupancy_clean", "occupancy_tv", "delta_occupancy",
+                           "max_dwell_clean", "max_dwell_tv", "delta_max_dwell", "coverage_clean", "coverage_tv",
+                           "delta_coverage"]
+NOISY_TV_PAIRED_SUMMARY_COLUMNS = ["condition", "method", "num_pairs", "delta_occupancy_mean", "delta_occupancy_std",
+                                   "delta_occupancy_ci95_low", "delta_occupancy_ci95_high", "delta_max_dwell_mean",
+                                   "delta_coverage_mean"]
+NOISY_TV_INTRINSIC_COLUMNS = ["condition", "method", "subset", "num_transitions", "raw_mean", "raw_std", "scaled_mean"]
+NOISY_TV_TRANSITION_COLUMNS = ["condition", "method", "reset_seed", "episode", "row", "in_region", "tv_active",
+                               "subset", "raw", "scaled"]
+NOISY_TV_EVALUATION = "evaluation.json"
+
+
+def condition_name(noisy_tv: Optional[Dict[str, Any]]) -> Optional[str]:
+    """clean / tv<size> from a noisy-TV section; None for a run without one."""
+    if noisy_tv is None:
+        return None
+    return f"tv{int(noisy_tv['size'])}" if noisy_tv["enabled"] else "clean"
+
+
+def wrap_angle(angle: np.ndarray) -> np.ndarray:
+    """Pole angle wrapped to [-pi, pi)."""
+    return (np.asarray(angle, dtype=np.float64) + np.pi) % (2 * np.pi) - np.pi
+
+
+def coverage_bins(cart_position: np.ndarray, pole_angle: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(position bin, angle bin) of each state: position bins 0 (below -1.8 m), 1..18 (POSITION_EDGES), 19 (above
+    1.8 m; 1.8 itself is the last regular bin); angle bins 0..23 of the wrapped angle."""
+    edges = np.asarray(POSITION_EDGES)
+    x = np.asarray(cart_position, dtype=np.float64)
+    pos = np.searchsorted(edges, x, side="right")  # 0 below edges[0]; len(edges) above edges[-1]
+    pos = np.where(x == edges[-1], len(edges) - 1, pos)
+    ang = np.floor((wrap_angle(pole_angle) + np.pi) / (2 * np.pi / ANGLE_BINS)).astype(int)
+    return pos, np.clip(ang, 0, ANGLE_BINS - 1)
+
+
+NUM_POSITION_BINS = len(POSITION_EDGES) + 1  # 18 regular + underflow + overflow
+NUM_COVERAGE_BINS = NUM_POSITION_BINS * ANGLE_BINS
+
+
+def runs_of_ones(flags: np.ndarray) -> List[Tuple[int, int]]:
+    return bouts(np.asarray(flags, dtype=bool))
+
+
+def noisy_tv_episode_metrics(qpos: np.ndarray, qvel: np.ndarray, in_region: np.ndarray, tv_active: np.ndarray
+                             ) -> Dict[str, Any]:
+    """Metrics of one episode from its observations o_0..o_T in order (rows and, when recorded, the final
+    observation): qpos/qvel (N, 2) as recorded (cart position, pole angle / their velocities), the recorded region
+    membership I_t and TV activation. Durations count observations (agent steps)."""
+    inside, active = np.asarray(in_region, dtype=bool), np.asarray(tv_active, dtype=bool)
+    if (active & ~inside).any():
+        raise ValueError("The TV is recorded active outside the trigger region")
+    visits = runs_of_ones(inside)
+    dwell = [length for _, length in visits]
+    pos, ang = coverage_bins(qpos[:, 0], qpos[:, 1])
+    cells = set(zip(pos.tolist(), ang.tolist()))
+    v, w = np.abs(qvel[:, 0]), np.abs(qvel[:, 1])
+    return dict(num_observations=int(inside.size), occupancy=float(inside.mean()), tv_active_fraction=float(active.mean()),
+                initial_in_region=int(inside[0]), region_entries=int((~inside[:-1] & inside[1:]).sum()),
+                visits=len(visits), reached=int(inside.any()),
+                mean_dwell=float(np.mean(dwell)) if dwell else "", max_dwell=max(dwell) if dwell else "",
+                position_angle_bins_visited=len(cells), position_angle_coverage=len(cells) / NUM_COVERAGE_BINS,
+                position_bins_visited=len(set(pos.tolist())), angle_bins_visited=len(set(ang.tolist())),
+                cart_velocity_mean_abs=float(v.mean()), cart_velocity_std=float(np.std(qvel[:, 0])),
+                cart_velocity_max_abs=float(v.max()), pole_angular_velocity_mean_abs=float(w.mean()),
+                pole_angular_velocity_std=float(np.std(qvel[:, 1])), pole_angular_velocity_max_abs=float(w.max()),
+                cells=cells)
+
+
+def episode_observation_states(episode) -> Dict[str, np.ndarray]:
+    """qpos, qvel, in_region, tv_active of o_0..o_T of one recorded noisy-TV episode (the final observation
+    included when its state was recorded). Every row must be recorded."""
+    ps = episode.physical_state
+    if ps is None or "tv_in_region" not in ps:
+        raise ValueError("The episode has no noisy-TV diagnostics (collected without the wrapper or without "
+                         "record_physical_state)")
+    if not bool(ps["recorded"].all()):
+        raise ValueError("The episode has unrecorded frames")
+    parts = {k: [ps[k].numpy()] for k in ("qpos", "qvel", "tv_in_region", "tv_active")}
+    final = "final_qpos" in ps
+    if final:
+        for k in parts:
+            parts[k].append(ps[f"final_{k}"].numpy()[None])
+    out = {k: np.concatenate(v) for k, v in parts.items()}
+    out["final_included"] = final
+    return out
+
+
+def mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float, float]:
+    """Mean, population std and a normal-approximation 95% interval of the mean over episodes (episode-level
+    evaluation variability of one trained policy, not variability across training runs)."""
+    x = np.asarray([v for v in values if v != ""], dtype=np.float64)
+    if x.size == 0:
+        return (float("nan"),) * 4
+    m, s = float(x.mean()), float(x.std())
+    half = 1.96 * float(x.std(ddof=1)) / math.sqrt(x.size) if x.size > 1 else float("nan")
+    return m, s, m - half, m + half
+
+
+def noisy_tv_condition_rows(condition: str, method: str, episodes: List[Any], seeds: List[int]
+                            ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    """(per-episode rows, summary row, per-episode states for intrinsic diagnostics) of one condition."""
+    rows, states, union = [], [], set()
+    for k, (episode, seed) in enumerate(zip(episodes, seeds)):
+        st = episode_observation_states(episode)
+        m = noisy_tv_episode_metrics(st["qpos"], st["qvel"], st["tv_in_region"], st["tv_active"])
+        if condition == "clean" and m["tv_active_fraction"] > 0:
+            raise ValueError("A Clean episode records an active TV")
+        if condition != "clean" and not np.array_equal(st["tv_active"], st["tv_in_region"]):
+            raise ValueError(f"A {condition} episode's TV activation differs from its region membership")
+        union |= m.pop("cells")
+        rows.append(dict(condition=condition, method=method, reset_seed=seed, episode=k, length=len(episode),
+                         final_observation_included=int(st["final_included"]),
+                         task_return=float(episode.rew.sum()), **m))
+        states.append(st)
+    occ = mean_std_ci([r["occupancy"] for r in rows])
+    visited = [r for r in rows if r["reached"]]
+    cov = mean_std_ci([r["position_angle_coverage"] for r in rows])
+    summary = dict(condition=condition, method=method, num_episodes=len(rows), occupancy_mean=occ[0],
+                   occupancy_std=occ[1], occupancy_ci95_low=occ[2], occupancy_ci95_high=occ[3],
+                   reach_rate=float(np.mean([r["reached"] for r in rows])),
+                   initial_in_region_episodes=int(sum(r["initial_in_region"] for r in rows)),
+                   episodes_without_visits=len(rows) - len(visited),
+                   region_entries_mean=float(np.mean([r["region_entries"] for r in rows])),
+                   mean_dwell_mean_given_visit=float(np.mean([r["mean_dwell"] for r in visited])) if visited else "",
+                   max_dwell_mean_given_visit=float(np.mean([r["max_dwell"] for r in visited])) if visited else "",
+                   max_dwell_max=max((r["max_dwell"] for r in visited), default=""),
+                   position_angle_coverage_mean=cov[0], position_angle_coverage_std=cov[1],
+                   union_position_angle_bins=len(union), union_position_angle_coverage=len(union) / NUM_COVERAGE_BINS,
+                   cart_velocity_mean_abs_mean=float(np.mean([r["cart_velocity_mean_abs"] for r in rows])),
+                   pole_angular_velocity_mean_abs_mean=float(np.mean([r["pole_angular_velocity_mean_abs"] for r in rows])),
+                   task_return_mean=float(np.mean([r["task_return"] for r in rows])))
+    return rows, summary, states
+
+
+def noisy_tv_paired(rows: Dict[str, List[Dict[str, Any]]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Per reset seed, each TV condition against Clean: delta = TV - Clean (occupancy, max dwell with 0 for no
+    visit, position-angle coverage)."""
+    paired, summaries = [], []
+    clean = {r["reset_seed"]: r for r in rows.get("clean", [])}
+    for condition in ("tv16", "tv24"):
+        if condition not in rows or not clean:
+            continue
+        found = []
+        for r in rows[condition]:
+            c = clean.get(r["reset_seed"])
+            if c is None:
+                raise ValueError(f"{condition} reset seed {r['reset_seed']} has no Clean episode to pair with")
+            dwell = lambda x: 0 if x["max_dwell"] == "" else x["max_dwell"]
+            found.append(dict(condition=condition, method=r["method"], reset_seed=r["reset_seed"],
+                              occupancy_clean=c["occupancy"], occupancy_tv=r["occupancy"],
+                              delta_occupancy=r["occupancy"] - c["occupancy"], max_dwell_clean=dwell(c),
+                              max_dwell_tv=dwell(r), delta_max_dwell=dwell(r) - dwell(c),
+                              coverage_clean=c["position_angle_coverage"], coverage_tv=r["position_angle_coverage"],
+                              delta_coverage=r["position_angle_coverage"] - c["position_angle_coverage"]))
+        d = mean_std_ci([f["delta_occupancy"] for f in found])
+        summaries.append(dict(condition=condition, method=found[0]["method"] if found else "", num_pairs=len(found),
+                              delta_occupancy_mean=d[0], delta_occupancy_std=d[1], delta_occupancy_ci95_low=d[2],
+                              delta_occupancy_ci95_high=d[3],
+                              delta_max_dwell_mean=float(np.mean([f["delta_max_dwell"] for f in found])),
+                              delta_coverage_mean=float(np.mean([f["delta_coverage"] for f in found]))))
+        paired += found
+    return paired, summaries
+
+
+def tensor_sha256(state: Dict[str, Any]) -> str:
+    """state_sha256 of the tensor entries of a state dict (PMPO's _extra_state is not a tensor)."""
+    return state_sha256({k: v for k, v in state.items() if torch.is_tensor(v)})
+
+
+def evaluate_noisy_tv_milestone(milestone_path: Path, out_dir: Path, seeds: Sequence[int], device: torch.device,
+                                action_seed: int = 0) -> Dict[str, Any]:
+    """30-seed (seeds) real evaluation of one noisy-TV milestone in its own condition, with the existing exploration
+    test collector (coroutines.collector.make_collector, reset every collect, one episode per reset seed): the
+    run's env.test settings (its evaluation TV seed), collection.test.epsilon, the milestone's exploration policy
+    (sampled actions, as the run's own test collection) or, for Uniform, uniform actions. Nothing is trained,
+    refreshed or refitted; the policy's weights are hashed before and after. The global RNGs are seeded per
+    episode from SeedSequence([action_seed, reset_seed]) and restored afterwards. Writes out_dir/dataset (the
+    episodes with their diagnostics) and out_dir/evaluation.json; returns the evaluation record."""
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+    from agent import get_action_space_kwargs
+    from coroutines.collector import make_collector, NumToCollect
+    from data import Dataset
+    from envs import make_dm_control_env
+    from models.pmpo_beta import PMPOBeta
+    from utils import rng_state, set_rng_state, set_seed
+    milestone_path, out_dir = Path(milestone_path), Path(out_dir)
+    if (out_dir / NOISY_TV_EVALUATION).exists() or (out_dir / "dataset").exists():
+        raise FileExistsError(f"Not overwriting the existing evaluation in {out_dir}")
+    manifest = read_manifest(milestone_path)
+    run_dir = milestone_path.parent.parent
+    cfg = run_config(run_dir)
+    test_env = OmegaConf.to_container(cfg.env.test, resolve=True)
+    if test_env.get("noisy_tv") is None:
+        raise ValueError(f"Run {run_dir} has no env.test.noisy_tv: not a noisy-TV run")
+    learned = cfg.collection.train.mode == "policy"
+    env = make_dm_control_env(num_envs=1, device=device, **test_env, record_physical_state=True)
+    saved_rng = rng_state()
+    try:
+        action_kwargs = get_action_space_kwargs(env)
+        ac_cfg = instantiate(cfg.agent.actor_critic)
+        ac_cfg.continuous_action_dim = action_kwargs["continuous_action_dim"]
+        ac_cfg.action_low, ac_cfg.action_high = action_kwargs["action_low"], action_kwargs["action_high"]
+        policy = PMPOBeta(ac_cfg)
+        policy_file = None
+        if learned:
+            policy_file = milestone_path / "exploration_policy.pt"
+            listed = {e["path"] for e in manifest["files"].values()}
+            if policy_file.name not in listed or not policy_file.is_file():
+                raise FileNotFoundError(f"Milestone {milestone_path} has no exploration_policy.pt (a learned method "
+                                        "saves it from its first refresh on)")
+            entry = next(e for e in manifest["files"].values() if e["path"] == policy_file.name)
+            if file_sha256(policy_file) != entry["sha256"]:
+                raise ValueError(f"{policy_file} does not match its manifest checksum")
+            policy.load_state_dict(torch.load(policy_file, map_location="cpu", weights_only=False))
+        policy.to(device).eval()
+        before = tensor_sha256(policy.state_dict())
+        dataset = Dataset(out_dir / "dataset", "noisy_tv_evaluation", cache_in_ram=True)
+        collector = make_collector(env, policy, dataset, float(cfg.collection.test.epsilon), reset_every_collect=True,
+                                   verbose=False)
+        mode = "policy" if learned else "uniform"
+        for seed in seeds:
+            set_seed(int(np.random.SeedSequence([int(action_seed), int(seed)]).generate_state(1)[0]))
+            collector.send(NumToCollect(episodes=1, mode=mode, reset_seed=int(seed), progress=False))
+        after = tensor_sha256(policy.state_dict())
+        if before != after:
+            raise RuntimeError("The exploration policy's weights changed during evaluation")
+        if dataset.num_episodes != len(seeds):
+            raise RuntimeError(f"Evaluation gave {dataset.num_episodes} episodes for {len(seeds)} reset seeds")
+        dataset.save_to_default_path()
+    finally:
+        set_rng_state(saved_rng)
+        env.close()
+    record = dict(
+        milestone=str(milestone_path.resolve()), run=str(run_dir.resolve()), domain=manifest["domain"],
+        task_names=manifest["task_names"], collected_steps=int(manifest["collected_steps"]),
+        method=method_label(learned, OmegaConf.select(cfg, "intrinsic_reward.method", default=None)),
+        condition=condition_name(test_env["noisy_tv"]), noisy_tv_test=test_env["noisy_tv"],
+        noisy_tv_train=OmegaConf.to_container(cfg.env.train.noisy_tv, resolve=True),
+        env_test={k: v for k, v in test_env.items() if k != "noisy_tv"}, reset_seeds=[int(s) for s in seeds],
+        action_selection=("policy samples (the run's test collection rule)" if learned else "uniform in the action bounds")
+        + f", epsilon {float(cfg.collection.test.epsilon)}", action_seed=int(action_seed),
+        action_rng="global RNGs seeded per episode from SeedSequence([action_seed, reset_seed]); restored afterwards",
+        collector="coroutines.collector.make_collector(reset_every_collect=True), one episode per reset seed",
+        policy_file=None if policy_file is None else policy_file.name,
+        policy_sha256=before, policy_sha256_after=after, weights_unchanged=True,
+        milestone_files={k: v["sha256"] for k, v in manifest["files"].items()}, source=manifest.get("source"),
+        episode_lengths=[int(x) for x in dataset.lengths])
+    write_json(out_dir / NOISY_TV_EVALUATION, record)
+    return record
+
+
+def read_noisy_tv_evaluation(out_dir: Path) -> Tuple[Dict[str, Any], List[Any]]:
+    """A saved evaluation (evaluation.json and its dataset), every episode file checked against its checksum."""
+    from data import Dataset
+    out_dir = Path(out_dir)
+    record = json.loads((out_dir / NOISY_TV_EVALUATION).read_text(encoding="utf-8"))
+    dataset = Dataset(out_dir / "dataset", "noisy_tv_evaluation", save_on_disk=False)
+    dataset.load_from_default_path()
+    dataset.is_static = True
+    episodes = [load_checked_episode(dataset, k) for k in range(int(dataset.num_episodes))]
+    return record, episodes
+
+
+def noisy_tv_batch(episodes: List[Any], n: int) -> Dict[str, Any]:
+    """Every transition of the evaluation episodes, with what every scorer reads (as window_batch): sampler
+    windows, the real successor (next row or the final observation), the Plan2Explore context, frame and action."""
+    from intrinsic_reward.intrinsic_eval import sampler_windows
+    from intrinsic_reward.plan2explore import context_window
+    fields = {k: [] for k in ("obs", "act", "frame", "action", "context", "context_act", "successor", "position")}
+    for k, episode in enumerate(episodes):
+        obs_w, act_w, nexts = sampler_windows(episode, n)
+        for i in range(len(episode)):
+            ctx, ctx_act, _ = context_window(episode.obs, episode.act, i, n)
+            fields["obs"].append(obs_w[i]), fields["act"].append(act_w[i])
+            fields["frame"].append(episode.obs[i]), fields["action"].append(episode.act[i])
+            fields["context"].append(ctx), fields["context_act"].append(ctx_act)
+            fields["successor"].append(nexts[i] if i < nexts.shape[0] else None)
+            fields["position"].append((k, i))
+    batch = {k: torch.stack(v) for k, v in fields.items() if k not in ("successor", "position")}
+    batch.update(successor=fields["successor"], position=fields["position"])
+    return batch
+
+
+def noisy_tv_intrinsic(condition: str, method: str, milestone_path: Path, episodes: List[Any],
+                       states: List[Dict[str, Any]], seeds: List[int], scoring_seed: int, device: torch.device
+                       ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Frozen-scorer intrinsic rewards (restore_milestone_scorer: nothing refreshed or refitted) of the evaluation
+    transitions (o_t, a_t), split by the region membership of o_t: inside / outside, entry (o_t inside, o_{t-1}
+    outside or t = 0) / sustained (o_t and o_{t-1} inside)."""
+    scorer, _, _ = restore_milestone_scorer(method, milestone_path, device)
+    batch = noisy_tv_batch(episodes, scorer.n)
+    raw, scaled = scorer.score(batch, scoring_seed)
+    transitions, subsets = [], {s: [] for s in ("all", "inside", "outside", "entry", "sustained")}
+    for j, (k, i) in enumerate(batch["position"]):
+        inside = bool(states[k]["tv_in_region"][i])
+        previous = bool(states[k]["tv_in_region"][i - 1]) if i > 0 else False
+        subset = ("sustained" if previous else "entry") if inside else "outside"
+        ok = not math.isnan(float(raw[j]))
+        transitions.append(dict(condition=condition, method=method, reset_seed=seeds[k], episode=k, row=i,
+                                in_region=int(inside), tv_active=int(bool(states[k]["tv_active"][i])), subset=subset,
+                                raw=float(raw[j]) if ok else "", scaled="" if scaled is None or not ok else float(scaled[j])))
+        if ok:
+            for s in ("all", "inside" if inside else "outside", subset if inside else None):
+                if s is not None:
+                    subsets[s].append(j)
+    rows = []
+    for s, idx in subsets.items():
+        r = raw[idx].numpy() if idx else np.array([])
+        rows.append(dict(condition=condition, method=method, subset=s, num_transitions=len(idx),
+                         raw_mean=float(r.mean()) if idx else "", raw_std=float(r.std()) if idx else "",
+                         scaled_mean="" if scaled is None or not idx else float(scaled[idx].mean())))
+    return rows, transitions, scorer.describe()
+
+
+def export_noisy_tv_videos(episodes: Dict[str, List[Any]], rows: Dict[str, List[Dict[str, Any]]], out: Path,
+                           scale: int = 4, fps: int = 25) -> List[str]:
+    """Representative videos from the saved (replay-format) evaluation observations: per condition, the episode
+    with the highest occupancy (ties: the lowest reset seed), as MP4 (OpenCV) and a PNG strip of frames around its
+    first region entry. Returns the written paths; none when OpenCV is unavailable."""
+    try:
+        import cv2
+    except ImportError:
+        return []
+    written = []
+    out.mkdir(parents=True, exist_ok=True)
+    for condition, eps in episodes.items():
+        best = max(range(len(eps)), key=lambda k: (rows[condition][k]["occupancy"], -rows[condition][k]["reset_seed"]))
+        frames = eps[best].obs.add(1).div(2).mul(255).round().clamp(0, 255).byte().permute(0, 2, 3, 1).numpy()
+        seed = rows[condition][best]["reset_seed"]
+        path = out / f"{condition}_seed{seed}.mp4"
+        h, w = frames.shape[1] * scale, frames.shape[2] * scale
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        for f in frames:
+            writer.write(cv2.resize(np.ascontiguousarray(f[..., ::-1]), (w, h), interpolation=cv2.INTER_NEAREST))
+        writer.release()
+        written.append(str(path))
+        inside = eps[best].physical_state["tv_in_region"].numpy()
+        start = int(np.argmax(inside)) if inside.any() else 0
+        picks = list(range(max(0, start - 3), min(len(frames), start + 5)))
+        strip = np.concatenate([frames[t] for t in picks], axis=1)
+        png = out / f"{condition}_seed{seed}_entry_strip.png"
+        cv2.imwrite(str(png), cv2.resize(strip[..., ::-1], (strip.shape[1] * scale, strip.shape[0] * scale),
+                                         interpolation=cv2.INTER_NEAREST))
+        written.append(str(png))
+    return written
+
+
+NOISY_TV_PLOT_PROGRAM = r"""
+import json, sys
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+spec = json.loads(sys.stdin.read())
+out, conditions = spec["out"], spec["conditions"]
+for key, label, name in (("occupancy", "Trigger-region occupancy (fraction of observations)", "occupancy"),
+                         ("max_dwell", "Maximum dwell (observations; episodes with a visit)", "dwell"),
+                         ("position_angle_coverage", "Physical coverage (fraction of position x angle bins)", "coverage")):
+    fig, ax = plt.subplots(figsize=(6, 4))
+    data = [[v for v in spec["values"][c][key] if v is not None] for c in conditions]
+    ax.boxplot(data, labels=conditions, showmeans=True)
+    for i, d in enumerate(data):
+        ax.scatter([i + 1] * len(d), d, s=8, alpha=0.5)
+    ax.set_ylabel(label)
+    ax.set_title(spec["title"], fontsize=9)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    for suffix in ("png", "pdf"):
+        fig.savefig(f"{out}/{name}.{suffix}", dpi=150)
+    plt.close(fig)
+"""
+
+
+def plot_noisy_tv(rows: Dict[str, List[Dict[str, Any]]], out: Path, title: str) -> Optional[str]:
+    """Occupancy, dwell and coverage plots in a separate process (as downstream_analysis' figures). Returns None
+    when drawn, else the reason they were skipped (no matplotlib)."""
+    import subprocess
+    spec = dict(out=str(out), title=title, conditions=list(rows),
+                values={c: {k: [None if r[k] == "" else r[k] for r in rs]
+                            for k in ("occupancy", "max_dwell", "position_angle_coverage")} for c, rs in rows.items()})
+    result = subprocess.run([sys.executable, "-c", NOISY_TV_PLOT_PROGRAM], input=json.dumps(spec), text=True,
+                            capture_output=True)
+    if result.returncode != 0:
+        return f"plots skipped: {result.stderr.strip().splitlines()[-1] if result.stderr.strip() else 'plot process failed'}"
+    return None
+
+
+def noisy_tv_analysis(conditions: Dict[str, Path], output: Path, seeds: Optional[Sequence[int]] = None,
+                      device: Optional[str] = None, intrinsic: bool = False, scoring_seed: int = 0, action_seed: int = 0,
+                      videos: bool = True, argv: Optional[Sequence[str]] = None) -> Dict[str, Path]:
+    """The noisy-TV comparison of one method: conditions maps clean/tv16/tv24 to a milestone of that condition's run.
+    Saved trajectories (output/trajectories/<condition>/) are read when present and consistent (same milestone,
+    policy hash and seeds); missing ones are evaluated first (evaluate_noisy_tv_milestone). Writes per-episode,
+    summary, paired and (with intrinsic) intrinsic-reward CSV/JSON, plots, videos and analysis.json."""
+    from omegaconf import OmegaConf
+    output = Path(output)
+    names = ["noisy_tv_episodes.csv", "noisy_tv_summary.csv", "noisy_tv_paired.csv", "noisy_tv_paired_summary.csv",
+             "noisy_tv_episodes.json", "analysis.json"] + (["noisy_tv_intrinsic.csv", "noisy_tv_transitions.csv"]
+                                                           if intrinsic else [])
+    existing = [str(output / f) for f in names if (output / f).exists()]
+    if existing:
+        raise FileExistsError(f"Not overwriting existing results: {existing}")
+    unknown = sorted(set(conditions) - set(NOISY_TV_CONDITIONS))
+    if unknown or not conditions:
+        raise ValueError(f"--condition takes {', '.join(NOISY_TV_CONDITIONS)}=<milestone>; got {sorted(conditions)}")
+    torch_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    # Every condition: a noisy-TV run of that condition; one method, domain, task group, trigger and panel.
+    info = {}
+    for condition, milestone in conditions.items():
+        milestone = Path(milestone)
+        manifest = read_manifest(milestone)
+        cfg = run_config(milestone.parent.parent)
+        train_tv = OmegaConf.select(cfg, "env.train.noisy_tv", default=None)
+        train_tv = None if train_tv is None else OmegaConf.to_container(train_tv, resolve=True)
+        if condition_name(train_tv) != condition:
+            raise ValueError(f"--condition {condition}={milestone}: that run's condition is {condition_name(train_tv)}")
+        exploration = manifest.get("exploration", {})
+        info[condition] = dict(milestone=milestone, manifest=manifest, cfg=cfg, tv=train_tv,
+                               method=method_label(bool(exploration.get("intrinsic_reward_enabled")),
+                                                   exploration.get("method")),
+                               final_seeds=list(OmegaConf.select(cfg, "evaluation.final_reset_seeds", default=None) or []))
+    shared = lambda c: (c["method"], c["manifest"]["domain"], tuple(c["manifest"]["task_names"]),
+                        tuple(c["tv"]["position_interval"]), c["tv"]["panel_location"], c["tv"]["margin"],
+                        int(c["manifest"]["collected_steps"]))
+    if len({shared(c) for c in info.values()}) != 1:
+        raise ValueError("All conditions must share method, domain, task group, trigger interval, panel location, "
+                         "margin and milestone step: " + str({k: shared(c) for k, c in info.items()}))
+    method = next(iter(info.values()))["method"]
+    if seeds is None:
+        options = {tuple(c["final_seeds"]) for c in info.values()}
+        if len(options) != 1 or not next(iter(options)):
+            raise ValueError("Give --seeds: the runs record different or no evaluation.final_reset_seeds")
+        seeds = list(next(iter(options)))
+    seeds = [int(s) for s in seeds]
+    rows, summaries, episodes, states, evaluations = {}, [], {}, {}, {}
+    for condition in NOISY_TV_CONDITIONS:
+        if condition not in info:
+            continue
+        c = info[condition]
+        folder = output / "trajectories" / condition
+        if not (folder / NOISY_TV_EVALUATION).is_file():
+            say_line(f"Evaluating {condition}: {c['milestone']} ({len(seeds)} reset seeds)")
+            evaluate_noisy_tv_milestone(c["milestone"], folder, seeds, torch_device, action_seed)
+        record, eps = read_noisy_tv_evaluation(folder)
+        if record["milestone"] != str(c["milestone"].resolve()) or record["reset_seeds"] != seeds \
+                or record["action_seed"] != action_seed or record["condition"] != condition:
+            raise ValueError(f"Saved trajectories {folder} belong to another milestone, condition or seed list")
+        if record["milestone_files"] != {k: v["sha256"] for k, v in c["manifest"]["files"].items()}:
+            raise ValueError(f"Saved trajectories {folder}: the milestone's files changed since they were evaluated")
+        r, s, st = noisy_tv_condition_rows(condition, method, eps, seeds)
+        rows[condition], episodes[condition], states[condition], evaluations[condition] = r, eps, st, record
+        summaries.append(s)
+    paired, paired_summary = noisy_tv_paired(rows)
+    all_rows = [r for c in rows.values() for r in c]
+    write_csv(output / "noisy_tv_episodes.csv", all_rows, NOISY_TV_EPISODE_COLUMNS)
+    write_csv(output / "noisy_tv_summary.csv", summaries, NOISY_TV_SUMMARY_COLUMNS)
+    write_csv(output / "noisy_tv_paired.csv", paired, NOISY_TV_PAIRED_COLUMNS)
+    write_csv(output / "noisy_tv_paired_summary.csv", paired_summary, NOISY_TV_PAIRED_SUMMARY_COLUMNS)
+    write_json(output / "noisy_tv_episodes.json", dict(episodes=all_rows))
+    intrinsic_info = None
+    if intrinsic:
+        if method not in LEARNED:
+            raise ValueError(f"--intrinsic needs a learned method; {method} has no intrinsic scorer")
+        irows, trows, described = [], [], {}
+        for condition in rows:
+            ir, tr, d = noisy_tv_intrinsic(condition, method, info[condition]["milestone"], episodes[condition],
+                                           states[condition], seeds, scoring_seed, torch_device)
+            irows += ir
+            trows += tr
+            described[condition] = d
+        write_csv(output / "noisy_tv_intrinsic.csv", irows, NOISY_TV_INTRINSIC_COLUMNS)
+        write_csv(output / "noisy_tv_transitions.csv", trows, NOISY_TV_TRANSITION_COLUMNS)
+        intrinsic_info = dict(scoring_seed=scoring_seed, scorers=described,
+                              note="raw scores are comparable within this method only; each condition uses its own "
+                                   "milestone's frozen scorer")
+    video_files = export_noisy_tv_videos(episodes, rows, output / "videos") if videos else []
+    plot_note = plot_noisy_tv(rows, output, f"{method}, {next(iter(info.values()))['manifest']['domain']}, "
+                                            f"milestone {next(iter(info.values()))['milestone'].name}")
+    finite = lambda v: v if isinstance(v, (int, float)) and math.isfinite(v) else None
+    write_json(output / "analysis.json", dict(
+        tests=[NOISY_TV], method=method, conditions={k: str(c["milestone"].resolve()) for k, c in info.items()},
+        reset_seeds=seeds, action_seed=action_seed,
+        noisy_tv={k: dict(train=c["tv"], test=evaluations[k]["noisy_tv_test"]) for k, c in info.items()},
+        evaluations={k: {kk: v for kk, v in e.items() if kk != "episode_lengths"} for k, e in evaluations.items()},
+        metrics=dict(
+            observations="o_0..o_T of each episode: the stored rows and, when recorded, the final observation",
+            occupancy="fraction of observations with I_t = 1 (cart position in the interval, inclusive)",
+            region_entries="outside-to-inside transitions between consecutive observations; an episode starting inside "
+                           "is counted in initial_in_region, not as an entry",
+            dwell="lengths of maximal runs of I_t = 1, in observations; mean/max over the episode's visits; empty "
+                  "without a visit (the summary conditions on visits); runs reaching the episode end are not censored",
+            reached="any observation inside", coverage=dict(
+                position_edges_m=list(POSITION_EDGES), position_bins=NUM_POSITION_BINS,
+                position_out_of_range="bin 0 below -1.8 m, bin 19 above 1.8 m (1.8 itself in the last regular bin)",
+                angle="pole angle wrapped to [-pi, pi), 24 bins of 15 degrees", total_bins=NUM_COVERAGE_BINS,
+                note="simulator state only; rendered images are never counted"),
+            velocities="per episode: mean |v|, std v, max |v| of cart velocity (qvel[0]) and pole angular velocity "
+                       "(qvel[1])",
+            paired="per reset seed: TV - Clean (occupancy, max dwell with 0 when no visit, coverage)",
+            intervals="normal-approximation 95% intervals of episode means: evaluation variability of one trained "
+                      "policy per condition, not variability across independent training runs"),
+        paired_summary=[{k: finite(v) if isinstance(v, float) else v for k, v in s.items()} for s in paired_summary],
+        intrinsic=intrinsic_info, videos=video_files, plots=plot_note or "occupancy, dwell, coverage (.png, .pdf)",
+        command=list(argv) if argv is not None else None))
+    return {name: output / name for name in names}
+
+
+def say_line(text: str) -> None:
+    print(text, flush=True)
+
+
+def parse_conditions(items: Sequence[str]) -> Dict[str, Path]:
+    """condition=milestone pairs, each condition once."""
+    found = {}
+    for item in items:
+        name, sep, path = item.partition("=")
+        if not sep or not name.strip() or not path.strip():
+            raise ValueError(f"--condition takes condition=<milestone folder>, got {item!r}")
+        if name.strip() in found:
+            raise ValueError(f"--condition gives {name.strip()!r} more than once")
+        found[name.strip()] = Path(path.strip())
+    return found
+
+
+def parse_seeds(text: Optional[str]) -> Optional[List[int]]:
+    """'3001-3030' or '3001,3002,...'."""
+    if text is None:
+        return None
+    if "-" in text and "," not in text:
+        a, b = (int(v) for v in text.split("-"))
+        return list(range(a, b + 1))
+    return [int(v) for v in text.split(",")]
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--test", action="append", required=True, choices=TESTS,
                         help="analysis to run; repeat to combine")
-    parser.add_argument("--milestone", action="append", required=True, type=Path,
+    parser.add_argument("--milestone", action="append", default=[], type=Path,
                         help="milestone folder <run>/milestones/steps_N; repeat for several methods (coverage, "
-                             f"lasting); exactly one for {FOLLOW}")
+                             f"lasting); exactly one for {FOLLOW}; not used by {NOISY_TV}")
+    parser.add_argument("--condition", action="append", default=[], metavar="CONDITION=MILESTONE",
+                        help=f"{NOISY_TV}: a milestone of the run of one condition ({', '.join(NOISY_TV_CONDITIONS)}); "
+                             "repeat per condition")
+    parser.add_argument("--seeds", default=None, help=f"{NOISY_TV}: evaluation reset seeds, e.g. 3001-3030 (default: "
+                                                      "the runs' evaluation.final_reset_seeds)")
+    parser.add_argument("--action-seed", type=int, default=0, help=f"{NOISY_TV}: seed of the evaluation action RNG")
+    parser.add_argument("--intrinsic", action="store_true",
+                        help=f"{NOISY_TV}: also score the evaluation transitions with each milestone's frozen scorer")
+    parser.add_argument("--no-videos", action="store_true", help=f"{NOISY_TV}: skip the representative videos")
     parser.add_argument("--threshold", action="append", default=[], metavar="TASK=VALUE",
                         help="coverage, lasting: reward threshold of one task in stored units; repeat per task")
     parser.add_argument("--method", choices=sorted(LEARNED), help=f"{FOLLOW}: the milestone's learned method")
     parser.add_argument("--uniform-run", type=Path, help=f"{FOLLOW}: the Uniform run folder to compare with")
     parser.add_argument("--scoring-seed", type=int, default=0,
-                        help=f"{FOLLOW}: seed of the scoring randomness, the same for both batches (default 0)")
-    parser.add_argument("--device", default=None, help=f"{FOLLOW}: torch device (default: cuda if available, else cpu)")
+                        help=f"{FOLLOW}, {NOISY_TV} --intrinsic: seed of the scoring randomness (default 0)")
+    parser.add_argument("--device", default=None,
+                        help=f"{FOLLOW}, {NOISY_TV}: torch device (default: cuda if available, else cpu)")
     parser.add_argument("--output", required=True, type=Path, help="folder for the CSV results and analysis.json")
     args = parser.parse_args(argv)
     command = sys.argv if argv is None else ["exploration_analysis.py", *argv]
     tests = list(dict.fromkeys(args.test))
+    noisy_options = args.condition or args.seeds or args.intrinsic or args.no_videos or args.action_seed
+    if NOISY_TV in tests:
+        if len(tests) > 1:
+            parser.error(f"{NOISY_TV} runs on its own; run the other tests in a separate invocation")
+        if args.milestone or args.threshold or args.method or args.uniform_run:
+            parser.error(f"{NOISY_TV} takes --condition (not --milestone, --threshold, --method or --uniform-run)")
+        written = noisy_tv_analysis(parse_conditions(args.condition), args.output, parse_seeds(args.seeds), args.device,
+                                    args.intrinsic, args.scoring_seed, args.action_seed, not args.no_videos,
+                                    argv=command)
+        for name, path in written.items():
+            print(f"{name}: {path.resolve()}")
+        return
+    if noisy_options:
+        parser.error(f"--condition, --seeds, --action-seed, --intrinsic and --no-videos belong to {NOISY_TV}")
+    if not args.milestone:
+        parser.error("Give at least one --milestone")
     if FOLLOW in tests:
         if len(tests) > 1:
             parser.error(f"{FOLLOW} runs on its own; run the replay tests in a separate invocation")

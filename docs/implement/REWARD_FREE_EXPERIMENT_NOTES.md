@@ -4465,3 +4465,112 @@ tested. Unresolvable historical origins/namespaces stay labelled rather than sil
 server values. Earlier ZIPs and evidence remain unchanged; the new complete review package is
 `docs/changes/shared_downstream_wandb_fixed_20261106_review.zip` with a SHA-256 manifest and separate
 complete-worktree and correction-only diffs.
+
+## Cartpole noisy TV (2026-11-28)
+
+Implementation of `docs/implement/AlEATRORISTIC_EXPERIMENT_DESIGN.md` (Cartpole; Clean, TV16, TV24). Base commit
+`b971eaf`; uncommitted. No 100k comparison was launched; no running job was touched. Review package:
+`outputs/noisy_tv_review/package/` (gitignored).
+
+**What was added**
+
+- `src/envs/cartpole_noisy_tv.py`: `CartpoleNoisyTV`, a gymnasium wrapper around one `DMControlEnv` (cartpole). It
+  runs inside each vector-env worker, after action repeat and rendering, and emits each observation once:
+  `I_t = x_L <= qpos[0] <= x_R` for the state the frame was rendered from; while enabled and inside, a fresh
+  `size x size x 3` uint8 texture (uniform 0..255, private numpy Generator) replaces the panel pixels. Inactive frames
+  are the rendering unchanged; Clean never draws. Physics, actions, rewards, task labels, termination, shape and
+  dtype are the wrapped env's. A reset with seed `s` restarts the TV stream from `SeedSequence([tv_seed, s])`;
+  autoresets continue it. `collection_state` adds the Generator state, draw count, the last emitted observation and
+  its diagnostics (restored, never regenerated); `physical_state` reads the cached diagnostics (no draw).
+- `envs/env.py`: `make_dm_control_env(..., noisy_tv=None)` builds the wrapper when the env config has a noisy-TV
+  section (validated before workers spawn; any non-Cartpole domain is refused, Clean included). `TorchEnv` carries
+  the TV diagnostics beside qpos/qvel (`tv_in_region`, `tv_active`, `tv_panel_size`).
+- `data/episode.py`: optional all-or-none TV keys in `Episode.physical_state` (and `final_*` with the final
+  observation), stacked, joined and validated like qpos/qvel (active outside the region is refused).
+- `config/noisy_tv/{clean,tv16,tv24}.yaml` (`+noisy_tv=<condition>`): `env.train.noisy_tv` (TV seed 0),
+  `env.test.noisy_tv` (same condition, seed 1000), `collection.{train,test}.record_physical_state: true`.
+- `exploration_trainer.py`: `check_noisy_tv_settings` (train/test given together, same condition, different seeds,
+  diagnostics recorded); banner line; `provenance()["noisy_tv"]`; milestone manifest `noisy_tv` and TV keys in
+  `physical_state`. The collection loop, imagination (`WorldModelEnv` from the denoiser and replay) and every method
+  are unchanged; the resume check compares `env.train` including `noisy_tv`.
+- `downstream_trainer.py`: a milestone explored with an enabled TV is refused (downstream evaluation builds a plain
+  env); Clean milestones adapt as before.
+- `exploration_analysis.py --test noisy-tv` (runs on its own): `--condition clean=... tv16=... tv24=...` (milestones of
+  one method), `--seeds` (default: the runs' `evaluation.final_reset_seeds`), `--intrinsic`, `--no-videos`.
+  Trajectories are read from `<output>/trajectories/<condition>/` when present and consistent (milestone, file
+  checksums, seeds, action seed, condition), else evaluated by `evaluate_noisy_tv_milestone`: the existing exploration
+  test collector (`make_collector(reset_every_collect=True)`), one episode per reset seed, the run's `env.test`
+  (evaluation TV seed), `collection.test.epsilon`, sampled policy actions from `exploration_policy.pt` (or uniform
+  actions), global RNGs seeded per episode from `SeedSequence([action_seed, reset_seed])` and restored; the policy
+  weights are hashed before and after. Outputs: per-episode CSV/JSON, condition summaries, paired TV - Clean per seed,
+  optional frozen-scorer intrinsic rewards (inside/outside, entry/sustained; `restore_milestone_scorer`, nothing
+  refitted), occupancy/dwell/coverage plots (separate process; skipped with a recorded reason without matplotlib),
+  videos (MP4 and a lossless PNG entry strip from the saved replay frames) and `analysis.json` (definitions, bins,
+  settings, provenance).
+
+**Calibration (before training; no evaluation results examined)**
+
+Ten clean Cartpole runs' training replays on kingplus0 (uniform, Plan2Explore, full ensemble, LCG data-scaled,
+LCG predictor; balance and swingup groups; 127-200 episodes each), per-frame `qpos`:
+`outputs/noisy_tv_review/calibration/` (`calibration_stats.py`, `calibration_stats.json`).
+
+| Interval `[0.3, 0.6]` m | Range over the ten runs |
+| --- | --- |
+| Frames inside | 5.6-14.4% |
+| Episodes visiting | 79-99% |
+| Visiting episodes that also leave | 97-100% |
+| Mean entries per episode | 1.6 (uniform) - 8.7 |
+| Episodes starting inside | 0 |
+| Median longest dwell (visiting episodes) | 6-24 steps |
+
+Cart positions reach +-1.9 to +-2.05 m (the slider's soft limit is +-1.8 m), hence the out-of-range coverage bins.
+The interval is reachable and escapable for every method; kept as drafted.
+
+Panel placement (`panel_occlusion.py`, `panel_occlusion.json`): re-rendered segmentation at in-region states (1,500
+calibration frames per run, and a dense grid of 13 positions in the interval x 181 angles); count of cart/pole/rail
+pixels under the panel. Top-left (selected): TV16 covers nothing (all frames and grid states); TV24 covers at most 6
+pole pixels in 0.07-4.5% of calibration frames (2.6% of grid states). Top-right (draft): TV16 0-5.4% of frames, TV24
+21% of grid states (up to 24 px). Margin 0 is best for both corners. The 64 x 64 frame has no 24-pixel square free of
+the pole for every angle. Preview (`outputs/noisy_tv_review/preview/`): one fixed-action trajectory (reset seed 7)
+through all three conditions; identical cart positions; 19 in-region frames, the panel on exactly those in TV16 and
+TV24, none in Clean; 0 object pixels under the panel on every active frame.
+
+**Validation** (local, Windows, RTX 5060 laptop; MuJoCo default backend)
+
+- `tests/exploration/test_noisy_tv.py`: 22 passed. Fixed actions: identical qpos/qvel, rewards, task labels and
+  episode boundaries across plain/Clean/TV16/TV24; Clean equals the plain rendering; TV active exactly when the
+  state's cart position is in the interval; panel pixels only, sizes 16/24; inactive frames and the first frame after
+  leaving equal the original; fresh textures each step; reads draw nothing; global python/numpy/torch RNG untouched;
+  reset seeds restart the stream (TV16/TV24 paired); `collection_state` restore continues bit-identically and refuses
+  another condition; vector env and collector: policy inputs = replay rows = saved and reloaded files, restored env
+  states continue the uninterrupted frames, PNG strips equal the replay frames, MP4 frame count; episode format;
+  metrics on a known trajectory; coverage bins (out-of-range, angle periodicity); paired differences; CLI option
+  checks; condition configs leave every method setting unchanged; run-config checks; downstream guard.
+- Related existing tests (collection, exploration analysis/trainer/test diagnostics/uniform preset, resume and
+  milestones, downstream trainer, plus the new file before its downstream-guard test was added): 275 passed, exit 0
+  (`outputs/noisy_tv_review/tests/related_tests.log`). The full suite was not run.
+- Bounded integration smoke (`outputs/noisy_tv_review/smoke/run_smoke.sh`): real presets, cartpole balance group, 2,000
+  steps (1,000 uniform + 2 epochs of 500), reduced update counts, milestones at 1,500 and 2,000, W&B disabled. LCG
+  predictor Clean/TV16/TV24, Uniform Clean/TV16, and LCG predictor TV24 stopped at 1,500 and resumed to 2,000 with
+  `scripts/resume.sh` (budget extension): all exit 0. The resumed TV24 replay equals the uninterrupted one over all
+  2,000 rows (observations including textures, actions, rewards, qpos, TV flags). Training and test episodes hold the
+  diagnostics on every frame (Clean: 93/130 in-region training/test frames, 0 active; TV16: 87/110, all active).
+  Analysis (5 reset seeds, `--intrinsic` for the LCG predictor): exit 0; reusing the saved trajectories evaluates
+  nothing and gives byte-identical CSVs; re-evaluating Uniform from scratch gives byte-identical results; Uniform's
+  Clean and TV16 occupancies are equal (its actions ignore observations); policy hashes unchanged. Integration
+  evidence only, not learning-quality evidence: in this 2,000-step smoke the predictor's in-region raw score is about
+  4x its out-of-region score under TV16/TV24 and about equal under Clean.
+
+**Limitations**
+
+- TV24 can cover up to 6 pole pixels in a few percent of in-region frames (see above); TV16 covers none.
+- The TV16 and TV24 evaluation streams share their seed per reset seed, but textures of different sizes are not crops
+  of each other.
+- The analysis evaluates into its own `trajectories/` folder; the run's own final test episodes (also recorded with
+  diagnostics) are not read by it.
+- Dwell runs that reach the episode end are not censored; durations count observations o_0..o_T (final included).
+- Plots need matplotlib (absent on kingplus0: the analysis records the skip; draw on the laptop).
+- Frozen-scorer intrinsic diagnostics were smoke-tested for the LCG predictor only; the other methods use the same
+  `FrozenScorer` paths as `follow-intrinsic-reward`.
+- Validated on Windows with MuJoCo's default backend; the EGL server path was not exercised.
+- Downstream adaptation of TV milestones is refused until its protocol is specified.

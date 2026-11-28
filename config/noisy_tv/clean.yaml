@@ -1,0 +1,33 @@
+# @package _global_
+# Cartpole noisy-TV condition (docs/implement/AlEATRORISTIC_EXPERIMENT_DESIGN.md; envs/cartpole_noisy_tv.py).
+# Clean: original observations (no panel, no TV draws); trigger-region membership is still recorded.
+# Combine with any method preset; Cartpole only (any other domain is refused):
+#   python src/exploration_main.py +experiment=<preset> +noisy_tv=clean env.train.domain_name=cartpole \
+#       "env.train.task_names=[balance,balance_sparse]" common.seed=<seed> common.devices=<gpu> hydra.run.dir=<run folder>
+# Frozen settings (2026-11-28, before any noisy-TV training; calibration in REWARD_FREE_EXPERIMENT_NOTES.md):
+# interval [0.3, 0.6] m as drafted; panel top_left with margin 0 (draft: top_right, which covers the pole while the
+# cart is in the interval). Size is not used when disabled; Clean keeps 16 so all three share one schema.
+env:
+  train:
+    noisy_tv:
+      enabled: false
+      size: 16
+      position_interval: [0.3, 0.6]
+      panel_location: top_left
+      margin: 0
+      seed: 0  # training TV stream; a reset with seed s restarts it from SeedSequence([seed, s])
+  test:
+    noisy_tv:  # evaluation: the same condition with its own TV seed
+      enabled: ${env.train.noisy_tv.enabled}
+      size: ${env.train.noisy_tv.size}
+      position_interval: ${env.train.noisy_tv.position_interval}
+      panel_location: ${env.train.noisy_tv.panel_location}
+      margin: ${env.train.noisy_tv.margin}
+      seed: 1000
+
+# Diagnostics: per-frame qpos/qvel and TV membership/activation in training and evaluation episodes (analysis only).
+collection:
+  train:
+    record_physical_state: true
+  test:
+    record_physical_state: true

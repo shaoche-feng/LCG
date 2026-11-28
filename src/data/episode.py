@@ -83,17 +83,34 @@ class Episode:
 #   final_qpos (nq,), final_qvel (nv,): the state of info["final_observation"] (after the last
 #       action, before the vector env's autoreset); present only if the episode ended with it recorded.
 # The state of the frame after an unfinished episode's last step is a milestone's successor state.
+# Noisy-TV episodes (envs/cartpole_noisy_tv.py) also hold, all or none: tv_in_region (T,) bool, tv_active (T,) bool,
+# tv_panel_size (T,) int16 (0 when inactive), False/0 where not recorded; with final_qpos also final_tv_in_region,
+# final_tv_active (bool scalars) and final_tv_panel_size (int16 scalar).
 PHYSICAL_STATE_KEYS = ("qpos", "qvel", "recorded")
 FINAL_PHYSICAL_STATE_KEYS = ("final_qpos", "final_qvel")
+TV_KEYS = ("tv_in_region", "tv_active", "tv_panel_size")
+FINAL_TV_KEYS = tuple(f"final_{k}" for k in TV_KEYS)
+TV_DTYPES = dict(tv_in_region=torch.bool, tv_active=torch.bool, tv_panel_size=torch.int16)
 
 
 def check_physical_state(state: Dict[str, torch.Tensor], length: int) -> None:
     keys = set(state)
     final = keys & set(FINAL_PHYSICAL_STATE_KEYS)
-    if not set(PHYSICAL_STATE_KEYS) <= keys or keys - set(PHYSICAL_STATE_KEYS) - final or final not in (
-            set(), set(FINAL_PHYSICAL_STATE_KEYS)):
-        raise ValueError(f"Episode physical_state has keys {sorted(keys)}; expected {list(PHYSICAL_STATE_KEYS)} "
-                         f"and optionally both of {list(FINAL_PHYSICAL_STATE_KEYS)}")
+    tv, final_tv = keys & set(TV_KEYS), keys & set(FINAL_TV_KEYS)
+    if (not set(PHYSICAL_STATE_KEYS) <= keys or keys - set(PHYSICAL_STATE_KEYS) - final - tv - final_tv
+            or final not in (set(), set(FINAL_PHYSICAL_STATE_KEYS)) or tv not in (set(), set(TV_KEYS))
+            or final_tv not in (set(), set(FINAL_TV_KEYS)) or (final_tv and not (tv and final))
+            or (tv and final and not final_tv)):
+        raise ValueError(f"Episode physical_state has keys {sorted(keys)}; expected {list(PHYSICAL_STATE_KEYS)}, "
+                         f"optionally both of {list(FINAL_PHYSICAL_STATE_KEYS)}, and for noisy-TV episodes "
+                         f"{list(TV_KEYS)} (with {list(FINAL_TV_KEYS)} when final_* are present)")
+    for k in tv:
+        if state[k].dtype is not TV_DTYPES[k] or state[k].shape != (length,):
+            raise ValueError(f"Episode physical_state {k} must be a {TV_DTYPES[k]} tensor of shape ({length},)")
+    for k in final_tv:
+        dtype = TV_DTYPES[k[len("final_"):]]
+        if state[k].dtype is not dtype or state[k].shape != ():
+            raise ValueError(f"Episode physical_state {k} must be a {dtype} scalar")
     qpos, qvel, recorded = (state[k] for k in PHYSICAL_STATE_KEYS)
     if qpos.ndim != 2 or qvel.ndim != 2 or qpos.size(0) != length or qvel.size(0) != length:
         raise ValueError(f"Episode physical_state qpos {tuple(qpos.shape)} / qvel {tuple(qvel.shape)} "
@@ -104,6 +121,8 @@ def check_physical_state(state: Dict[str, torch.Tensor], length: int) -> None:
         raise ValueError("Episode physical_state qpos/qvel must be float64 (MuJoCo's precision)")
     if not (qpos[~recorded].isnan().all() and qvel[~recorded].isnan().all()):
         raise ValueError("Episode physical_state rows not recorded must be NaN")
+    if tv and (state["tv_active"] & ~state["tv_in_region"]).any():
+        raise ValueError("Episode physical_state: the TV is active outside the trigger region")
     if final and (state["final_qpos"].shape != qpos.shape[1:] or state["final_qvel"].shape != qvel.shape[1:]
                   or state["final_qpos"].dtype is not torch.float64 or state["final_qvel"].dtype is not torch.float64):
         raise ValueError("Episode physical_state final_qpos/final_qvel do not match qpos/qvel")
@@ -119,13 +138,22 @@ def stack_physical_states(states: List[Optional[Dict[str, torch.Tensor]]],
     nq, nv = known[0]["qpos"].numel(), known[0]["qvel"].numel()
     if any(s["qpos"].shape != (nq,) or s["qvel"].shape != (nv,) for s in known):
         raise ValueError("Physical states of one episode have different dimensions")
+    tv = "tv_in_region" in known[0]
+    if any(("tv_in_region" in s) != tv for s in known):
+        raise ValueError("Physical states of one episode mix noisy-TV and plain states")
     nan = torch.full((nq + nv,), float("nan"), dtype=torch.float64)
     rows = [nan if s is None else torch.cat((s["qpos"], s["qvel"])).to(torch.float64) for s in states]
     stacked = torch.stack(rows) if rows else nan.new_empty(0, nq + nv)
     state = dict(qpos=stacked[:, :nq].contiguous(), qvel=stacked[:, nq:].contiguous(),
                  recorded=torch.tensor([s is not None for s in states], dtype=torch.bool))
+    if tv:
+        for k in TV_KEYS:
+            values = [0 if s is None else (bool(s[k]) if TV_DTYPES[k] is torch.bool else int(s[k])) for s in states]
+            state[k] = torch.tensor(values, dtype=TV_DTYPES[k])
     if final is not None:
         state.update(final_qpos=final["qpos"].to(torch.float64).clone(), final_qvel=final["qvel"].to(torch.float64).clone())
+        if tv:
+            state.update({f"final_{k}": torch.as_tensor(final[k]).to(TV_DTYPES[k]).reshape(()) for k in TV_KEYS})
     return state
 
 
@@ -136,22 +164,28 @@ def join_physical_states(first: Optional[Dict[str, torch.Tensor]], first_len: in
     if first is None and second is None:
         return None
     if first is None:
-        first = missing_physical_state(first_len, second["qpos"].size(1), second["qvel"].size(1))
+        first = missing_physical_state(first_len, second["qpos"].size(1), second["qvel"].size(1), "tv_in_region" in second)
     if second is None:
-        second = missing_physical_state(second_len, first["qpos"].size(1), first["qvel"].size(1))
+        second = missing_physical_state(second_len, first["qpos"].size(1), first["qvel"].size(1), "tv_in_region" in first)
     if first["qpos"].size(1) != second["qpos"].size(1) or first["qvel"].size(1) != second["qvel"].size(1):
         raise ValueError("Cannot extend an episode's physical states with ones of different dimensions")
+    if ("tv_in_region" in first) != ("tv_in_region" in second):
+        raise ValueError("Cannot extend an episode's noisy-TV states with plain ones (or the reverse)")
     if any(k in first for k in FINAL_PHYSICAL_STATE_KEYS):
         raise ValueError("Cannot extend an episode whose physical states already end")
-    state = {k: torch.cat((first[k], second[k]), dim=0) for k in PHYSICAL_STATE_KEYS}
-    state.update({k: second[k] for k in FINAL_PHYSICAL_STATE_KEYS if k in second})
+    keys = PHYSICAL_STATE_KEYS + (TV_KEYS if "tv_in_region" in first else ())
+    state = {k: torch.cat((first[k], second[k]), dim=0) for k in keys}
+    state.update({k: second[k] for k in FINAL_PHYSICAL_STATE_KEYS + FINAL_TV_KEYS if k in second})
     return state
 
 
-def missing_physical_state(length: int, nq: int, nv: int) -> Dict[str, torch.Tensor]:
-    return dict(qpos=torch.full((length, nq), float("nan"), dtype=torch.float64),
-                qvel=torch.full((length, nv), float("nan"), dtype=torch.float64),
-                recorded=torch.zeros(length, dtype=torch.bool))
+def missing_physical_state(length: int, nq: int, nv: int, tv: bool = False) -> Dict[str, torch.Tensor]:
+    state = dict(qpos=torch.full((length, nq), float("nan"), dtype=torch.float64),
+                 qvel=torch.full((length, nv), float("nan"), dtype=torch.float64),
+                 recorded=torch.zeros(length, dtype=torch.bool))
+    if tv:
+        state.update({k: torch.zeros(length, dtype=TV_DTYPES[k]) for k in TV_KEYS})
+    return state
 
 
 def merge_info(info_a, info_b):

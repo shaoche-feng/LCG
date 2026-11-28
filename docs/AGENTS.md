@@ -143,6 +143,8 @@ One `DownstreamTrainer` handles exactly one milestone, task, adaptation seed and
 
 Environment (`config/env/dm_control.yaml`): RGB 64x64, camera 0, action repeat 2, four conditioning frames, `time_limit: null`; its Walker `[stand, walk, run]` group is only the default, overridden by launch scripts. Accepted groups are `REWARD_LABEL_TASK_GROUPS` (7 groups over acrobot, cartpole ×2, hopper, humanoid, humanoid_CMU, walker); do not claim others without the compatibility evidence. The two Cartpole groups share a domain and therefore the default run folder: their launchers must set distinct `hydra.run.dir` values.
 
+Cartpole noisy TV (`docs/implement/AlEATRORISTIC_EXPERIMENT_DESIGN.md`, implemented 2026-11-28): the Hydra group `+noisy_tv=clean|tv16|tv24` adds `env.train/test.noisy_tv` (wrapper `src/envs/cartpole_noisy_tv.py`, applied inside each real-env worker to the final rendered frame; never to imagination) and records per-frame `qpos`/`qvel` and TV membership/activation in training and test episodes. Cartpole only; without the group no wrapper is built. Milestones explored with an enabled TV are refused by downstream adaptation (not specified). Analysis: `python src/exploration_analysis.py --test noisy-tv --condition clean=<milestone> --condition tv16=... --condition tv24=...`.
+
 The selected 100k schedule, resolved by all six method presets for every accepted task group (`config/exploration.yaml`; pinned by `tests/exploration/test_uniform_preset.py`):
 
 | Setting | Value |

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from .cartpole_noisy_tv import TV_STATE_KEYS, CartpoleNoisyTV, check_noisy_tv_config
 from .dm_control_env import DMControlEnv, validate_task_names
 
 
@@ -20,12 +21,16 @@ def make_dm_control_env(
     action_repeat: int,
     time_limit: Optional[float],
     record_physical_state: bool = False,
+    noisy_tv: Optional[Dict[str, Any]] = None,
 ) -> TorchEnv:
     # Fail here, before spawning workers, on an invalid or unsupported task selection.
     task_names = validate_task_names(domain_name, task_names)
+    # noisy_tv (env.train/test.noisy_tv; absent or null: no wrapper): Cartpole Clean/TV16/TV24 observations
+    # (envs/cartpole_noisy_tv.py), applied inside each worker to the final rendered frame.
+    noisy_tv = check_noisy_tv_config(None if noisy_tv is None else dict(noisy_tv), domain_name, size)
 
     def env_fn():
-        return DMControlEnv(
+        env = DMControlEnv(
             domain_name=domain_name,
             task_names=task_names,
             size=size,
@@ -34,6 +39,7 @@ def make_dm_control_env(
             time_limit=time_limit,
             record_physical_state=record_physical_state,
         )
+        return env if noisy_tv is None else CartpoleNoisyTV(env, noisy_tv)
 
     # Spawn avoids inheriting the Trainer's initialized CUDA context (fork deadlocks).
     env = AsyncVectorEnv([env_fn for _ in range(num_envs)], context="spawn")
@@ -42,7 +48,9 @@ def make_dm_control_env(
     return env
 
 
-PhysicalState = Dict[str, Tensor]  # {"qpos": (nq,), "qvel": (nv,)} float64 CPU copies
+# {"qpos": (nq,), "qvel": (nv,)} float64 CPU copies; noisy-TV envs add the scalars of TV_STATE_KEYS
+# (tv_in_region, tv_active: bool tensors; tv_panel_size: int16 tensor).
+PhysicalState = Dict[str, Tensor]
 
 
 class TorchEnv(gymnasium.Wrapper):
@@ -133,24 +141,33 @@ class TorchEnv(gymnasium.Wrapper):
     def _physical_state(info: Dict[str, Any], i: Optional[int]) -> PhysicalState:
         """Env i's state from a vector info (i=None: a single env's info). A recording env always
         reports one, so a missing state is an error rather than a silent gap."""
+        keys = ("qpos", "qvel") + tuple(k for k in TV_STATE_KEYS if k in info)
         if i is None:
-            qpos, qvel = info.get("qpos"), info.get("qvel")
+            values = {k: info.get(k) for k in keys}
         else:
-            if not (info.get("_qpos", np.zeros(i + 1, bool))[i] and info.get("_qvel", np.zeros(i + 1, bool))[i]):
+            if not all(info.get(f"_{k}", np.zeros(i + 1, bool))[i] for k in keys):
                 raise RuntimeError(f"Sub-environment {i} returned no physical state")
-            qpos, qvel = info["qpos"][i], info["qvel"][i]
-        if qpos is None or qvel is None:
+            values = {k: info[k][i] for k in keys}
+        if any(v is None for v in values.values()):
             raise RuntimeError("A recording environment returned no physical state")
-        return TorchEnv._copy_physical_state(dict(qpos=qpos, qvel=qvel))
+        return TorchEnv._copy_physical_state(values)
 
     @staticmethod
     def _copy_physical_state(state: Dict[str, np.ndarray]) -> PhysicalState:
-        return {k: torch.tensor(np.asarray(state[k]), dtype=torch.float64) for k in ("qpos", "qvel")}  # copies
+        copied = {k: torch.tensor(np.asarray(state[k]), dtype=torch.float64) for k in ("qpos", "qvel")}  # copies
+        if any(k in state for k in TV_STATE_KEYS):
+            if not all(k in state for k in TV_STATE_KEYS):
+                raise RuntimeError(f"A noisy-TV environment returned only some of {TV_STATE_KEYS}")
+            copied.update(tv_in_region=torch.tensor(bool(state["tv_in_region"])),
+                          tv_active=torch.tensor(bool(state["tv_active"])),
+                          tv_panel_size=torch.tensor(int(state["tv_panel_size"]), dtype=torch.int16))
+        return copied
 
     @staticmethod
     def _pop_physical_state(info: Dict[str, Any]) -> None:
-        for key in ("qpos", "qvel", "_qpos", "_qvel"):
+        for key in ("qpos", "qvel") + TV_STATE_KEYS:
             info.pop(key, None)
+            info.pop(f"_{key}", None)
 
     def _to_tensor(self, x: Tensor) -> Tensor:
         if x.ndim == 4:

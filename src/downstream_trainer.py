@@ -124,6 +124,13 @@ class DownstreamTrainer:
                     raise ValueError(f"A downstream trainer takes one milestone; initialization.{key} is for downstream_main.py")
             cfg.env.train = manifest["model"]["env"]
             cfg.agent.denoiser = manifest["model"]["denoiser"]
+        # Noisy-TV milestones (envs/cartpole_noisy_tv.py): downstream adaptation is outside the noisy-TV test and its
+        # evaluation builds a plain DMControlEnv, so an enabled TV would be silently dropped. Clean (enabled false)
+        # emits the original rendering and adapts as usual.
+        tv = (manifest["model"]["env"] or {}).get("noisy_tv")
+        if tv is not None and tv.get("enabled"):
+            raise ValueError(f"Milestone {self.milestone.path} was explored with an enabled noisy TV; downstream "
+                             "adaptation for noisy-TV conditions is not specified (AlEATRORISTIC_EXPERIMENT_DESIGN.md)")
         OmegaConf.resolve(cfg)
         self.cfg = cfg
 

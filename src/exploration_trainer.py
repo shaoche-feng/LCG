@@ -22,6 +22,7 @@ from data.milestone import (OUTPUT_LABELS, method_label, milestone_name, physica
                             read_manifest, referenced_files)
 from utils import device_lines, physical_gpu_index
 from envs import make_dm_control_env, TIME_LIMIT_ONLY_DOMAINS, WorldModelEnv
+from envs.cartpole_noisy_tv import check_noisy_tv_config
 from intrinsic_reward.ensemble import EnsembleDisagreementConfig, EnsembleScorer, EnsembleTraining, migrate_ensemble_layout
 from intrinsic_reward.lcg import (imagined_candidates_from_batch, LCGLifecycle, sample_uniform_historical_transitions,
                                   selected_named_parameters)
@@ -186,6 +187,7 @@ class ExplorationTrainer(StateDictMixin):
         if keep_last is not None and keep_last < 1:
             raise ValueError(f"milestones.keep_last must be null or at least 1, got {keep_last}")
         check_collection_budget(cfg.collection.train)
+        self._noisy_tv = check_noisy_tv_settings(cfg)  # None: no noisy-TV wrapper (every non-Cartpole run)
         self._should_test, collect_test = check_evaluation_config(cfg.evaluation)
         self._collect_test = collect_test and not self._is_static_dataset  # static datasets never collect
         # Fixed test reset seeds (one episode per seed) for periodic and final collections, and
@@ -1006,6 +1008,12 @@ class ExplorationTrainer(StateDictMixin):
             lines.append(f"  Resumed at epoch {self.epoch} (resume #{self.resume_count})")
         if self._method is None:
             lines.append("  Uniform random: no scorer refresh, no exploration-policy training, no intrinsic scores")
+        if self._noisy_tv is not None:
+            tv = self._noisy_tv["train"]
+            condition = f"TV{tv['size']}" if tv["enabled"] else "Clean (region recorded, no panel)"
+            lines.append(f"  Noisy TV: {condition}; cart interval {tv['position_interval']} m; panel "
+                         f"{tv['panel_location']} margin {tv['margin']}; TV seeds train {tv['seed']} / evaluation "
+                         f"{self._noisy_tv['test']['seed']} (real environments only, not imagination)")
         lines.append("=" * 78)
         say("\n".join(lines))
 
@@ -1058,7 +1066,7 @@ class ExplorationTrainer(StateDictMixin):
                               debug_metrics=bool(ac.debug_metrics))
         return dict(seed=self._seed, method=self._method or "uniform", method_name=METHOD_NAMES[self._method],
                     method_settings=settings, controller=controller, source=self.source, evaluation=self.evaluation_protocol(),
-                    milestones=[m["name"] for m in self.milestones if not m["retired"]])
+                    milestones=[m["name"] for m in self.milestones if not m["retired"]], noisy_tv=self._noisy_tv)
 
     def evaluation_protocol(self) -> Dict[str, Any]:
         cfg = self._cfg
@@ -1502,8 +1510,12 @@ class ExplorationTrainer(StateDictMixin):
             run_config="../../config/exploration.yaml",
             source=self.source,
             physical_state=physical_state_manifest(
-                bool(OmegaConf.select(cfg, "collection.train.record_physical_state", default=False))),
+                bool(OmegaConf.select(cfg, "collection.train.record_physical_state", default=False)),
+                noisy_tv=self._noisy_tv is not None),
         )
+        if self._noisy_tv is not None:  # also in model.env (train) and the run config (test)
+            manifest["noisy_tv"] = dict(self._noisy_tv, spec="docs/implement/AlEATRORISTIC_EXPERIMENT_DESIGN.md",
+                                        imagination="not applied: the denoiser learns the emitted observations from replay")
         member_states = None
         if self.ensemble is not None:
             manifest["ensemble"] = dict(members=self.ensemble.members, bootstrap=self.ensemble.bootstrap,
@@ -1766,6 +1778,30 @@ def check_evaluation_config(e: DictConfig) -> Tuple[bool, bool]:
     if should and (isinstance(e.every, bool) or not isinstance(e.every, int) or e.every < 1):
         raise ValueError(f"evaluation.every must be a positive integer, got {e.every!r}")
     return should, collect
+
+
+def check_noisy_tv_settings(cfg: DictConfig) -> Optional[Dict[str, Any]]:
+    """env.train.noisy_tv and env.test.noisy_tv (envs/cartpole_noisy_tv.py): both absent (no wrapper), or both
+    given with the same condition (enabled, size, interval, panel) and different TV seeds, and with per-frame
+    diagnostics recorded in training and test episodes. Returns {"train": ..., "test": ...} or None."""
+    def section(name):
+        value = OmegaConf.select(cfg, f"env.{name}.noisy_tv", default=None)
+        value = None if value is None else OmegaConf.to_container(value, resolve=True)
+        return check_noisy_tv_config(value, cfg.env[name].domain_name, cfg.env[name].size)
+    train, test = section("train"), section("test")
+    if train is None and test is None:
+        return None
+    if train is None or test is None:
+        raise ValueError("env.train.noisy_tv and env.test.noisy_tv must be given together (use +noisy_tv=<condition>)")
+    differ = [k for k in train if k != "seed" and train[k] != test[k]]
+    if differ:
+        raise ValueError(f"env.test.noisy_tv must be the training condition with its own seed; it differs in {differ}")
+    if train["seed"] == test["seed"]:
+        raise ValueError(f"env.train.noisy_tv.seed and env.test.noisy_tv.seed must differ, both are {train['seed']}")
+    for split in ("train", "test"):
+        if not OmegaConf.select(cfg, f"collection.{split}.record_physical_state", default=False):
+            raise ValueError(f"A noisy-TV run records its diagnostics: set collection.{split}.record_physical_state=true")
+    return dict(train=train, test=test)
 
 
 def check_collection_budget(c: DictConfig) -> None:
