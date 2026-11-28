@@ -1,0 +1,10 @@
+# @package _global_
+# Predictor-based LCG with fixed_divisor 5000 instead of 500 (2026-11-27 walker pilot): policy rewards and
+# imagined returns about 10x smaller, to test whether the critic's value-gradient clipping (norm cap 10, hit on
+# ~90-96% of updates at divisor 500) goes away. Everything else is lcg_predictor_100k.
+defaults:
+  - lcg_predictor_100k
+  - _self_
+
+intrinsic_reward:
+  fixed_divisor: 5000.0
