@@ -16,8 +16,9 @@ defaults:
   - _self_  # last, so the explicit downstream controller settings below take precedence
 
 # Downstream controller: the Gaussian H10 EMA-critic controller of config/agent/pmpo_beta.yaml (repeat-frame
-# imagined resets, EMA critic regularization) with the sign-only PMPO objective, stated explicitly
-# (the learned exploration presets use advantage_weighted).
+# imagined resets, EMA critic regularization). Actor objective: sign (default, stated explicitly; no magnitude
+# weighting) or advantage_weighted (log-probabilities weighted by min(cap, |A| / mean |A|) within each sign group,
+# cap agent.actor_critic.advantage_weight_cap, as the learned exploration presets use).
 agent:
   actor_critic:
     actor_objective: sign
@@ -107,6 +108,14 @@ evaluation:
   seeds: [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010, 3011, 3012, 3013, 3014, 3015,
           3016, 3017, 3018, 3019, 3020, 3021, 3022, 3023, 3024, 3025, 3026, 3027, 3028, 3029, 3030]  # 30-seed protocol
   max_steps: 500  # environment steps per episode (x action_repeat control steps)
+  # Monitoring during policy training (as DIAMOND's per-epoch 4-seed evaluation): after every `every` policy
+  # updates, one deterministic episode per seed in the real task. W&B: train_eval/return_<stat> on the policy-update
+  # axis (per-seed returns logged, charts hidden); metrics.jsonl: in that update's row. Diagnostics only: the global
+  # RNG states and model modes are restored, so training is unchanged; may differ on resume. null every: off.
+  during_training:
+    every: 500
+    seeds: [3001, 3002, 3003, 3004]
+    max_steps: 500
 
 # Phase 1: reward/end model on the selected task's recorded rewards.
 rew_end_model:
@@ -134,3 +143,7 @@ actor_critic:
     batch_size: 32
     sample_weights: null
     lr_warmup_steps: 100
+    # PMPO's lambda returns use predicted task reward / reward_divisor (the reward model trains on raw rewards). It
+    # shrinks the critic's targets, values and gradients (fewer clipped critic updates); both actor objectives ignore
+    # the reward scale. W&B task_reward/ stays in task units; return/value metrics are in divided units. 1: as before.
+    reward_divisor: 1.0

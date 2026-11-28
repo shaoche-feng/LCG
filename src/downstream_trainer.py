@@ -10,6 +10,7 @@ evaluated with a deterministic policy.
 from copy import deepcopy
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -47,7 +48,7 @@ DOWNSTREAM_RESUME_FORMAT = 3
 # Settings a resume may change: how it is launched, where the (moved) milestone is, and logging
 # (W&B mode/names and the diagnostics-only debug flags; they change no loss, update or RNG draw).
 RESUME_MAY_CHANGE = ("downstream.mode", "initialization.milestone_path", "wandb", "rew_end_model.debug_metrics",
-                     "agent.actor_critic.debug_metrics")
+                     "agent.actor_critic.debug_metrics", "evaluation.during_training")
 
 # W&B (wandb.mode: disabled | offline | online). One run per exploration run x task x adaptation seed x denoiser
 # member, shared by every milestone adapted for them (shared_run_path: its identity and publication state as
@@ -70,6 +71,15 @@ EVAL_AXIS = "exploration/train_env_steps"  # the milestone's recorded collected_
 # eval/, any other protocol under eval_protocols/protocol-<id>/, so incompatible protocols never share a curve.
 PRIMARY_EVAL = "eval"
 OTHER_EVAL = "eval_protocols"
+# Per-seed returns of those evaluations: seed_returns/<namespace>/seed_<s>/return, logged but hidden from the
+# automatic charts (only the aggregates are drawn).
+SEED_RETURNS = "seed_returns"
+# Monitoring during policy training (evaluation.during_training, DIAMOND-style): train_eval/return_<stat> on the
+# policy-update axis, per-seed returns hidden under train_eval_seed_returns/seed_<s>/return. Carried in the
+# metrics.jsonl row of the policy update after which they were taken, so a resume backfills them like the update.
+TRAIN_EVAL = "train_eval"
+TRAIN_EVAL_SEEDS = "train_eval_seed_returns"
+RETURN_STATS = ("max", "median", "mean", "min", "std")
 SHARED_RUN_SCHEMA = 1
 HISTORY_ATTEMPTS = 3
 HISTORY_RETRY_SECONDS = 0.2
@@ -80,7 +90,10 @@ REWARD_CORE = dict(loss_reward="loss_rew", predicted_reward_mean="predicted_rewa
                    target_reward_mean="target_reward_mean")
 REWARD_DEBUG = dict(loss_total="loss_total", loss_end="loss_end", grad_norm="grad_norm_before_clip",
                     prediction_mae="prediction_mae")
-# Controller metrics not published downstream: advantage-weight statistics, which sign-only PMPO does not use.
+# Actor objectives of the downstream controller: sign (default) or advantage_weighted (as the exploration presets).
+DOWNSTREAM_OBJECTIVES = ("sign", "advantage_weighted")
+# Controller metrics not published with the sign objective: advantage-weight statistics (always 0 or 1 there).
+# advantage_weighted publishes them (weights/clipped_fraction_<group>; the weight_* debug keys with debug metrics).
 UNPUBLISHED_POLICY_PREFIXES = ("weight_clipped_fraction_", "weight_mean_", "weight_max_", "weight_std_")
 NOT_RECORDED = "not recorded"
 
@@ -95,9 +108,12 @@ class DownstreamTrainer:
         if every is not None and (not isinstance(every, int) or every < 1):
             raise ValueError(f"checkpointing.every must be null or a positive integer, got {every!r}")
         check_evaluation_config(cfg.evaluation)
-        if cfg.agent.actor_critic.actor_objective != "sign":
-            raise ValueError("Downstream PMPO is sign-only (agent.actor_critic.actor_objective=sign), got "
-                             f"{cfg.agent.actor_critic.actor_objective!r}")
+        check_training_evaluation(OmegaConf.select(cfg, "evaluation.during_training"))
+        if cfg.agent.actor_critic.actor_objective not in DOWNSTREAM_OBJECTIVES:
+            raise ValueError(f"Downstream PMPO supports agent.actor_critic.actor_objective in {DOWNSTREAM_OBJECTIVES}, "
+                             f"got {cfg.agent.actor_critic.actor_objective!r}")
+        self.reward_divisor = check_reward_divisor(OmegaConf.select(cfg, "actor_critic.training.reward_divisor",
+                                                                    default=1.0))
         task_name, seed = cfg.downstream.task_name, cfg.downstream.seed
         set_seed(seed)  # downstream randomness comes only from its own seed
         torch.backends.cudnn.deterministic = True
@@ -178,6 +194,12 @@ class DownstreamTrainer:
         self.rl_env = WorldModelEnv(self.agent.denoiser, self.agent.rew_end_model, prompts,
                                     instantiate(cfg.world_model_env), sample_ends=False)
         self.agent.actor_critic.setup_training(self.rl_env)
+        # actor_critic.training.reward_divisor: PMPO's returns use predicted task reward / divisor (the critic's
+        # targets and values shrink with it; both actor objectives ignore the scale). 1: no hook, as before.
+        self._reward_scale = None
+        if self.reward_divisor != 1.0:
+            self._reward_scale = TaskRewardScale(self.reward_divisor)
+            self.agent.actor_critic.set_intrinsic_reward_fn(self._reward_scale)
 
         self.phase = "rew_end_model"  # then "actor_critic", then "done"
         self.num_updates = dict(rew_end_model=0, actor_critic=0)
@@ -220,8 +242,8 @@ class DownstreamTrainer:
         if wandb.run is not None:
             wandb.summary["output"] = str(output_dir.resolve())
             if self._shared is not None:
-                wandb.summary[f"milestones/{self.milestone.path.name}"] = dict(
-                    self.milestone_summary(), status="trained", output=str(output_dir.resolve()))
+                wandb.summary[f"milestones/{self.milestone.path.name}"] = summary_value(dict(
+                    self.milestone_summary(), status="trained", output=str(output_dir.resolve())))
         try:
             if self.cfg.evaluation.after_training:
                 if self._shared is not None:
@@ -290,11 +312,24 @@ class DownstreamTrainer:
         loss, metrics = self.agent.actor_critic()
         loss.backward()
         metrics.update(self.actor_critic_opt.step())
-        # The predicted task rewards this update gave the lambda returns (no second reward-model pass).
-        metrics.update(reward_statistics(self.agent.actor_critic.last_reward, "task_reward",
-                                         self.agent.actor_critic.debug_metrics))
+        # The predicted task rewards this update gave the lambda returns (no second reward-model pass), in task
+        # units (before reward_divisor).
+        rewards = self.agent.actor_critic.last_reward if self._reward_scale is None else self._reward_scale.last_raw
+        metrics.update(reward_statistics(rewards, "task_reward", self.agent.actor_critic.debug_metrics))
         self.num_updates["actor_critic"] += 1
+        metrics.update(self.training_evaluation())
         self.log("actor_critic", metrics)
+
+    def training_evaluation(self) -> Dict[str, float]:
+        """The monitoring evaluation due after this policy update (evaluation.during_training: every N updates,
+        one deterministic episode per seed), as train_eval/ metrics of the update's row; none when not due or off.
+        evaluate_policy restores the global RNG states and the model's modes: training is unchanged."""
+        c = OmegaConf.select(self.cfg, "evaluation.during_training")
+        if c is None or c.every is None or self.num_updates["actor_critic"] % c.every:
+            return {}
+        result = evaluate_policy(self.agent.actor_critic, self.cfg.env.train, self.milestone.task_name,
+                                 list(c.seeds), c.max_steps)
+        return training_evaluation_row(result)
 
     def evaluate(self) -> Dict[str, Any]:
         """Evaluate the current policy in the real task without changing training state."""
@@ -335,7 +370,8 @@ class DownstreamTrainer:
             self._blocked = True
             say("W&B warning: later publications closed this milestone's block; remaining updates stay in metrics.jsonl only")
             return
-        log_wandb(wandb_row(row, self.cfg.agent.actor_critic.actor_distribution, self._block), step)
+        log_wandb(wandb_row(row, self.cfg.agent.actor_critic.actor_distribution, self._block,
+                            self.cfg.agent.actor_critic.actor_objective), step)
         self._wandb_next = step + 1
 
     def check_replayed(self, step: int, row: Dict[str, Any]) -> None:
@@ -345,7 +381,7 @@ class DownstreamTrainer:
         outcome = "unverified" if earlier is None else "matched" if earlier == row else "mismatched"
         key = f"replayed_{outcome}"
         self._resume_event[key] = self._resume_event.get(key, 0) + 1
-        wandb.summary["resume"] = self._resume_event  # kept here: W&B returns nested summary values flattened
+        wandb.summary["resume"] = summary_value(self._resume_event)  # kept here: the summary holds it as JSON text
         if outcome == "mismatched":
             say(f"W&B warning: replayed {row['phase']} update {row['update']} (W&B step {step}) differs from the "
                 f"value the interrupted segment sent; the server keeps the earlier value")
@@ -389,7 +425,7 @@ class DownstreamTrainer:
                                          server=server)
         path_identity.write_text(json.dumps(dict(run_identity(), shared_run=Path(
             os.path.relpath(path, self._work_dir)).as_posix()), indent=2))
-        wandb.summary[f"milestones/{m.path.name}"] = dict(self.milestone_summary(), status="training")
+        wandb.summary[f"milestones/{m.path.name}"] = summary_value(dict(self.milestone_summary(), status="training"))
         if resume:
             self.reconcile_wandb(identity if registered else None)
         else:
@@ -445,7 +481,8 @@ class DownstreamTrainer:
                 if missing:
                     raise RuntimeError(f"metrics.jsonl lacks committed updates (W&B steps {missing[:5]}...); cannot backfill")
                 for step in range(start, committed):
-                    log_wandb(wandb_row(by_step[step], self.cfg.agent.actor_critic.actor_distribution, self._block), step)
+                    log_wandb(wandb_row(by_step[step], self.cfg.agent.actor_critic.actor_distribution, self._block,
+                                        self.cfg.agent.actor_critic.actor_objective), step)
                 event["backfilled_rows"] = committed - start
                 say(f"W&B: backfilled {committed - start} committed updates the server did not receive")
             elif server > committed:
@@ -455,7 +492,7 @@ class DownstreamTrainer:
                     "they are replayed without being logged again")
             self._wandb_next = max(server, committed)
         self._resume_event = event
-        wandb.summary["resume"] = event
+        wandb.summary["resume"] = summary_value(event)
 
     def provenance(self) -> Dict[str, Any]:
         """What this adaptation run is (W&B config). Missing historical metadata is labelled, never guessed."""
@@ -475,6 +512,7 @@ class DownstreamTrainer:
             controller=dict(controller_settings(ac.cfg), actor_objective=ac.objective_settings(),
                             debug_metrics=bool(ac.debug_metrics)),
             reward_model=dict(debug_metrics=bool(self.agent.rew_end_model.debug_metrics)),
+            reward_divisor=self.reward_divisor,
             budgets=dict(rew_end_model=OmegaConf.to_container(cfg.rew_end_model.training),
                          actor_critic=OmegaConf.to_container(cfg.actor_critic.training)),
             evaluation=evaluation_protocol(cfg.evaluation), source=self.source)
@@ -577,7 +615,8 @@ class DownstreamTrainer:
         return state["rng"]
 
 
-def wandb_row(row: Dict[str, Any], actor_distribution: str, block: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+def wandb_row(row: Dict[str, Any], actor_distribution: str, block: Optional[Dict[str, Any]] = None,
+              actor_objective: str = "sign") -> Dict[str, float]:
     """The W&B row of one metrics.jsonl update row: reward_model/train/{core,debug}/ or the accepted
     actor_critic/train/<group>/ paths (metric_path), with this adaptation's own update counter and the
     cumulative one of the shared run (the block's offset plus the update), and the milestone's training env
@@ -590,8 +629,11 @@ def wandb_row(row: Dict[str, Any], actor_distribution: str, block: Optional[Dict
         out[REWARD_AXIS] = row["update"]
         out[REWARD_CUMULATIVE_AXIS] = reward_offset + row["update"]
     else:
+        monitoring = (f"{TRAIN_EVAL}/", f"{TRAIN_EVAL_SEEDS}/")  # evaluation.during_training, published as is
+        unpublished = UNPUBLISHED_POLICY_PREFIXES if actor_objective == "sign" else ()
         out = {f"actor_critic/train/{metric_path(k, actor_distribution)}": v for k, v in row.items()
-               if k not in ("phase", "update") and not k.startswith(UNPUBLISHED_POLICY_PREFIXES)}
+               if k not in ("phase", "update") and not k.startswith(unpublished + monitoring)}
+        out.update({k: v for k, v in row.items() if k.startswith(monitoring)})
         out[POLICY_AXIS] = row["update"]
         out[POLICY_CUMULATIVE_AXIS] = policy_offset + row["update"]
     if block:
@@ -612,13 +654,61 @@ def evaluation_namespace(path: Path, primary: Optional[str]) -> str:
 
 
 def evaluation_row(result: Dict[str, Any], collected_steps: Optional[int], namespace: str) -> Dict[str, float]:
-    """<namespace>/seed_<s>/return per configured seed and the saved aggregates, at the milestone's data budget
+    """The saved aggregates <namespace>/return_<stat> and the per-seed returns
+    seed_returns/<namespace>/seed_<s>/return (hidden charts), at the milestone's data budget
     (namespace: evaluation_namespace)."""
-    row = {f"{namespace}/seed_{e['seed']}/return": e["episode_return"] for e in result["episodes"]}
-    row.update({f"{namespace}/return_{k}": result[f"return_{k}"] for k in ("max", "median", "mean", "min", "std")})
+    row = {f"{SEED_RETURNS}/{namespace}/seed_{e['seed']}/return": e["episode_return"] for e in result["episodes"]}
+    row.update({f"{namespace}/return_{k}": result[f"return_{k}"] for k in RETURN_STATS})
     if collected_steps is not None:
         row[EVAL_AXIS] = collected_steps
     return row
+
+
+def training_evaluation_row(result: Dict[str, Any]) -> Dict[str, float]:
+    """A monitoring evaluation during policy training: train_eval/return_<stat> and the per-seed returns
+    train_eval_seed_returns/seed_<s>/return (hidden charts)."""
+    row = {f"{TRAIN_EVAL_SEEDS}/seed_{e['seed']}/return": float(e["episode_return"]) for e in result["episodes"]}
+    row.update({f"{TRAIN_EVAL}/return_{k}": float(result[f"return_{k}"]) for k in RETURN_STATS})
+    return row
+
+
+class TaskRewardScale:
+    """The PMPO reward hook for actor_critic.training.reward_divisor: returns predicted task reward / divisor and
+    keeps the unscaled rewards of the last update (logging, in task units)."""
+
+    def __init__(self, divisor: float) -> None:
+        self.divisor, self.last_raw = float(divisor), None
+
+    def __call__(self, infos: Any, rew: torch.Tensor) -> torch.Tensor:
+        self.last_raw = rew.detach()
+        return rew / self.divisor
+
+
+def check_reward_divisor(value: Any) -> float:
+    """actor_critic.training.reward_divisor: a positive finite number (1: the predicted reward as is)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"actor_critic.training.reward_divisor must be a positive finite number, got {value!r}")
+    return float(value)
+
+
+def check_training_evaluation(c: Any) -> None:
+    """evaluation.during_training: absent or every null (off), or every a positive integer with distinct integer
+    seeds and a positive step limit."""
+    if c is None or c.every is None:
+        return
+    if isinstance(c.every, bool) or not isinstance(c.every, int) or c.every < 1:
+        raise ValueError(f"evaluation.during_training.every must be null or a positive integer, got {c.every!r}")
+    seeds = list(c.seeds)
+    if not seeds or not all(isinstance(s, int) and not isinstance(s, bool) for s in seeds) or len(set(seeds)) != len(seeds):
+        raise ValueError(f"evaluation.during_training.seeds must be a non-empty list of distinct integers, got {seeds}")
+    if isinstance(c.max_steps, bool) or not isinstance(c.max_steps, int) or c.max_steps < 1:
+        raise ValueError(f"evaluation.during_training.max_steps must be a positive integer, got {c.max_steps!r}")
+
+
+def summary_value(value: Any) -> Any:
+    """Bookkeeping in the W&B summary: dicts and lists as JSON text. W&B draws a chart (empty: no history) for every
+    numeric field of a dict-valued summary entry; text is listed in the run overview without charts."""
+    return json.dumps(value, sort_keys=True, default=str) if isinstance(value, (dict, list)) else value
 
 
 def metrics_rows(path: Path) -> List[Dict[str, Any]]:
@@ -685,6 +775,9 @@ def define_axes() -> None:
     wandb.define_metric(EVAL_AXIS, hidden=True)
     wandb.define_metric(f"{PRIMARY_EVAL}/*", step_metric=EVAL_AXIS)
     wandb.define_metric(f"{OTHER_EVAL}/*", step_metric=EVAL_AXIS)
+    wandb.define_metric(f"{SEED_RETURNS}/*", step_metric=EVAL_AXIS, hidden=True)
+    wandb.define_metric(f"{TRAIN_EVAL}/*", step_metric=POLICY_CUMULATIVE_AXIS)
+    wandb.define_metric(f"{TRAIN_EVAL_SEEDS}/*", step_metric=POLICY_CUMULATIVE_AXIS, hidden=True)
 
 
 def begin_status(activity: str) -> None:
@@ -694,9 +787,9 @@ def begin_status(activity: str) -> None:
     previous, error = wandb.summary.get("status"), wandb.summary.get("error")
     if previous == "failed":
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        wandb.summary[f"status_history/{stamp}"] = dict(
+        wandb.summary[f"status_history/{stamp}"] = summary_value(dict(
             status="failed", activity=wandb.summary.get("activity") or NOT_RECORDED,
-            error=error if error is not None else NOT_RECORDED)
+            error=error if error is not None else NOT_RECORDED))
     if error is not None:
         del wandb.summary["error"]
     wandb.summary["status"] = "running"
@@ -734,12 +827,12 @@ def summarize_evaluation(path: Path, result: Dict[str, Any], collected_steps: Op
     """The summary records what each evaluation was (after_training, evaluate_only, recovered), its file, step
     and metric namespace, and the seeds and step limit of its protocol."""
     protocol = protocol_label(path)
-    wandb.summary[f"evaluations/{Path(path).stem}"] = dict(
+    wandb.summary[f"evaluations/{Path(path).stem}"] = summary_value(dict(
         kind=kind, step=step, file=str(Path(path).resolve()), protocol=protocol, namespace=namespace,
         seeds=result["seeds"], max_steps=result["max_steps"],
-        train_env_steps=collected_steps if collected_steps is not None else NOT_RECORDED)
-    wandb.summary[f"evaluation_protocols/{protocol}"] = dict(seeds=result["seeds"], max_steps=result["max_steps"],
-                                                             namespace=namespace)
+        train_env_steps=collected_steps if collected_steps is not None else NOT_RECORDED))
+    wandb.summary[f"evaluation_protocols/{protocol}"] = summary_value(dict(
+        seeds=result["seeds"], max_steps=result["max_steps"], namespace=namespace))
 
 
 # ---------------------------------------------------------------------- the shared W&B run
@@ -916,7 +1009,7 @@ def restore_evaluation_summary(shared: Dict[str, Any], path: Path, result: Dict[
                                collected_steps: Optional[int], entry: Dict[str, Any]) -> None:
     if wandb.run is not None:
         summarize_evaluation(path, result, collected_steps, entry["kind"], entry["step"], entry["namespace"])
-        wandb.summary["evaluation_protocols/primary"] = shared["record"].get("primary_protocol") or NOT_RECORDED
+        wandb.summary["evaluation_protocols/primary"] = summary_value(shared["record"].get("primary_protocol") or NOT_RECORDED)
 
 
 def publish_evaluation(shared: Dict[str, Any], path: Path, result: Dict[str, Any], collected_steps: Optional[int],
@@ -1068,7 +1161,7 @@ def reconcile_evaluations(shared: Dict[str, Any], server: int, offline: bool, re
         say(f"W&B warning: {counts['unverified']} evaluation(s) unverified ({source}); neither confirmed nor logged again")
     summary = dict(counts, history=source)
     if wandb.run is not None:
-        wandb.summary["evaluation_publication"] = summary
+        wandb.summary["evaluation_publication"] = summary_value(summary)
     return summary
 
 
@@ -1158,6 +1251,10 @@ def normalized_saved_config(saved: Dict[str, Any]) -> Dict[str, Any]:
     Returns a copy; the saved file is not changed."""
     saved = deepcopy(saved)
     saved.setdefault("initialization", {}).setdefault("member_index", 0)
+    # Configs from before actor_critic.training.reward_divisor: the predicted reward was used as is (divisor 1).
+    training = (saved.get("actor_critic") or {}).get("training")
+    if isinstance(training, dict):
+        training.setdefault("reward_divisor", 1.0)
     return saved
 
 
@@ -1304,8 +1401,8 @@ def evaluate_saved_output(cfg: DictConfig) -> Path:
                 publish_evaluation(logged["shared"], path, result, logged["steps"], "evaluate_only")
             else:
                 log_evaluation(result, path, logged["steps"], "evaluate_only", logged["total"], 0)
-            wandb.summary["last_evaluate_only"] = dict(file=str(Path(path).resolve()), seeds=result["seeds"],
-                                                       max_steps=result["max_steps"])
+            wandb.summary["last_evaluate_only"] = summary_value(dict(
+                file=str(Path(path).resolve()), seeds=result["seeds"], max_steps=result["max_steps"]))
     except BaseException as error:
         finish_wandb("failed", error)
         raise

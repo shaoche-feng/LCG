@@ -218,6 +218,14 @@ def announce(cfg: DictConfig, label: str, source: Path, milestones: List[Tuple[P
                      f"maximum {e.max_steps:,} steps per episode")
     else:
         lines.append("  Evaluation: none after training (evaluation.after_training=false)")
+    objective = OmegaConf.select(cfg, "agent.actor_critic.actor_objective", default="sign")
+    divisor = OmegaConf.select(cfg, "actor_critic.training.reward_divisor", default=1.0)
+    if mode != "evaluate" and (objective != "sign" or divisor != 1):  # shown when not the defaults
+        lines.append(f"  Controller: actor objective {objective} | reward divisor {divisor:g}")
+    during = OmegaConf.select(cfg, "evaluation.during_training")
+    if mode != "evaluate" and during is not None and during.every is not None:
+        lines.append(f"  Monitoring: every {during.every:,} policy updates, {plural(len(during.seeds), 'seed')} "
+                     f"({seed_span(during.seeds, '–')}) | maximum {during.max_steps:,} steps per episode")
     root = downstream_output_dir(milestones[0][0], task, seed, member).parents[2]  # <run>/downstream
     lines.append(f"  Output root: {root.resolve()}")
     if OmegaConf.select(cfg, "wandb.mode", default="disabled") != "disabled":

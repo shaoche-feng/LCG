@@ -4574,3 +4574,46 @@ TV24, none in Clean; 0 object pixels under the panel on every active frame.
   `FrozenScorer` paths as `follow-intrinsic-reward`.
 - Validated on Windows with MuJoCo's default backend; the EGL server path was not exercised.
 - Downstream adaptation of TV milestones is refused until its protocol is specified.
+
+## Downstream W&B layout and monitoring evaluation (2026-11-28)
+
+- Evaluation charts: only the aggregates `eval/return_{mean,median,std,min,max}` (other protocols:
+  `eval_protocols/protocol-<id>/return_<stat>`) are drawn. Per-seed returns are still logged, under
+  `seed_returns/<namespace>/seed_<s>/return`, with `define_metric(..., hidden=True)`. Server reconciliation of
+  evaluation points reads `<namespace>/return_mean`, so it is unaffected. Runs logged before this change keep their
+  old `eval/seed_<s>/return` keys.
+- The W&B summary bookkeeping (`milestones/<name>`, `evaluations/<file>`, `evaluation_protocols/<id|primary>`,
+  `resume`, `evaluation_publication`, `status_history/<time>`, `last_evaluate_only`) was written as dicts, and W&B drew
+  an empty chart ("no data") for every numeric field. It is now JSON text (`summary_value`); the authoritative copy is
+  still the shared-run record `<run>/downstream/wandb_<task>_seed_<s>.json`. `status`, `activity`, `error`, `output`
+  stay plain strings.
+- Monitoring during policy training (`evaluation.during_training`, default every 500 policy updates, seeds
+  3001–3004, 500 steps): `evaluate_policy` (deterministic actions, real task) after the update, its result added to
+  that update's `metrics.jsonl` row and W&B row as `train_eval/return_<stat>` (per seed:
+  `train_eval_seed_returns/seed_<s>/return`, hidden), on `actor_critic/train/core/cumulative_updates`. Diagnostics
+  only: `evaluate_policy` restores the global RNG states and module modes, so weights and every other metric are
+  identical with and without it (test); the setting may change on resume (`RESUME_MAY_CHANGE`). `every: null`: off.
+  The seeds overlap the final 30-seed protocol (3001–3030); use other seeds for selection decisions.
+- Tests: `tests/downstream/` (138 passed), plus the downstream tests of `test_noisy_tv.py`, `test_plan2explore.py`,
+  `test_laplace.py` (5 passed). Not validated against a live W&B server (workspace rendering of hidden globs and
+  JSON-text summary entries).
+
+## Downstream actor objective and reward divisor (2026-11-28)
+
+- `agent.actor_critic.actor_objective`: `sign` (default) or `advantage_weighted` (cap
+  `agent.actor_critic.advantage_weight_cap`, 5), the PMPO objectives of `models/pmpo_beta.py`; anything else is
+  refused. With `advantage_weighted`, W&B also publishes `actor_critic/train/weights/clipped_fraction_{positive,negative}`
+  (and the `debug/weight_*` keys with debug metrics); with `sign` they stay unpublished (always 0/1).
+- `actor_critic.training.reward_divisor` (default 1): PMPO's lambda returns use predicted task reward / divisor,
+  through the controller's reward hook (`TaskRewardScale`, set only when the divisor is not 1, so 1 is the earlier
+  code path). The reward model trains on raw rewards. Critic targets, values and gradients shrink with it; both actor
+  objectives ignore the reward scale (sign: signs; advantage_weighted: |A| / mean |A| per sign group); KL and entropy
+  do not depend on it. W&B `task_reward/` stays in task units (the hook keeps the unscaled rewards); `core/return_mean`,
+  `core/value_mean` and the losses are in divided units. It changes training: a resume may not change it; saved
+  configs without it read as 1. Recorded in the W&B provenance (`reward_divisor`).
+- Motivation (Plan2Explore hopper-stand, 100k): critic clipped (norm > 10) on 86% of policy updates, tenth-averaged
+  value gradient norm 23 -> 171 while the imagined return rose 0.9 -> 4.9; stand reward ~1.65 per stored step when
+  present (8.7% of replay steps). A divisor of 20 puts those norms at ~1-9 and a policy standing throughout at a
+  value of ~110 / 20 ~ 5.5.
+- Tests: `tests/downstream/` (140 passed) incl. advantage-weighted training and publication, and the divisor (PMPO
+  receives predicted reward / 20 on the same rollout; task units logged; validation; resume rules).

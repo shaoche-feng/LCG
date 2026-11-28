@@ -17,7 +17,7 @@ from coroutines.frame_history import FrameHistory
 from downstream_trainer import (DownstreamTrainer, evaluate_policy, evaluate_saved_output, frame_tensor,
                                 recover_metrics_log)
 from envs import DMControlEnv
-from test_downstream_trainer import FakeWandb, TINY_DOWNSTREAM, build_milestone, compose, tree_hashes
+from test_downstream_trainer import FakeWandb, TINY_DOWNSTREAM, entry as summary_entry, build_milestone, compose, tree_hashes
 from utils import configure_progress, rng_state
 
 RESUMABLE = [o for o in TINY_DOWNSTREAM if not o.startswith(("rew_end_model.training.steps", "actor_critic.training.steps"))]
@@ -636,7 +636,7 @@ def test_resume_continues_the_wandb_run_without_duplicate_updates(tmp_path, monk
     output = wandb_run(milestone, monkeypatch, second, resume=True).run()
     run_id = json.loads((tmp_path / "split/run/downstream/wandb_walk_seed_0.json").read_text())["identity"]["id"]
     assert second.inits[0]["id"] == run_id and second.inits[0]["resume"] == "allow"  # the same run
-    event = second.summary["resume"]
+    event = summary_entry(second.summary, "resume")
     assert (event["committed_rows"], event["previous_status"], event["count"]) == (8, "running", 1)
 
     server_rows = {s: r for s, r in first.logged if s < held} if server != "offline" else {}
@@ -691,7 +691,7 @@ def test_resume_of_a_run_without_wandb_starts_one_and_backfills_its_committed_up
     assert all(not set(row).intersection(old_keys) for row in rows)
     fake = FakeWandb()
     wandb_run(milestone, monkeypatch, fake, resume=True).run()
-    event = fake.summary["resume"]
+    event = summary_entry(fake.summary, "resume")
     assert event["previous_status"] == "no earlier W&B run" and event["backfilled_rows"] == 8
     assert [s for s, _ in fake.logged] == list(range(10))  # 8 committed rows backfilled, then PMPO updates 3 and 4
 
@@ -758,7 +758,7 @@ def test_resume_in_a_shared_run_continues_the_milestone_block(tmp_path, monkeypa
         monkeypatch.setattr(DownstreamTrainer, "policy_update", original)
         second = FakeWandb(server=server)
         output = wandb_run(milestones / "steps_000026", monkeypatch, second, EVALUATED, resume=True).run()
-        event = second.summary["resume"]
+        event = summary_entry(second.summary, "resume")
         # 6 + 2 committed rows from step 11; the server holds update 3 too (replayed, not logged again).
         assert (event["block_first_step"], event["committed_rows"], event["server_rows_beyond_checkpoint"]) == (11, 8, 1)
         assert event["replayed_matched"] == 1
@@ -851,8 +851,8 @@ def test_interrupted_evaluation_publication_is_completed_exactly_once(tmp_path, 
     # 6 + 4 updates at steps 0-9, then the reserved step 10; without a recorded step: the next free one (11).
     expected = 10  # the intent and reserved step now survive even a crash before publication registration
     assert points(rows, after_training) == [expected] and points(rows, path) == [expected + 1]
-    assert second.summary["evaluation_publication"]["confirmed"] == (1 if interrupted == "after_log" else 0)
-    assert second.summary["evaluation_publication"]["recovered"] == (0 if interrupted == "after_log" else 1)
+    assert summary_entry(second.summary, "evaluation_publication")["confirmed"] == (1 if interrupted == "after_log" else 0)
+    assert summary_entry(second.summary, "evaluation_publication")["recovered"] == (0 if interrupted == "after_log" else 1)
     assert {evaluation_status(e) for e in record["evaluations"].values()} == {"confirmed"}  # both seen on the server
     assert entry_of(tmp_path, after_training)["kind"] == "after_training"
 
@@ -904,7 +904,7 @@ def test_an_evaluation_already_on_the_server_is_confirmed_not_duplicated(tmp_pat
     evaluate_only(milestone, monkeypatch, second, "[5]")
     record, rows = shared_rows(tmp_path, server)
     assert points(rows, report) == [10] and entry_of(tmp_path, report)["status"] == "confirmed"
-    assert second.summary["evaluation_publication"] == dict(confirmed=1, recovered=0, unverified=0, history="server")
+    assert summary_entry(second.summary, "evaluation_publication") == dict(confirmed=1, recovered=0, unverified=0, history="server")
 
 
 def test_a_missing_evaluation_behind_later_server_rows_is_logged_at_the_next_free_step(tmp_path, monkeypatch):
@@ -916,8 +916,8 @@ def test_a_missing_evaluation_behind_later_server_rows_is_logged_at_the_next_fre
     wandb_run(milestones / "steps_000020", monkeypatch, FakeWandb(server=server, lose=is_evaluation), EVALUATED).run()
     unavailable = FakeWandb(server=server, api_error=ConnectionError("no API"))
     wandb_run(milestones / "steps_000026", monkeypatch, unavailable, EVALUATED).run()
-    assert unavailable.summary["evaluation_publication"]["unverified"] == 1  # not confirmed, not logged again
-    assert unavailable.summary["evaluation_publication"]["history"].startswith("unavailable (ConnectionError")
+    assert summary_entry(unavailable.summary, "evaluation_publication")["unverified"] == 1  # not confirmed, not logged again
+    assert summary_entry(unavailable.summary, "evaluation_publication")["history"].startswith("unavailable (ConnectionError")
     (report,) = (tmp_path / "run/downstream/steps_000020/walk/seed_0/evaluations").iterdir()
     record, rows = shared_rows(tmp_path, server)
     assert points(rows, report) == [] and max(s for s, _ in rows) == 21  # 26's block (11-21) is on the server
@@ -939,8 +939,8 @@ def test_offline_evaluations_are_never_claimed_confirmed(tmp_path, monkeypatch):
     again = FakeWandb(offline=True)
     evaluate_only(milestone, monkeypatch, again, "[5]", "wandb.mode=offline")
     assert entry_of(tmp_path, report)["status"] == "unverified" and len(again.logged) == 1  # only its own point
-    assert again.summary["evaluation_publication"]["unverified"] == 1
-    assert again.summary["evaluation_publication"]["history"].startswith("offline")
+    assert summary_entry(again.summary, "evaluation_publication")["unverified"] == 1
+    assert summary_entry(again.summary, "evaluation_publication")["history"].startswith("offline")
 
 
 def test_resume_after_later_steps_in_the_shared_run_keeps_its_rows_local(tmp_path, monkeypatch, capsys):
@@ -963,7 +963,7 @@ def test_resume_after_later_steps_in_the_shared_run_keeps_its_rows_local(tmp_pat
     second = FakeWandb(server=server)
     output = wandb_run(milestones / "steps_000026", monkeypatch, second, EVALUATED, resume=True).run()
     assert "the shared run already holds later steps" in capsys.readouterr().out
-    assert "later steps" in second.summary["resume"]["note"]
+    assert "later steps" in summary_entry(second.summary, "resume")["note"]
     record, rows = shared_rows(tmp_path, server)
     steps = [s for s, _ in rows]
     assert steps == sorted(set(steps)) and steps[-2:] == [22, 23]  # nothing below the server's step; no duplicates
@@ -1230,9 +1230,9 @@ def test_confirmed_summaries_are_rebuilt_on_every_attachment(tmp_path, monkeypat
     fake.summary.clear()
     event = downstream_module.reconcile_evaluations(shared, downstream_module.server_next_step(), False)
     assert event["history"] == "nothing to verify" and not fake.logged
-    assert fake.summary["evaluation_protocols/primary"] == shared["record"]["primary_protocol"]
-    assert fake.summary["evaluation_protocols/" + downstream_module.protocol_label(path)]["namespace"] == "eval"
-    assert fake.summary["evaluations/" + path.stem]["step"] == 10
+    assert summary_entry(fake.summary, "evaluation_protocols/primary") == shared["record"]["primary_protocol"]
+    assert summary_entry(fake.summary, "evaluation_protocols/" + downstream_module.protocol_label(path))["namespace"] == "eval"
+    assert summary_entry(fake.summary, "evaluations/" + path.stem)["step"] == 10
 
 
 def test_primary_migration_uses_original_step_and_published_namespace(tmp_path, monkeypatch):

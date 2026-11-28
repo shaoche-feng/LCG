@@ -45,6 +45,7 @@ TINY_DOWNSTREAM = [
     "world_model_env.diffusion_sampler.num_steps_denoising=2", "rew_end_model.training.steps=4",
     "rew_end_model.training.batch_size=3", "rew_end_model.training.lr_warmup_steps=0",
     "actor_critic.training.steps=3", "actor_critic.training.batch_size=2", "evaluation.after_training=false",
+    "evaluation.during_training.every=null",  # monitoring has its own tests
 ]
 
 
@@ -972,6 +973,13 @@ def downstream_ac_keys(ac_schema, action_dim, debug):
     return {f"actor_critic/train/{k}" for k in keys}
 
 
+def entry(summary, key):
+    """A bookkeeping entry of the W&B summary (JSON text, so that W&B draws no empty charts for it)."""
+    value = summary[key]
+    assert isinstance(value, str), f"{key} is not JSON text: {value!r}"
+    return json.loads(value)
+
+
 def logged_run(milestone, monkeypatch, *extra, fake=None):
     fake = fake or FakeWandb()
     monkeypatch.setattr(downstream_module, "wandb", fake)
@@ -1001,7 +1009,7 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
                for r in policy) and [r[downstream_module.POLICY_AXIS] for r in policy] == [1, 2, 3]
     assert all(r["exploration/train_env_steps"] == 26 for r in reward + policy)  # identifies the milestone
     published = set().union(*map(set, (r for _, r in fake.logged)))
-    assert {k.split("/", 1)[0] for k in published} == {"reward_model", "actor_critic", "eval", "exploration"}
+    assert {k.split("/", 1)[0] for k in published} == {"reward_model", "actor_critic", "eval", "seed_returns", "exploration"}
     assert not any("intrinsic" in k or "weights/" in k or "weight_" in k for k in published)
 
     # loss_reward is loss_rew (the reward MSE), not loss_total; values equal metrics.jsonl's.
@@ -1017,11 +1025,12 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
     saved = OmegaConf.to_container(OmegaConf.load(file))
     # The run's primary protocol publishes directly under eval/.
     protocol = "protocol-" + analysis_module.protocol_id(file)
-    assert evaluation == {**{f"eval/seed_{e['seed']}/return": e["episode_return"] for e in saved["episodes"]},
+    # Per-seed returns are logged under seed_returns/ (hidden charts); eval/ holds only the aggregates.
+    assert evaluation == {**{f"seed_returns/eval/seed_{e['seed']}/return": e["episode_return"] for e in saved["episodes"]},
                           **{f"eval/return_{k}": saved[f"return_{k}"] for k in ("max", "median", "mean", "min", "std")},
                           "exploration/train_env_steps": 26}
-    assert sorted(k for k in evaluation if "/seed_" in k) == [f"eval/seed_{s}/return" for s in (3001, 3002, 3005)]
-    assert fake.summary[f"evaluation_protocols/{protocol}"] == dict(seeds=[3001, 3002, 3005], max_steps=3, namespace="eval")
+    assert sorted(k for k in evaluation if "/seed_" in k) == [f"seed_returns/eval/seed_{s}/return" for s in (3001, 3002, 3005)]
+    assert entry(fake.summary, f"evaluation_protocols/{protocol}") == dict(seeds=[3001, 3002, 3005], max_steps=3, namespace="eval")
     assert saved["protocol_id"] == analysis_module.protocol_id(file)  # in the local report too
 
     # Axes: training metrics on the cumulative update axes, evaluations on the training env steps (all hidden).
@@ -1030,9 +1039,14 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
                             (downstream_module.POLICY_CUMULATIVE_AXIS, None),
                             ("actor_critic/train/*", downstream_module.POLICY_CUMULATIVE_AXIS),
                             ("exploration/train_env_steps", None), ("eval/*", "exploration/train_env_steps"),
-                            ("eval_protocols/*", "exploration/train_env_steps")]
+                            ("eval_protocols/*", "exploration/train_env_steps"),
+                            ("seed_returns/*", "exploration/train_env_steps"),
+                            ("train_eval/*", downstream_module.POLICY_CUMULATIVE_AXIS),
+                            ("train_eval_seed_returns/*", downstream_module.POLICY_CUMULATIVE_AXIS)]
     assert fake.hidden == [downstream_module.REWARD_CUMULATIVE_AXIS, downstream_module.POLICY_CUMULATIVE_AXIS,
-                           "exploration/train_env_steps"]
+                           "exploration/train_env_steps", "seed_returns/*", "train_eval_seed_returns/*"]
+    # Bookkeeping summary entries are JSON text, never dicts (W&B would draw an empty chart per numeric field).
+    assert not any(isinstance(v, (dict, list)) for v in fake.summary.values())
 
     # Run identity (the shared run's record), names and provenance; status; the identity file travels with the output.
     record = shared_record(tmp_path / "run")
@@ -1044,7 +1058,7 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
     assert provenance["exploration"]["method"] == "not recorded" and provenance["exploration"]["collection_mode"] == "uniform"
     assert provenance["exploration"]["seed"].startswith("not recorded")
     assert "milestone" not in provenance and "milestone_path" not in init["config"]["initialization"]  # per milestone:
-    milestone_summary = fake.summary["milestones/steps_000026"]                                       # in the summary
+    milestone_summary = entry(fake.summary, "milestones/steps_000026")                                # in the summary
     assert milestone_summary["train_env_steps"] == 26 and milestone_summary["member_index"] == 0
     assert milestone_summary["identity"] == trainer.milestone.manifest["identity"] and milestone_summary["status"] == "trained"
     assert milestone_summary["member_sha256"] == OmegaConf.load(output / "summary.json").milestone.member_sha256
@@ -1053,14 +1067,14 @@ def test_wandb_rows_keys_axes_and_evaluation(tmp_path, monkeypatch, ac_schema, d
     assert identity["id"] == record["identity"]["id"] and identity["shared_run"] == "../../../wandb_walk_seed_0.json"
     assert record["milestones"]["steps_000026"]["first_step"] == 0 and record["next_step"] == 8
     assert record["primary_protocol"] == dict(id=analysis_module.protocol_id(file), seeds=[3001, 3002, 3005], max_steps=3)
-    assert fake.summary["evaluation_protocols/primary"] == record["primary_protocol"]
+    assert entry(fake.summary, "evaluation_protocols/primary") == record["primary_protocol"]
     assert init["config"]["provenance"]["evaluation"]["protocol"] == record["primary_protocol"]["id"]
     assert record["evaluations"] == {f"steps_000026/walk/seed_0/evaluations/{file.name}": dict(
         step=7, original_step=7, kind="after_training", status="unverified", attempted=True,
         namespace="eval", protocol=record["primary_protocol"],
         verification="unavailable (RuntimeError: this fake has no server history)")}
     assert fake.summary["status"] == "completed" and fake.finished == [0]
-    assert fake.summary[f"evaluations/{file.stem}"]["kind"] == "after_training"
+    assert entry(fake.summary, f"evaluations/{file.stem}")["kind"] == "after_training"
 
 
 def test_reward_statistics_use_the_masked_transitions_and_task_rewards_pmpo_used(tmp_path, monkeypatch):
@@ -1247,10 +1261,11 @@ def test_evaluate_only_adds_to_the_adaptation_run_without_the_milestone(tmp_path
     second = "protocol-" + analysis_module.protocol_id(path)
     assert first != second  # another protocol: its own namespace, never the primary eval/ curves
     assert step == 8 and row["exploration/train_env_steps"] == 26
-    assert row[f"eval_protocols/{second}/seed_9/return"] == saved["episodes"][1]["episode_return"]
+    assert row[f"seed_returns/eval_protocols/{second}/seed_9/return"] == saved["episodes"][1]["episode_return"]
+    assert row[f"eval_protocols/{second}/return_mean"] == saved["return_mean"]
     assert not any(k.startswith("eval/") for k in row)
-    assert fake.summary[f"evaluations/{path.stem}"]["kind"] == "evaluate_only" and fake.finished == [0]
-    assert fake.summary[f"evaluation_protocols/{second}"]["namespace"] == f"eval_protocols/{second}"
+    assert entry(fake.summary, f"evaluations/{path.stem}")["kind"] == "evaluate_only" and fake.finished == [0]
+    assert entry(fake.summary, f"evaluation_protocols/{second}")["namespace"] == f"eval_protocols/{second}"
     assert record["evaluations"][f"steps_000026/walk/seed_0/evaluations/{path.name}"] == dict(
         step=8, original_step=8, kind="evaluate_only", status="unverified", attempted=True,
         namespace=f"eval_protocols/{second}", protocol=downstream_module.configured_protocol(cfg),
@@ -1290,7 +1305,7 @@ def evaluate_only_cfg(milestone, *extra):
 
 
 def history(summary):
-    return [v for k, v in sorted(summary.items()) if k.startswith("status_history/")]
+    return [json.loads(v) for k, v in sorted(summary.items()) if k.startswith("status_history/")]
 
 
 def test_evaluate_only_status_after_a_failed_final_evaluation_of_an_adaptation_run(tmp_path, monkeypatch):
@@ -1332,8 +1347,8 @@ def test_evaluate_only_status_after_a_failed_final_evaluation_of_an_adaptation_r
     # The next free step of the shared run (the failed after-training evaluation left its reserved step 7 unused);
     # the same protocol as the run's primary one: under eval/.
     assert step == 8 and row["exploration/train_env_steps"] == 26
-    assert set(row) >= {"eval/seed_3001/return", "eval/return_mean"}
-    assert third.summary[f"evaluations/{path.stem}"]["kind"] == "evaluate_only"
+    assert set(row) >= {"seed_returns/eval/seed_3001/return", "eval/return_mean"}
+    assert entry(third.summary, f"evaluations/{path.stem}")["kind"] == "evaluate_only"
 
     # The same policy and protocol again: refused before anything runs; W&B is not touched.
     fourth = FakeWandb(summary=third.summary)
@@ -1989,6 +2004,120 @@ def test_downstream_controller_is_a_fresh_sign_only_h10_controller(tmp_path, mon
     for copy, source in ((model.prior_actor, model.actor), (model.initial_actor, model.actor), (model.slow_value, model.value)):
         assert states_equal(copy.state_dict(), source.state_dict())
     assert not any("actor" in p.name or "value" in p.name for p in Path(trainer.milestone.path).rglob("*"))
-    with pytest.raises(ValueError, match="Downstream PMPO is sign-only"):
+    with pytest.raises(ValueError, match="Downstream PMPO supports agent.actor_critic.actor_objective in"):
         make_trainer(build_milestone(tmp_path / "other"), monkeypatch,
-                     extra=["agent.actor_critic.actor_objective=advantage_weighted"])
+                     extra=["agent.actor_critic.actor_objective=softmax"])
+
+
+# ---------------------------------------------------------------- monitoring during policy training
+
+MONITORED = ["evaluation.during_training.every=2", "evaluation.during_training.seeds=[3001,3002]",
+             "evaluation.during_training.max_steps=3"]
+TRAIN_EVAL_KEYS = {f"train_eval/return_{k}" for k in ("max", "median", "mean", "min", "std")} | \
+    {f"train_eval_seed_returns/seed_{s}/return" for s in (3001, 3002)}
+
+
+def test_training_evaluation_is_logged_every_n_updates_and_changes_no_training(tmp_path, monkeypatch):
+    plain_output = make_trainer(build_milestone(tmp_path / "a"), monkeypatch).run()
+    fake = FakeWandb()
+    monkeypatch.setattr(downstream_module, "wandb", fake)
+    output = make_trainer(build_milestone(tmp_path / "b"), monkeypatch, extra=[*ONLINE, *MONITORED]).run()
+
+    # Training is unchanged: the same weights and, apart from the monitoring keys, the same metrics rows.
+    for name in ("rew_end_model.pt", "actor_critic.pt"):
+        assert states_equal(torch.load(plain_output / name, weights_only=False), torch.load(output / name, weights_only=False))
+    plain_rows = [json.loads(line) for line in (plain_output / "metrics.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+    assert [{k: v for k, v in r.items() if k not in TRAIN_EVAL_KEYS} for r in rows] == plain_rows
+
+    # Monitoring after every 2nd policy update (of 3): in that update's row only.
+    policy = [r for r in rows if r["phase"] == "actor_critic"]
+    assert [sorted(TRAIN_EVAL_KEYS & set(r)) for r in policy] == [[], sorted(TRAIN_EVAL_KEYS), []]
+    monitored = policy[1]
+    returns = [monitored[f"train_eval_seed_returns/seed_{s}/return"] for s in (3001, 3002)]
+    assert monitored["train_eval/return_mean"] == pytest.approx(sum(returns) / 2)
+    assert monitored["train_eval/return_max"] == max(returns) and monitored["train_eval/return_min"] == min(returns)
+
+    # W&B: published as is (not under actor_critic/train/) in the update's row, on the policy-update axis.
+    policy_logged = [r for s, r in fake.logged[4:7]]
+    assert [sorted(TRAIN_EVAL_KEYS & set(r)) for r in policy_logged] == [[], sorted(TRAIN_EVAL_KEYS), []]
+    assert all(policy_logged[1][k] == monitored[k] for k in TRAIN_EVAL_KEYS)
+    assert policy_logged[1][downstream_module.POLICY_CUMULATIVE_AXIS] == 2
+    assert not any("train_eval" in k for r in policy_logged for k in r if k.startswith("actor_critic/"))
+    assert ("train_eval/*", downstream_module.POLICY_CUMULATIVE_AXIS) in fake.metrics
+    assert "train_eval_seed_returns/*" in fake.hidden and "train_eval/*" not in fake.hidden
+
+
+def test_training_evaluation_settings_are_checked_and_may_change_on_resume(tmp_path, monkeypatch):
+    milestone = build_milestone(tmp_path)
+    for override, message in (("evaluation.during_training.every=0", "during_training.every must be null or a positive"),
+                              ("evaluation.during_training.seeds=[1,1]", "during_training.seeds must be a non-empty list"),
+                              ("evaluation.during_training.max_steps=0", "during_training.max_steps must be a positive")):
+        extra = [override] if "every" in override else ["evaluation.during_training.every=1", override]
+        with pytest.raises(ValueError, match=message):
+            make_trainer(milestone, monkeypatch, extra=extra)
+    # Diagnostics only: a resume may switch it on, off or change it.
+    assert downstream_module.changed_settings({"evaluation": {"during_training": {"every": 1}, "max_steps": 3}},
+                                              {"evaluation": {"during_training": {"every": None}, "max_steps": 3}}) == []
+    # The default configuration monitors every 500 policy updates with four seeds.
+    default = compose("downstream", ["initialization.milestone_path=x", "downstream.task_name=walk"]).evaluation.during_training
+    assert (default.every, list(default.seeds), default.max_steps) == (500, [3001, 3002, 3003, 3004], 500)
+
+
+# ---------------------------------------------------------------- actor objective and reward divisor
+
+def test_advantage_weighted_objective_trains_and_publishes_its_weight_statistics(tmp_path, monkeypatch, ac_schema):
+    milestone = build_milestone(tmp_path)
+    trainer, output, fake = logged_run(milestone, monkeypatch, "agent.actor_critic.actor_objective=advantage_weighted")
+    assert trainer.agent.actor_critic.cfg.actor_objective == "advantage_weighted"
+    policy = [r for _, r in fake.logged[4:7]]
+    weights = {"actor_critic/train/weights/clipped_fraction_positive", "actor_critic/train/weights/clipped_fraction_negative"}
+    expected = downstream_ac_keys(ac_schema, 6, False) | weights
+    assert all(set(r) == expected | {downstream_module.POLICY_CUMULATIVE_AXIS, "exploration/train_env_steps"} for r in policy)
+    rows = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines() if '"actor_critic"' in line]
+    assert [r["actor_critic/train/weights/clipped_fraction_positive"] for r in policy] ==         [r["weight_clipped_fraction_positive"] for r in rows]
+    assert fake.inits[0]["config"]["provenance"]["controller"]["actor_objective"]["mode"] == "advantage_weighted"
+    # The sign objective keeps them unpublished (always 0 there).
+    row = {"phase": "actor_critic", "update": 1, "weight_clipped_fraction_positive": 0.0, "loss_actor": 1.0}
+    assert "actor_critic/train/weights/clipped_fraction_positive" not in downstream_module.wandb_row(row, "tanh_gaussian")
+    assert downstream_module.wandb_row(row, "tanh_gaussian", None, "advantage_weighted")[
+        "actor_critic/train/weights/clipped_fraction_positive"] == 0.0
+
+
+def test_reward_divisor_divides_the_rewards_pmpo_uses_and_logs_task_units(tmp_path, monkeypatch):
+    def first_policy_update(trainer):  # the reward model's updates, then one PMPO update
+        while trainer.phase == "rew_end_model" or trainer.num_updates["actor_critic"] < 1:
+            if trainer.phase == "rew_end_model":
+                trainer.reward_model_update()
+                if trainer.num_updates["rew_end_model"] == trainer.cfg.rew_end_model.training.steps:
+                    trainer.agent.rew_end_model.requires_grad_(False).eval()
+                    trainer.phase = "actor_critic"
+            else:
+                trainer.policy_update()
+        return trainer
+
+    # Built and run one after the other: each trainer seeds the global RNGs when it is built.
+    plain = first_policy_update(make_trainer(build_milestone(tmp_path / "a"), monkeypatch))
+    divided = first_policy_update(make_trainer(build_milestone(tmp_path / "b"), monkeypatch,
+                                               extra=["actor_critic.training.reward_divisor=20"]))
+    assert plain._reward_scale is None and plain.agent.actor_critic.intrinsic_reward_fn is None  # 1: no hook
+    assert divided.reward_divisor == 20.0 and divided.agent.actor_critic.intrinsic_reward_fn is divided._reward_scale
+    # The same imagined rollout (same seeds and models): PMPO received the predicted rewards / 20.
+    raw = divided._reward_scale.last_raw
+    torch.testing.assert_close(raw, plain.agent.actor_critic.last_reward)
+    torch.testing.assert_close(divided.agent.actor_critic.last_reward, raw / 20)
+    rows = {name: [json.loads(line) for line in (t._work_dir / "metrics.jsonl").read_text().splitlines()][-1]
+            for name, t in (("plain", plain), ("divided", divided))}
+    assert rows["divided"]["task_reward_mean"] == pytest.approx(rows["plain"]["task_reward_mean"])  # task units
+    assert divided.provenance()["reward_divisor"] == 20.0 and plain.provenance()["reward_divisor"] == 1.0
+
+    for bad in ("0", "-2", "inf", "true"):
+        with pytest.raises(ValueError, match="reward_divisor must be a positive finite number"):
+            make_trainer(build_milestone(tmp_path / f"bad{bad}"), monkeypatch,
+                         extra=[f"actor_critic.training.reward_divisor={bad}"])
+    # It changes training: a resume may not change it; checkpoints from before it meant 1.
+    saved = {"actor_critic": {"training": {"steps": 3}}, "initialization": {"member_index": 0}}
+    current = {"actor_critic": {"training": {"steps": 3, "reward_divisor": 1.0}}, "initialization": {"member_index": 0}}
+    assert downstream_module.changed_settings(downstream_module.normalized_saved_config(saved), current) == []
+    current["actor_critic"]["training"]["reward_divisor"] = 20.0
+    assert downstream_module.changed_settings(downstream_module.normalized_saved_config(saved), current) ==         ["actor_critic.training.reward_divisor"]
